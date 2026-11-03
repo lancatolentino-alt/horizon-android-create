@@ -106,6 +106,13 @@ jobs:
             --rev d9c83d7096b7ea5b83678da2efdfd6161f74997e horizon-mixins-cli
           python3 tools/apply_native_mods.py --mods native-mods \
             --cli "$RUNNER_TEMP/mixins/bin/horizon-mixins"
+      - name: Use Mojang's original 26.3 version file
+        run: |
+          # Mojang republished 26.3.json; Horizon only accepts the original (content-addressed, still served).
+          mkdir -p .local/minecraft/26.3
+          curl -fsSL https://piston-meta.mojang.com/v1/packages/11f1aefe473eefba0af62e3286c33b692807b2eb/26.3.json \
+            -o .local/minecraft/26.3/manifest.json
+          test "$(sha1sum .local/minecraft/26.3/manifest.json | cut -d' ' -f1)" = 11f1aefe473eefba0af62e3286c33b692807b2eb
       - name: Prepare private engine inputs from official downloads
         run: python3 tools/android_prepare.py --java-home "$JAVA_HOME"
       - name: Build optimized public dev APK
