@@ -34,8 +34,8 @@ pub fn kind_of(block: &str) -> Option<Kind> {
     }
 }
 
-/// A kinetic block as the network sees it. `axis` is 0/1/2 for x/y/z; a motor's `front`
-/// is the direction its shaft points (its `axis` is that direction's axis).
+// A kinetic block as the network sees it. `axis` is 0/1/2 for x/y/z; a motor's `front`
+// is the direction its shaft points (its `axis` is that direction's axis).
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
     pub kind: Kind,
@@ -47,7 +47,7 @@ impl Node {
     fn is_cog(&self) -> bool {
         matches!(self.kind, Kind::Cogwheel | Kind::LargeCogwheel)
     }
-    /// Whether a shaft end of this block faces the neighbour in direction `d`.
+    // Whether a shaft end of this block faces the neighbour in direction `d`.
     fn has_end(&self, d: [i32; 3]) -> bool {
         match self.kind {
             Kind::Motor => d == self.front,
@@ -104,8 +104,8 @@ fn axis_name(face: &str) -> &'static str {
     }
 }
 
-/// The factor `f` with `my_speed = neighbour_speed * f` when `me` and the neighbour at
-/// offset `d` (neighbour minus me) are connected, else None.
+// The factor `f` with `my_speed = neighbour_speed * f` when `me` and the neighbour at
+// offset `d` (neighbour minus me) are connected, else None.
 pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
     if me.has_end(d) && nb.has_end(neg(d)) {
         return Some(1.0);
@@ -125,7 +125,7 @@ pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
     None
 }
 
-/// Offsets worth looking at for `me`.
+// Offsets worth looking at for `me`.
 pub fn offsets(me: &Node) -> Vec<[i32; 3]> {
     let mut out = Vec::new();
     if me.kind == Kind::Motor {
@@ -204,7 +204,7 @@ fn node_at(game: &Game<'_>, p: [i32; 3]) -> Option<Node> {
     }
 }
 
-/// (speed, hops) of the kinetic block entity at `p`.
+// (speed, hops) of the kinetic block entity at `p`.
 fn read_neighbour(game: &mut Game<'_>, p: [i32; 3]) -> Option<(f32, i32)> {
     game.native_with_mod_block_entity(p, |e| {
         if e.id == BE_ID {
@@ -216,7 +216,7 @@ fn read_neighbour(game: &mut Game<'_>, p: [i32; 3]) -> Option<(f32, i32)> {
     .flatten()
 }
 
-/// One tick of a non-source block: (speed, hops, parent offset).
+// One tick of a non-source block: (speed, hops, parent offset).
 fn step(game: &mut Game<'_>, pos: [i32; 3], me: &Node, nbt: &Compound) -> (f32, i32, Option<[i32; 3]>) {
     let speed = get_f32(nbt, "speed");
     let hops = get_hops(nbt);
@@ -301,11 +301,11 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
     }
 }
 
-/// The block entity draws the moving part (`<block>_part`, never placed); the placed
-/// block's own model is empty (the motor's casing stays, only its shaft stub is drawn).
-/// A turning part is drawn about the block's centre, with Create's own phase offset:
-/// it depends only on the coordinates across the axis, so blocks along one shaft line
-/// stay aligned and meshing neighbours sit half a tooth apart.
+// The block entity draws the moving part (`<block>_part`, never placed); the placed
+// block's own model is empty (the motor's casing stays, only its shaft stub is drawn).
+// A turning part is drawn about the block's centre, with Create's own phase offset:
+// it depends only on the coordinates across the axis, so blocks along one shaft line
+// stay aligned and meshing neighbours sit half a tooth apart.
 pub fn submit(
     game: &Game<'_>,
     pos: [i32; 3],
@@ -348,7 +348,7 @@ pub fn submit(
     }
 }
 
-/// The direction the placer is looking (`getNearestLookingDirection`).
+// The direction the placer is looking (`getNearestLookingDirection`).
 pub fn nearest_looking(yaw: f32, pitch: f32) -> [i32; 3] {
     let (y, p) = (yaw.to_radians(), pitch.to_radians());
     let v = [-y.sin() * p.cos(), -p.sin(), y.cos() * p.cos()];
@@ -391,10 +391,10 @@ fn node_from_state(level: &GameLevel<'_>, state: BlockStateId) -> Option<Node> {
     }
 }
 
-/// As Create does: a block lines up with neighbours whose shaft end faces it (the motor's
-/// shaft points at one); with none, shafts and cogs take the axis you are looking along
-/// (a cog placed on a cog copies its axis) and the motor's shaft faces you. Sneaking skips
-/// the neighbour rule.
+// As Create does: a block lines up with neighbours whose shaft end faces it (the motor's
+// shaft points at one); with none, shafts and cogs take the axis you are looking along
+// (a cog placed on a cog copies its axis) and the motor's shaft faces you. Sneaking skips
+// the neighbour rule.
 pub fn placement(
     level: &GameLevel<'_>,
     state: BlockStateId,
@@ -488,83 +488,5 @@ mod tests {
         assert_eq!(link(&shaft(0), [-1, 0, 0], &motor), Some(1.0));
         assert_eq!(link(&shaft(0), [1, 0, 0], &motor), None);
     }
-}
-oth apart: alternate by position parity.
-    let odd = (pos[0] + pos[1] + pos[2]).rem_euclid(2) == 1;
-    let offset = match (odd, block) {
-        (true, "create:cogwheel") => 22.5,
-        (true, "create:large_cogwheel") => 11.25,
-        _ => 0.0,
-    };
-    let t = draw.game_time as f64 + f64::from(draw.partial);
-    let degrees = ((speed * 0.3 * t) % 360.0) as f32 + offset;
-    draw.push();
-    draw.rotate_about(about, degrees, [0.5, 0.5, 0.5]);
-    game.native_draw_block(draw, part, &[("axis", axis.as_str())]);
-    draw.pop();
-    if speed == 0.0 {
-        draw.keep();
-    }
-}
-
-/// Shafts and cogwheels take their axis from the clicked face; the motor's shaft points
-/// into the block clicked.
-pub fn placement(
-    level: &GameLevel<'_>,
-    state: BlockStateId,
-    face: &str,
-    answer: &mut Option<Option<BlockStateId>>,
-) {
-    let name = level.facts.get(state).name.to_string();
-    let Some(kind) = kind_of(&name) else { return };
-    let new = if kind == Kind::Motor {
-        level.native_state_with_property(state, "facing", opposite(face))
-    } else {
-        level.native_state_with_property(state, "axis", axis_name(face))
-    };
-    if let Some(s) = new {
-        *answer = Some(Some(s));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cog(axis: usize) -> Node {
-        Node { kind: Kind::Cogwheel, axis, front: [0; 3] }
-    }
-    fn shaft(axis: usize) -> Node {
-        Node { kind: Kind::Shaft, axis, front: [0; 3] }
-    }
-
-    #[test]
-    fn shafts_chain_along_their_axis_only() {
-        assert_eq!(link(&shaft(0), [1, 0, 0], &shaft(0)), Some(1.0));
-        assert_eq!(link(&shaft(0), [0, 1, 0], &shaft(0)), None);
-        assert_eq!(link(&shaft(0), [1, 0, 0], &shaft(1)), None);
-    }
-
-    #[test]
-    fn small_cogs_mesh_in_plane_and_reverse() {
-        assert_eq!(link(&cog(1), [1, 0, 0], &cog(1)), Some(-1.0));
-        assert_eq!(link(&cog(1), [0, 1, 0], &cog(1)), Some(1.0)); // stacked on the shaft
-        assert_eq!(link(&cog(1), [1, 0, 0], &cog(0)), None);
-    }
-
-    #[test]
-    fn small_and_large_ratio() {
-        let large = Node { kind: Kind::LargeCogwheel, axis: 1, front: [0; 3] };
-        assert_eq!(link(&cog(1), [1, 0, 0], &large), Some(-2.0));
-        assert_eq!(link(&large, [-1, 0, 0], &cog(1)), Some(-0.5));
-        assert_eq!(link(&large, [1, 0, 1], &large), Some(-1.0));
-    }
-
-    #[test]
-    fn motor_feeds_the_shaft_in_front_only() {
-        let motor = Node { kind: Kind::Motor, axis: 0, front: [1, 0, 0] };
-        assert_eq!(link(&shaft(0), [-1, 0, 0], &motor), Some(1.0));
-        assert_eq!(link(&shaft(0), [1, 0, 0], &motor), None);
-    }
-  }
-  
+        }
+        
