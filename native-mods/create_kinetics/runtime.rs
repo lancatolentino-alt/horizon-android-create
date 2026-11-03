@@ -6,6 +6,8 @@
 use super::native_block_entity_draw::BlockEntityDraw;
 use super::{Game, GameLevel};
 use horizon_client::containers::ModBlockEntity;
+use horizon_core::position::BlockPos;
+use horizon_world::level::{LevelAccess, PlacementContext};
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use horizon_world::registry::BlockStateId;
 
@@ -300,7 +302,10 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
 }
 
 /// The block entity draws the moving part (`<block>_part`, never placed); the placed
-/// block's own model is empty. A turning part is drawn about the block's centre.
+/// block's own model is empty (the motor's casing stays, only its shaft stub is drawn).
+/// A turning part is drawn about the block's centre, with Create's own phase offset:
+/// it depends only on the coordinates across the axis, so blocks along one shaft line
+/// stay aligned and meshing neighbours sit half a tooth apart.
 pub fn submit(
     game: &Game<'_>,
     pos: [i32; 3],
@@ -309,21 +314,182 @@ pub fn submit(
     entity: &ModBlockEntity,
     draw: &mut BlockEntityDraw,
 ) {
-    let part = match block {
-        "create:shaft" => "create:shaft_part",
-        "create:cogwheel" => "create:cogwheel_part",
-        "create:large_cogwheel" => "create:large_cogwheel_part",
+    let (part, prop) = match block {
+        "create:shaft" => ("create:shaft_part", "axis"),
+        "create:cogwheel" => ("create:cogwheel_part", "axis"),
+        "create:large_cogwheel" => ("create:large_cogwheel_part", "axis"),
+        "create:creative_motor" => ("create:motor_shaft_part", "facing"),
         _ => return,
     };
-    let Some(axis) = game.native_block_state_property(state, "axis") else { return };
-    let axis = axis.to_string();
-    let speed = f64::from(get_f32(&entity.nbt, "speed"));
-    let about = match axis.as_str() {
-        "x" => [1.0, 0.0, 0.0],
-        "y" => [0.0, 1.0, 0.0],
-        _ => [0.0, 0.0, 1.0],
+    let Some(value) = game.native_block_state_property(state, prop) else { return };
+    let value = value.to_string();
+    let axis = if prop == "axis" {
+        parse_axis(&value)
+    } else {
+        parse_dir(&value).map(axis_of)
     };
-    // Neighbouring gears mesh half a tooth apart: alternate by position parity.
+    let Some(axis) = axis else { return };
+    let speed = f64::from(get_f32(&entity.nbt, "speed"));
+    let mut about = [0.0f32; 3];
+    about[axis] = 1.0;
+    let across: i32 = (0..3).filter(|i| *i != axis).map(|i| pos[i]).sum();
+    let mut offset = if block == "create:large_cogwheel" { 11.25 } else { 0.0 };
+    if across % 2 == 0 {
+        offset = 22.5;
+    }
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let degrees = ((speed * 0.3 * t) % 360.0) as f32 + offset;
+    draw.push();
+    draw.rotate_about(about, degrees, [0.5, 0.5, 0.5]);
+    game.native_draw_block(draw, part, &[(prop, value.as_str())]);
+    draw.pop();
+    if speed == 0.0 {
+        draw.keep();
+    }
+}
+
+/// The direction the placer is looking (`getNearestLookingDirection`).
+pub fn nearest_looking(yaw: f32, pitch: f32) -> [i32; 3] {
+    let (y, p) = (yaw.to_radians(), pitch.to_radians());
+    let v = [-y.sin() * p.cos(), -p.sin(), y.cos() * p.cos()];
+    let mut best = 0;
+    for i in 1..3 {
+        if v[i].abs() > v[best].abs() {
+            best = i;
+        }
+    }
+    let mut d = [0; 3];
+    d[best] = if v[best] >= 0.0 { 1 } else { -1 };
+    d
+}
+
+fn dir_name(d: [i32; 3]) -> &'static str {
+    match d {
+        [0, -1, 0] => "down",
+        [0, 1, 0] => "up",
+        [0, 0, -1] => "north",
+        [0, 0, 1] => "south",
+        [-1, 0, 0] => "west",
+        _ => "east",
+    }
+}
+
+fn axis_char(axis: usize) -> &'static str {
+    ["x", "y", "z"][axis.min(2)]
+}
+
+fn node_from_state(level: &GameLevel<'_>, state: BlockStateId) -> Option<Node> {
+    let name = level.facts.get(state).name.to_string();
+    let kind = kind_of(&name)?;
+    let props = &level.registry.state(state)?.properties;
+    if kind == Kind::Motor {
+        let front = parse_dir(props.get("facing")?)?;
+        Some(Node { kind, axis: axis_of(front), front })
+    } else {
+        let axis = parse_axis(props.get("axis")?)?;
+        Some(Node { kind, axis, front: [0; 3] })
+    }
+}
+
+/// As Create does: a block lines up with neighbours whose shaft end faces it (the motor's
+/// shaft points at one); with none, shafts and cogs take the axis you are looking along
+/// (a cog placed on a cog copies its axis) and the motor's shaft faces you. Sneaking skips
+/// the neighbour rule.
+pub fn placement(
+    level: &GameLevel<'_>,
+    state: BlockStateId,
+    context: &PlacementContext,
+    answer: &mut Option<Option<BlockStateId>>,
+) {
+    let name = level.facts.get(state).name.to_string();
+    let Some(kind) = kind_of(&name) else { return };
+    let at = context.pos;
+    let look = nearest_looking(context.yaw, context.pitch);
+    let mut feeding: Vec<[i32; 3]> = Vec::new();
+    if !context.sneaking {
+        for a in 0..3 {
+            for s in [-1, 1] {
+                let mut d = [0; 3];
+                d[a] = s;
+                let nb = BlockPos::new(at.x + d[0], at.y + d[1], at.z + d[2]);
+                if let Some(n) = node_from_state(level, level.block_state(nb)) {
+                    if n.has_end(neg(d)) {
+                        feeding.push(d);
+                    }
+                }
+            }
+        }
+    }
+    let new = if kind == Kind::Motor {
+        let facing = feeding.first().copied().unwrap_or_else(|| neg(look));
+        level.native_state_with_property(state, "facing", dir_name(facing))
+    } else {
+        let mut axes: Vec<usize> = feeding.iter().map(|d| axis_of(*d)).collect();
+        axes.dedup();
+        let mut axis = if axes.len() == 1 { axes[0] } else { axis_of(look) };
+        if axes.is_empty() && !context.sneaking {
+            let clicked = BlockPos::new(context.hit_pos.x, context.hit_pos.y, context.hit_pos.z);
+            if let Some(n) = node_from_state(level, level.block_state(clicked)) {
+                if n.is_cog() && matches!(kind, Kind::Cogwheel | Kind::LargeCogwheel) {
+                    axis = n.axis;
+                }
+            }
+        }
+        level.native_state_with_property(state, "axis", axis_char(axis))
+    };
+    if let Some(s) = new {
+        *answer = Some(Some(s));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cog(axis: usize) -> Node {
+        Node { kind: Kind::Cogwheel, axis, front: [0; 3] }
+    }
+    fn shaft(axis: usize) -> Node {
+        Node { kind: Kind::Shaft, axis, front: [0; 3] }
+    }
+
+    #[test]
+    fn shafts_chain_along_their_axis_only() {
+        assert_eq!(link(&shaft(0), [1, 0, 0], &shaft(0)), Some(1.0));
+        assert_eq!(link(&shaft(0), [0, 1, 0], &shaft(0)), None);
+        assert_eq!(link(&shaft(0), [1, 0, 0], &shaft(1)), None);
+    }
+
+    #[test]
+    fn small_cogs_mesh_in_plane_and_reverse() {
+        assert_eq!(link(&cog(1), [1, 0, 0], &cog(1)), Some(-1.0));
+        assert_eq!(link(&cog(1), [0, 1, 0], &cog(1)), Some(1.0)); // stacked on the shaft
+        assert_eq!(link(&cog(1), [1, 0, 0], &cog(0)), None);
+    }
+
+    #[test]
+    fn small_and_large_ratio() {
+        let large = Node { kind: Kind::LargeCogwheel, axis: 1, front: [0; 3] };
+        assert_eq!(link(&cog(1), [1, 0, 0], &large), Some(-2.0));
+        assert_eq!(link(&large, [-1, 0, 0], &cog(1)), Some(-0.5));
+        assert_eq!(link(&large, [1, 0, 1], &large), Some(-1.0));
+    }
+
+    #[test]
+    fn looking_direction_follows_yaw_and_pitch() {
+        assert_eq!(nearest_looking(0.0, 0.0), [0, 0, 1]);
+        assert_eq!(nearest_looking(-90.0, 0.0), [1, 0, 0]);
+        assert_eq!(nearest_looking(0.0, 90.0), [0, -1, 0]);
+    }
+
+    #[test]
+    fn motor_feeds_the_shaft_in_front_only() {
+        let motor = Node { kind: Kind::Motor, axis: 0, front: [1, 0, 0] };
+        assert_eq!(link(&shaft(0), [-1, 0, 0], &motor), Some(1.0));
+        assert_eq!(link(&shaft(0), [1, 0, 0], &motor), None);
+    }
+}
+oth apart: alternate by position parity.
     let odd = (pos[0] + pos[1] + pos[2]).rem_euclid(2) == 1;
     let offset = match (odd, block) {
         (true, "create:cogwheel") => 22.5,
