@@ -81,6 +81,6 @@ helper = "placement.rs"
 bindings = [
   { name = "level", ty = "&crate::game::GameLevel<'_>", value = "&*self" },
   { name = "state", ty = "horizon_world::registry::BlockStateId", value = "state" },
-  { name = "face", ty = "String", value = "format!(\"{:?}\", context.face).to_lowercase()" },
+  { name = "context", ty = "&horizon_world::level::PlacementContext", value = "context" },
   { name = "answer", ty = "&mut Option<Option<horizon_world::registry::BlockStateId>>", value = "&mut *answer" },
 ]
