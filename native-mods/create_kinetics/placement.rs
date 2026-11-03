@@ -4,6 +4,5 @@ fn create_state_for_placement(
     context: &horizon_world::level::PlacementContext,
     answer: &mut Option<Option<horizon_world::registry::BlockStateId>>,
 ) {
-    let face = format!("{:?}", context.face).to_lowercase();
-    crate::game::create_kinetics::placement(level, state, &face, answer);
+    crate::game::create_kinetics::placement(level, state, context, answer);
 }
