@@ -4,8 +4,10 @@
 // a chain of "parents"; a block that loses its parent clears itself, so removing a
 // source winds the network down without stale speeds circulating in loops.
 use super::native_block_entity_draw::BlockEntityDraw;
+use super::native_hooks::NativeScreen;
 use super::{Game, GameLevel};
-use horizon_client::containers::ModBlockEntity;
+use horizon_client::containers::{ModBlockEntity, ModContainer};
+use horizon_client::hud::HudBatch;
 use horizon_core::position::BlockPos;
 use horizon_world::level::{LevelAccess, PlacementContext};
 use horizon_world::nbt::{Compound, JavaString, Tag};
@@ -14,7 +16,10 @@ use horizon_world::registry::BlockStateId;
 pub const BE_ID: &str = "create:kinetic";
 const NONE_HOPS: i32 = 255;
 const MAX_HOPS: i32 = 128;
-const MOTOR_RPM: f32 = 16.0;
+const MOTOR_DEFAULT_RPM: i32 = 16;
+const MOTOR_MAX_RPM: i32 = 256;
+const MOTOR_BLOCK: &str = "create:creative_motor";
+const MOTOR_MENU: &str = "create:creative_motor";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -105,24 +110,53 @@ fn axis_name(face: &str) -> &'static str {
 }
 
 // The factor `f` with `my_speed = neighbour_speed * f` when `me` and the neighbour at
-// offset `d` (neighbour minus me) are connected, else None.
+// offset `d` (neighbour minus me) are connected, else None. Rules as in Create:
+//  - shaft ends facing each other: same speed;
+//  - small cog and small cog: same axis, side by side in their plane: reversed;
+//  - small cog and large cog: same axis, diagonal in their plane: 2:1, reversed;
+//  - large cog and large cog: different axes, diagonal in the plane of both axes: reversed
+//    or not by which side of each the neighbour is on.
 pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
     if me.has_end(d) && nb.has_end(neg(d)) {
         return Some(1.0);
     }
-    if me.is_cog() && nb.is_cog() && me.axis == nb.axis && d[me.axis] == 0 {
-        let nonzero = d.iter().filter(|c| **c != 0).count();
-        let adjacent = nonzero == 1;
-        let diagonal = nonzero == 2 && d.iter().all(|c| c.abs() <= 1);
-        return match (me.kind, nb.kind) {
-            (Kind::Cogwheel, Kind::Cogwheel) if adjacent => Some(-1.0),
-            (Kind::Cogwheel, Kind::LargeCogwheel) if adjacent => Some(-2.0),
-            (Kind::LargeCogwheel, Kind::Cogwheel) if adjacent => Some(-0.5),
-            (Kind::LargeCogwheel, Kind::LargeCogwheel) if diagonal => Some(-1.0),
-            _ => None,
-        };
+    if !me.is_cog() || !nb.is_cog() {
+        return None;
     }
-    None
+    let nonzero = d.iter().filter(|c| **c != 0).count();
+    match (me.kind, nb.kind) {
+        (Kind::Cogwheel, Kind::Cogwheel) => {
+            if me.axis == nb.axis && d[me.axis] == 0 && nonzero == 1 {
+                Some(-1.0)
+            } else {
+                None
+            }
+        }
+        (Kind::LargeCogwheel, Kind::LargeCogwheel) => {
+            if me.axis == nb.axis {
+                return None;
+            }
+            let third = 3 - me.axis - nb.axis;
+            if d[me.axis].abs() == 1 && d[nb.axis].abs() == 1 && d[third] == 0 {
+                let mine = d[me.axis] > 0;
+                let theirs = d[nb.axis] > 0;
+                Some(if mine ^ theirs { -1.0 } else { 1.0 })
+            } else {
+                None
+            }
+        }
+        _ => {
+            // one small, one large
+            if me.axis != nb.axis || d[me.axis] != 0 || nonzero != 2 {
+                return None;
+            }
+            if me.kind == Kind::Cogwheel {
+                Some(-2.0)
+            } else {
+                Some(-0.5)
+            }
+        }
+    }
 }
 
 // Offsets worth looking at for `me`.
@@ -132,23 +166,45 @@ pub fn offsets(me: &Node) -> Vec<[i32; 3]> {
         out.push(me.front);
         return out;
     }
-    for a in 0..3 {
-        for s in [-1, 1] {
-            let mut d = [0; 3];
-            d[a] = s;
-            if a == me.axis || me.is_cog() {
+    // shaft ends
+    for s in [-1, 1] {
+        let mut d = [0; 3];
+        d[me.axis] = s;
+        out.push(d);
+    }
+    if !me.is_cog() {
+        return out;
+    }
+    let (p, q) = ((me.axis + 1) % 3, (me.axis + 2) % 3);
+    if me.kind == Kind::Cogwheel {
+        // small cogs side by side in the plane
+        for a in [p, q] {
+            for s in [-1, 1] {
+                let mut d = [0; 3];
+                d[a] = s;
                 out.push(d);
             }
         }
     }
+    // diagonal in the plane (small <-> large)
+    for sp in [-1, 1] {
+        for sq in [-1, 1] {
+            let mut d = [0; 3];
+            d[p] = sp;
+            d[q] = sq;
+            out.push(d);
+        }
+    }
     if me.kind == Kind::LargeCogwheel {
-        let (p, q) = ((me.axis + 1) % 3, (me.axis + 2) % 3);
-        for sp in [-1, 1] {
-            for sq in [-1, 1] {
-                let mut d = [0; 3];
-                d[p] = sp;
-                d[q] = sq;
-                out.push(d);
+        // diagonal in the plane of this axis and each other axis (large <-> large)
+        for other in [p, q] {
+            for sa in [-1, 1] {
+                for so in [-1, 1] {
+                    let mut d = [0; 3];
+                    d[me.axis] = sa;
+                    d[other] = so;
+                    out.push(d);
+                }
             }
         }
     }
@@ -283,7 +339,10 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     let Some(me) = node_at(game, pos) else { return };
     let old = get_f32(&entity.nbt, "speed");
     let (speed, hops, parent) = if me.kind == Kind::Motor {
-        (MOTOR_RPM, 0, None)
+        let rpm = motor_rpm(&entity.nbt);
+        entity.data.clear();
+        entity.data.push(rpm);
+        (rpm as f32, 0, None)
     } else {
         step(game, pos, &me, &entity.nbt)
     };
@@ -442,51 +501,115 @@ pub fn placement(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ---- the creative motor's screen ----
+// A one-slot menu (`data/create/horizon/menu/creative_motor.json`, its slot hidden) whose one
+// data slot is the motor's speed. The buttons send ids to the server, which sets the speed.
 
-    fn cog(axis: usize) -> Node {
-        Node { kind: Kind::Cogwheel, axis, front: [0; 3] }
+fn motor_rpm(nbt: &Compound) -> i32 {
+    match nbt.get(&JavaString::from("rpm")) {
+        Some(Tag::Int(v)) => *v,
+        _ => MOTOR_DEFAULT_RPM,
     }
-    fn shaft(axis: usize) -> Node {
-        Node { kind: Kind::Shaft, axis, front: [0; 3] }
-    }
+}
 
-    #[test]
-    fn shafts_chain_along_their_axis_only() {
-        assert_eq!(link(&shaft(0), [1, 0, 0], &shaft(0)), Some(1.0));
-        assert_eq!(link(&shaft(0), [0, 1, 0], &shaft(0)), None);
-        assert_eq!(link(&shaft(0), [1, 0, 0], &shaft(1)), None);
-    }
+struct Btn {
+    id: i32,
+    label: &'static str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
 
-    #[test]
-    fn small_cogs_mesh_in_plane_and_reverse() {
-        assert_eq!(link(&cog(1), [1, 0, 0], &cog(1)), Some(-1.0));
-        assert_eq!(link(&cog(1), [0, 1, 0], &cog(1)), Some(1.0)); // stacked on the shaft
-        assert_eq!(link(&cog(1), [1, 0, 0], &cog(0)), None);
-    }
+const BUTTONS: [Btn; 9] = [
+    Btn { id: 1, label: "-64", x: 11.0, y: 44.0, w: 24.0, h: 16.0 },
+    Btn { id: 2, label: "-16", x: 37.0, y: 44.0, w: 24.0, h: 16.0 },
+    Btn { id: 3, label: "-1", x: 63.0, y: 44.0, w: 24.0, h: 16.0 },
+    Btn { id: 4, label: "+1", x: 89.0, y: 44.0, w: 24.0, h: 16.0 },
+    Btn { id: 5, label: "+16", x: 115.0, y: 44.0, w: 24.0, h: 16.0 },
+    Btn { id: 6, label: "+64", x: 141.0, y: 44.0, w: 24.0, h: 16.0 },
+    Btn { id: 10, label: "Reverse", x: 11.0, y: 64.0, w: 50.0, h: 16.0 },
+    Btn { id: 11, label: "Stop", x: 63.0, y: 64.0, w: 50.0, h: 16.0 },
+    Btn { id: 12, label: "Max", x: 115.0, y: 64.0, w: 50.0, h: 16.0 },
+];
 
-    #[test]
-    fn small_and_large_ratio() {
-        let large = Node { kind: Kind::LargeCogwheel, axis: 1, front: [0; 3] };
-        assert_eq!(link(&cog(1), [1, 0, 0], &large), Some(-2.0));
-        assert_eq!(link(&large, [-1, 0, 0], &cog(1)), Some(-0.5));
-        assert_eq!(link(&large, [1, 0, 1], &large), Some(-1.0));
-    }
+// The button under `at` (GUI pixels from the screen's top left).
+fn hit(at: [f32; 2]) -> Option<i32> {
+    BUTTONS
+        .iter()
+        .find(|b| at[0] >= b.x && at[0] < b.x + b.w && at[1] >= b.y && at[1] < b.y + b.h)
+        .map(|b| b.id)
+}
 
-    #[test]
-    fn looking_direction_follows_yaw_and_pitch() {
-        assert_eq!(nearest_looking(0.0, 0.0), [0, 0, 1]);
-        assert_eq!(nearest_looking(-90.0, 0.0), [1, 0, 0]);
-        assert_eq!(nearest_looking(0.0, 90.0), [0, -1, 0]);
+pub fn container(block: &str, container: &mut Option<ModContainer>) {
+    if block == MOTOR_BLOCK {
+        *container = Some(ModContainer {
+            slots: 1,
+            menu: Some(MOTOR_MENU.to_string()),
+            ..Default::default()
+        });
     }
+}
 
-    #[test]
-    fn motor_feeds_the_shaft_in_front_only() {
-        let motor = Node { kind: Kind::Motor, axis: 0, front: [1, 0, 0] };
-        assert_eq!(link(&shaft(0), [-1, 0, 0], &motor), Some(1.0));
-        assert_eq!(link(&shaft(0), [1, 0, 0], &motor), None);
+pub fn screen(block: &str, screen: &mut Option<NativeScreen>) {
+    if block == MOTOR_BLOCK {
+        *screen = Some(NativeScreen {
+            width: 176.0,
+            height: 166.0,
+            slots: vec![None],
+            inventory_y: 84.0,
+            inventory_x: 8.0,
+            own_labels: false,
+        });
     }
+}
+
+pub fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut HudBatch, origin: [f32; 2]) {
+    if block != MOTOR_BLOCK {
+        return;
+    }
+    let rpm = data.first().copied().unwrap_or(MOTOR_DEFAULT_RPM);
+    game.native_text(batch, "Rotation Speed", [origin[0] + 8.0, origin[1] + 20.0], 0x404040, false);
+    let value = format!("{} RPM", rpm);
+    let width = game.native_text_width(&value);
+    game.native_text(batch, &value, [origin[0] + 88.0 - width / 2.0, origin[1] + 31.0], 0x1F1F1F, false);
+    let cursor = game.native_cursor();
+    let over = hit([cursor[0] - origin[0], cursor[1] - origin[1]]);
+    for b in BUTTONS.iter() {
+        let face = if over == Some(b.id) { 0xFFA8A8A8 } else { 0xFF8B8B8B };
+        game.native_fill(batch, [origin[0] + b.x, origin[1] + b.y, b.w, b.h], 0xFF373737);
+        game.native_fill(batch, [origin[0] + b.x + 1.0, origin[1] + b.y + 1.0, b.w - 2.0, b.h - 2.0], face);
+        let label_width = game.native_text_width(b.label);
+        game.native_text(
+            batch,
+            b.label,
+            [origin[0] + b.x + (b.w - label_width) / 2.0, origin[1] + b.y + 4.0],
+            0xFFFFFF,
+            true,
+        );
+    }
+}
+
+pub fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
+    if block == MOTOR_BLOCK {
+        if let Some(id) = hit(at) {
+            *button = Some(id);
         }
+    }
+}
+
+pub fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) {
+    if entity.id != BE_ID || game.native_block(pos) != MOTOR_BLOCK {
+        return;
+    }
+    let cur = motor_rpm(&entity.nbt);
+    let next = match id {
+        1 => cur - 64,
+        2 => cur - 16,
+        3 => cur - 1,
+        4 => cur + 1,
+        5 => cur + 16,
+        6 => cur + 64,
+        10 => -cur,
+        11 => 0,
         
