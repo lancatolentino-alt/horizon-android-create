@@ -501,6 +501,84 @@ fn sect() -> String {
     char::from(0xA7u8).to_string()
 }
 
+// ---- the mechanical drill ----
+// As in Create: a spinning drill works on the block in front of it. Each stage takes
+// hardness / (rpm / 100) ticks (at least one), ten stages break the block, and the crack
+// shows on it meanwhile. The block drops what its loot table gives, as without a tool.
+
+fn drill_id(pos: [i32; 3]) -> i32 {
+    let h = pos[0].wrapping_mul(73856093) ^ pos[1].wrapping_mul(19349663) ^ pos[2].wrapping_mul(83492791);
+    0x4000_0000 | (h & 0x3fff_ffff)
+}
+
+fn drill_idle(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
+    put_int(nbt, "bp", 0);
+    put_int(nbt, "bt", 0);
+    game.destroying.remove(&drill_id(pos));
+}
+
+fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return;
+    }
+    if speed.abs() < 1.0 {
+        drill_idle(game, pos, nbt);
+        return;
+    }
+    let target = [pos[0] + me.front[0], pos[1] + me.front[1], pos[2] + me.front[2]];
+    let state = game.world.block(target[0], target[1], target[2]);
+    let facts = game.res.facts().get(state).clone();
+    let name = facts.name.to_string();
+    let empty = name == "minecraft:air"
+        || name == "minecraft:cave_air"
+        || name == "minecraft:void_air"
+        || name == "minecraft:water"
+        || name == "minecraft:lava";
+    if empty || facts.hardness < 0.0 {
+        drill_idle(game, pos, nbt);
+        return;
+    }
+    let was = [get_int(nbt, "bx", i32::MIN), get_int(nbt, "by", i32::MIN), get_int(nbt, "bz", i32::MIN)];
+    if was != target {
+        put_int(nbt, "bx", target[0]);
+        put_int(nbt, "by", target[1]);
+        put_int(nbt, "bz", target[2]);
+        put_int(nbt, "bp", 0);
+        put_int(nbt, "bt", 0);
+    }
+    let hardness = facts.hardness.max(0.05);
+    let break_speed = (speed.abs() / 100.0).clamp(1.0 / 128.0, 16.0);
+    let mut wait = get_int(nbt, "bt", 0) - 1;
+    let mut progress = get_int(nbt, "bp", 0);
+    if wait <= 0 {
+        let step = ((break_speed / hardness) as i32).clamp(1, (10 - progress).max(1));
+        progress += step;
+        wait = ((hardness / break_speed) as i32).max(1);
+    }
+    put_int(nbt, "bt", wait);
+    put_int(nbt, "bp", progress);
+    let id = drill_id(pos);
+    if progress >= 10 {
+        put_int(nbt, "bp", 0);
+        put_int(nbt, "bt", 0);
+        game.destroying.remove(&id);
+        let drops = game.block_loot_at(target, state, None);
+        let dim = game.dim.id().to_string();
+        if game.native_set_block(&dim, target, BlockStateId(0), 3) {
+            game.destroy_particles(target, state);
+            for d in drops {
+                if &*d.item != "minecraft:air" {
+                    game.pop_resource(target, d);
+                }
+            }
+        }
+    } else {
+        let stage = (progress.clamp(1, 10) - 1) as u8;
+        let at = game.world.game_time;
+        game.destroying.insert(id, (target, stage, at));
+    }
+}
+
 // ---- hooks ----
 
 pub fn block_entity(block: &str, entity: &mut Option<(String, Compound)>) {
@@ -573,6 +651,9 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     set_state(&mut entity.nbt, out.speed, out.hops, out.parent);
     put_int(&mut entity.nbt, "load", out.load);
     put_int(&mut entity.nbt, "cap", out.cap);
+    if me.kind == Kind::Drill {
+        drill_tick(game, pos, &mut entity.nbt, &me, out.speed);
+    }
     if me.kind == Kind::Motor {
         let rpm = motor_rpm(&entity.nbt);
         entity.data.clear();
@@ -636,7 +717,7 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3]) {
 // part is drawn). A turning part is drawn about the blocks centre, with Creates own phase
 // offset: it depends only on the coordinates across the axis, so blocks along one shaft line
 // stay aligned and meshing neighbours sit half a tooth apart. The press head moves up and
-// down instead. The water wheel borrows the large cogwheel until its wheel model is carried.
+// down instead.
 pub fn submit(
     game: &Game<'_>,
     pos: [i32; 3],
@@ -654,7 +735,7 @@ pub fn submit(
         "create:hand_crank" => ("create:hand_crank_handle_part", "facing", "facing", 0),
         "create:mechanical_drill" => ("create:drill_head_part", "facing", "facing", 0),
         "create:mechanical_press" => ("create:press_head_part", "facing", "facing", 1),
-        "create:water_wheel" => ("create:large_cogwheel_part", "facing", "axis", 2),
+        "create:water_wheel" => ("create:water_wheel_wheel_part", "facing", "axis", 2),
         _ => return,
     };
     let Some(value) = game.native_block_state_property(state, prop) else { return };
