@@ -40,25 +40,38 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .local/keystore-cache
+          key: native-dev-keystore-v1
+      - name: Restore the saved dev signing key
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .local/keystore-cache
+          key: native-dev-keystore-v1
       - name: Restore dedicated dev signing identity
         env:
           DEV_KEYSTORE: ${{ secrets.ANDROID_DEV_KEYSTORE_BASE64 }}
         run: |
           python3 - <<'PY'
-          import base64, os
+          import base64, os, shutil, subprocess
           from pathlib import Path
           value = os.environ.get('DEV_KEYSTORE', '')
           path = Path('.local/android/debug.keystore')
+          saved = Path('.local/keystore-cache/debug.keystore')
           path.parent.mkdir(parents=True, exist_ok=True)
+          saved.parent.mkdir(parents=True, exist_ok=True)
           if value:
               path.write_bytes(base64.b64decode(value, validate=True))
           else:
-              # No secret set: make a throwaway key (each run's APK is then signed differently).
-              import subprocess
-              subprocess.run(['keytool', '-genkeypair', '-keystore', str(path), '-storepass', 'android',
-                              '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA',
-                              '-keysize', '2048', '-validity', '10000', '-dname', 'CN=Android Debug,O=Android,C=US'],
-                             check=True)
+              # No secret: reuse the key saved by an earlier run, or make one once and save it,
+              # so every build is signed alike and installs over the last without uninstalling.
+              if not saved.exists():
+                  subprocess.run(['keytool', '-genkeypair', '-keystore', str(saved), '-storepass', 'android',
+                                  '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA',
+                                  '-keysize', '2048', '-validity', '10000', '-dname', 'CN=Android Debug,O=Android,C=US'],
+                                 check=True)
+              shutil.copyfile(saved, path)
           path.chmod(0o600)
           PY
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
