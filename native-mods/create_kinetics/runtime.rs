@@ -40,6 +40,11 @@ pub enum Kind {
     Wheel,
     Drill,
     Press,
+    Gearbox,
+    Clutch,
+    Gearshift,
+    Chain,
+    AdjChain,
 }
 
 pub fn kind_of(block: &str) -> Option<Kind> {
@@ -52,13 +57,18 @@ pub fn kind_of(block: &str) -> Option<Kind> {
         "create:water_wheel" => Some(Kind::Wheel),
         "create:mechanical_drill" => Some(Kind::Drill),
         "create:mechanical_press" => Some(Kind::Press),
+        "create:gearbox" => Some(Kind::Gearbox),
+        "create:clutch" => Some(Kind::Clutch),
+        "create:gearshift" => Some(Kind::Gearshift),
+        "create:encased_chain_drive" => Some(Kind::Chain),
+        "create:adjustable_chain_gearshift" => Some(Kind::AdjChain),
         _ => None,
     }
 }
 
 impl Kind {
     fn uses_facing(self) -> bool {
-        !matches!(self, Kind::Shaft | Kind::Cogwheel | Kind::LargeCogwheel)
+        matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Drill | Kind::Press)
     }
     fn is_source(self) -> bool {
         matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel)
@@ -90,6 +100,11 @@ impl Kind {
             Kind::Wheel => "Water Wheel",
             Kind::Drill => "Mechanical Drill",
             Kind::Press => "Mechanical Press",
+            Kind::Gearbox => "Gearbox",
+            Kind::Clutch => "Clutch",
+            Kind::Gearshift => "Gearshift",
+            Kind::Chain => "Encased Chain Drive",
+            Kind::AdjChain => "Adjustable Chain Gearshift",
         }
     }
 }
@@ -101,9 +116,27 @@ pub struct Node {
     pub kind: Kind,
     pub axis: usize,
     pub front: [i32; 3],
+    // Direction to the block feeding a gearbox (its source facing), zero if none.
+    pub src: [i32; 3],
+    // Chain drives: whether the chain runs along the first coordinate across the axis.
+    pub first: bool,
 }
 
 impl Node {
+    fn new(kind: Kind, axis: usize, front: [i32; 3]) -> Node {
+        Node { kind, axis, front, src: [0; 3], first: false }
+    }
+    fn is_chain(&self) -> bool {
+        matches!(self.kind, Kind::Chain | Kind::AdjChain)
+    }
+    // The axis a chain drive links along (across its own axis).
+    fn chain_axis(&self) -> usize {
+        if self.first {
+            (self.axis + 1) % 3
+        } else {
+            (self.axis + 2) % 3
+        }
+    }
     fn is_cog(&self) -> bool {
         matches!(self.kind, Kind::Cogwheel | Kind::LargeCogwheel)
     }
@@ -122,6 +155,7 @@ impl Node {
             Kind::Motor => d == self.front,
             Kind::Crank | Kind::Drill => d == neg(self.front),
             Kind::Press => unit && d[self.shaft_axis()] != 0,
+            Kind::Gearbox => unit && d[self.axis] == 0,
             _ => unit && d[self.axis] != 0,
         }
     }
@@ -171,6 +205,25 @@ fn dir_name(d: [i32; 3]) -> &'static str {
     }
 }
 
+// How a gearbox turns the output facing `dir` compared with its input facing `src`
+// (Create: straight through reverses, a side output reverses when it shares the input sign).
+fn gearbox_mod(src: [i32; 3], dir: [i32; 3]) -> f32 {
+    if src == [0; 3] {
+        return 1.0;
+    }
+    if axis_of(dir) == axis_of(src) {
+        if dir == src {
+            1.0
+        } else {
+            -1.0
+        }
+    } else if dir.iter().sum::<i32>() == src.iter().sum::<i32>() {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
 // The factor `f` with `my_speed = neighbour_speed * f` when `me` and the neighbour at
 // offset `d` (neighbour minus me) are connected, else None. Rules as in Create:
 //  - shaft ends facing each other: same speed;
@@ -180,7 +233,13 @@ fn dir_name(d: [i32; 3]) -> &'static str {
 //    or not by which side of each the neighbour is on.
 pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
     if me.has_end(d) && nb.has_end(neg(d)) {
-        return Some(1.0);
+        return Some(if nb.kind == Kind::Gearbox { gearbox_mod(nb.src, neg(d)) } else { 1.0 });
+    }
+    if me.is_chain() && nb.is_chain() && me.axis == nb.axis && me.first == nb.first {
+        let line = me.chain_axis();
+        if d[line].abs() == 1 && d.iter().filter(|c| **c != 0).count() == 1 {
+            return Some(1.0);
+        }
     }
     if !me.is_cog() || !nb.is_cog() {
         return None;
@@ -231,6 +290,13 @@ pub fn offsets(me: &Node) -> Vec<[i32; 3]> {
             if me.has_end(d) {
                 out.push(d);
             }
+        }
+    }
+    if me.is_chain() {
+        for sgn in [-1, 1] {
+            let mut d = [0; 3];
+            d[me.chain_axis()] = sgn;
+            out.push(d);
         }
     }
     if !me.is_cog() {
@@ -326,10 +392,14 @@ fn node_at(game: &Game<'_>, p: [i32; 3]) -> Option<Node> {
     let kind = kind_of(&game.native_block(p))?;
     if kind.uses_facing() {
         let front = parse_dir(&game.native_block_property(p, "facing")?)?;
-        Some(Node { kind, axis: axis_of(front), front })
+        Some(Node::new(kind, axis_of(front), front))
     } else {
         let axis = parse_axis(&game.native_block_property(p, "axis")?)?;
-        Some(Node { kind, axis, front: [0; 3] })
+        let mut node = Node::new(kind, axis, [0; 3]);
+        if node.is_chain() {
+            node.first = game.native_block_property(p, "axis_along_first").map(|v| v == "true").unwrap_or(false);
+        }
+        Some(node)
     }
 }
 
@@ -340,6 +410,7 @@ struct Reading {
     load: i32,
     cap: i32,
     target: f32,
+    parent: Option<[i32; 3]>,
 }
 
 // What the kinetic block entity at `p` holds.
@@ -352,6 +423,7 @@ fn read_neighbour(game: &mut Game<'_>, p: [i32; 3]) -> Option<Reading> {
                 load: get_int(&e.nbt, "load", 0),
                 cap: get_int(&e.nbt, "cap", 0),
                 target: get_f32(&e.nbt, "target"),
+                parent: get_parent(&e.nbt),
             })
         } else {
             None
@@ -380,7 +452,8 @@ fn step(game: &mut Game<'_>, pos: [i32; 3], me: &Node, nbt: &Compound) -> Out {
     if let Some(d) = get_parent(nbt) {
         // Keep a parent that still feeds us from closer to a source; else wind down.
         let p = at(d);
-        if let (Some(nb), Some(r)) = (node_at(game, p), read_neighbour(game, p)) {
+        if let (Some(mut nb), Some(r)) = (node_at(game, p), read_neighbour(game, p)) {
+            nb.src = r.parent.unwrap_or([0; 3]);
             if let Some(f) = link(me, d, &nb) {
                 if r.speed != 0.0 && r.hops < hops && r.hops + 1 <= MAX_HOPS {
                     return Out { speed: r.speed * f, hops: r.hops + 1, parent: Some(d), load: r.load, cap: r.cap };
@@ -395,9 +468,10 @@ fn step(game: &mut Game<'_>, pos: [i32; 3], me: &Node, nbt: &Compound) -> Out {
     let mut best: Option<(i32, f32, [i32; 3], i32, i32)> = None;
     for d in offsets(me) {
         let p = at(d);
-        let Some(nb) = node_at(game, p) else { continue };
-        let Some(f) = link(me, d, &nb) else { continue };
+        let Some(mut nb) = node_at(game, p) else { continue };
         let Some(r) = read_neighbour(game, p) else { continue };
+        nb.src = r.parent.unwrap_or([0; 3]);
+        let Some(f) = link(me, d, &nb) else { continue };
         if r.speed == 0.0 || r.hops >= MAX_HOPS {
             continue;
         }
@@ -487,8 +561,9 @@ fn analyse(game: &mut Game<'_>, pos: [i32; 3], me: &Node, target: f32) -> (i32, 
             if seen.contains(&q) {
                 continue;
             }
-            let Some(nb) = node_at(game, q) else { continue };
+            let Some(mut nb) = node_at(game, q) else { continue };
             let Some(f) = link(&nb, neg(d), &node) else { continue };
+            nb.src = neg(d);
             seen.insert(q);
             queue.push((q, nb, speed * f));
         }
@@ -726,6 +801,10 @@ pub fn submit(
     entity: &ModBlockEntity,
     draw: &mut BlockEntityDraw,
 ) {
+    if matches!(block, "create:gearbox" | "create:clutch" | "create:gearshift") {
+        submit_halves(game, pos, block, state, entity, draw);
+        return;
+    }
     // (part, state property of the block, property of the part, 0 spin / 1 press / 2 wheel)
     let (part, prop, part_prop, anim) = match block {
         "create:shaft" => ("create:shaft_part", "axis", "axis", 0),
@@ -771,6 +850,46 @@ pub fn submit(
     }
 }
 
+// The shaft halves of a gearbox (one on each side across its axis) or of a clutch or
+// gearshift (one at each end), each turning as the block does at its own port.
+fn submit_halves(
+    game: &Game<'_>,
+    pos: [i32; 3],
+    block: &str,
+    state: BlockStateId,
+    entity: &ModBlockEntity,
+    draw: &mut BlockEntityDraw,
+) {
+    let Some(value) = game.native_block_state_property(state, "axis") else { return };
+    let Some(axis) = parse_axis(&value.to_string()) else { return };
+    let src = get_parent(&entity.nbt).unwrap_or([0; 3]);
+    let speed = f64::from(get_f32(&entity.nbt, "speed"));
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let gearbox = block == "create:gearbox";
+    for a in 0..3 {
+        for sgn in [-1, 1] {
+            let mut d = [0; 3];
+            d[a] = sgn;
+            if gearbox == (a == axis) {
+                continue;
+            }
+            let m = if gearbox { f64::from(gearbox_mod(src, d)) } else { 1.0 };
+            let across: i32 = (0..3).filter(|i| *i != a).map(|i| pos[i]).sum();
+            let offset = if across % 2 == 0 { 22.5 } else { 0.0 };
+            let degrees = ((speed * m * 0.3 * t) % 360.0) as f32 + offset;
+            let mut about = [0.0f32; 3];
+            about[a] = 1.0;
+            draw.push();
+            draw.rotate_about(about, degrees, [0.5, 0.5, 0.5]);
+            game.native_draw_block(draw, "create:motor_shaft_part", &[("facing", dir_name(d))]);
+            draw.pop();
+        }
+    }
+    if speed == 0.0 {
+        draw.keep();
+    }
+}
+
 // The direction the placer is looking (`getNearestLookingDirection`).
 pub fn nearest_looking(yaw: f32, pitch: f32) -> [i32; 3] {
     let (y, p) = (yaw.to_radians(), pitch.to_radians());
@@ -792,10 +911,14 @@ fn node_from_state(level: &GameLevel<'_>, state: BlockStateId) -> Option<Node> {
     let props = &level.registry.state(state)?.properties;
     if kind.uses_facing() {
         let front = parse_dir(props.get("facing")?)?;
-        Some(Node { kind, axis: axis_of(front), front })
+        Some(Node::new(kind, axis_of(front), front))
     } else {
         let axis = parse_axis(props.get("axis")?)?;
-        Some(Node { kind, axis, front: [0; 3] })
+        let mut node = Node::new(kind, axis, [0; 3]);
+        if node.is_chain() {
+            node.first = props.get("axis_along_first").map(|v| v == "true").unwrap_or(false);
+        }
+        Some(node)
     }
 }
 
@@ -995,7 +1118,7 @@ mod tests {
     use super::*;
 
     fn node(kind: Kind, axis: usize) -> Node {
-        Node { kind, axis, front: [0; 3] }
+        Node::new(kind, axis, [0; 3])
     }
     fn cog(axis: usize) -> Node {
         node(Kind::Cogwheel, axis)
@@ -1038,29 +1161,61 @@ mod tests {
 
     #[test]
     fn motor_feeds_the_shaft_in_front_only() {
-        let motor = Node { kind: Kind::Motor, axis: 0, front: [1, 0, 0] };
+        let motor = Node::new(Kind::Motor, 0, [1, 0, 0]);
         assert_eq!(link(&shaft(0), [-1, 0, 0], &motor), Some(1.0));
         assert_eq!(link(&shaft(0), [1, 0, 0], &motor), None);
     }
 
     #[test]
     fn crank_and_drill_take_a_shaft_at_their_back() {
-        let crank = Node { kind: Kind::Crank, axis: 1, front: [0, 1, 0] };
+        let crank = Node::new(Kind::Crank, 1, [0, 1, 0]);
         // a crank facing up has its shaft end down: a shaft below it joins, one above does not
         assert_eq!(link(&shaft(1), [0, 1, 0], &crank), Some(1.0)); // crank above the shaft
         assert_eq!(link(&shaft(1), [0, -1, 0], &crank), None); // crank below the shaft
         assert_eq!(link(&crank, [0, -1, 0], &shaft(1)), Some(1.0));
-        let drill = Node { kind: Kind::Drill, axis: 2, front: [0, 0, -1] };
+        let drill = Node::new(Kind::Drill, 2, [0, 0, -1]);
         assert_eq!(link(&drill, [0, 0, 1], &shaft(2)), Some(1.0));
         assert_eq!(link(&drill, [0, 0, -1], &shaft(2)), None);
     }
 
     #[test]
     fn press_takes_a_shaft_across_its_facing() {
-        let press = Node { kind: Kind::Press, axis: 2, front: [0, 0, -1] };
+        let press = Node::new(Kind::Press, 2, [0, 0, -1]);
         assert_eq!(link(&press, [1, 0, 0], &shaft(0)), Some(1.0));
         assert_eq!(link(&press, [-1, 0, 0], &shaft(0)), Some(1.0));
         assert_eq!(link(&press, [0, 0, 1], &shaft(2)), None);
+    }
+
+    #[test]
+    fn gearbox_outputs() {
+        // input from the west (src = west): east is straight through (reversed), north/south are side outputs
+        let west = [-1, 0, 0];
+        assert_eq!(gearbox_mod(west, [-1, 0, 0]), 1.0);
+        assert_eq!(gearbox_mod(west, [1, 0, 0]), -1.0);
+        assert_eq!(gearbox_mod(west, [0, 0, 1]), 1.0);
+        assert_eq!(gearbox_mod(west, [0, 0, -1]), -1.0);
+        assert_eq!(gearbox_mod([0; 3], [1, 0, 0]), 1.0);
+    }
+
+    #[test]
+    fn gearbox_has_ports_across_its_axis() {
+        let gb = node(Kind::Gearbox, 1);
+        assert!(gb.has_end([1, 0, 0]));
+        assert!(gb.has_end([0, 0, -1]));
+        assert!(!gb.has_end([0, 1, 0]));
+    }
+
+    #[test]
+    fn chain_drives_link_along_their_chain_only() {
+        let mut a = node(Kind::Chain, 1);
+        let mut b = node(Kind::Chain, 1);
+        a.first = true;
+        b.first = true;
+        // axis y, first coordinate across it is z (axis + 1 = 2)
+        assert_eq!(link(&a, [0, 0, 1], &b), Some(1.0));
+        assert_eq!(link(&a, [1, 0, 0], &b), None);
+        b.first = false;
+        assert_eq!(link(&a, [0, 0, 1], &b), None);
     }
 
     #[test]
