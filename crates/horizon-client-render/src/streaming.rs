@@ -202,6 +202,7 @@ struct MeshSettings {
     blend_radius: i32,
     smooth_lighting: bool,
     cutout_leaves: bool,
+    experimental_leaf_culling: bool,
 }
 enum Job {
     Generate(i32, i32),
@@ -444,6 +445,7 @@ pub struct Streaming {
     /// The `ao` and `cutoutLeaves` options.
     pub smooth_lighting: bool,
     pub cutout_leaves: bool,
+    pub experimental_leaf_culling: bool,
     /// Incremental relighting of block edits on lit chunks (see `light::relight`).
     light_tables: Arc<LightTables>,
     /// Applied edits by sequence, replayed onto light jobs snapshotted before them.
@@ -798,6 +800,8 @@ impl Streaming {
                                         blend_radius: settings.blend_radius,
                                         smooth_lighting: settings.smooth_lighting,
                                         cutout_leaves: settings.cutout_leaves,
+                                        experimental_leaf_culling: settings
+                                            .experimental_leaf_culling,
                                         assets: &context.assets,
                                         render: &context.render,
                                         tables: &context.tables,
@@ -879,6 +883,7 @@ impl Streaming {
             biome_blend: 2,
             smooth_lighting: true,
             cutout_leaves: true,
+            experimental_leaf_culling: false,
             light_tables,
             light_log: Vec::new(),
             light_edit_sequence: 0,
@@ -1738,6 +1743,7 @@ impl Streaming {
                             blend_radius: self.biome_blend,
                             smooth_lighting: self.smooth_lighting,
                             cutout_leaves: self.cutout_leaves,
+                            experimental_leaf_culling: self.experimental_leaf_culling,
                         },
                     ),
                 );
@@ -2399,6 +2405,7 @@ mod tests {
         mesh.solid.resize(64, bytemuck::Zeroable::zeroed());
         mesh.translucent.resize(16, bytemuck::Zeroable::zeroed());
         mesh.block_entities.push(([1, 2, 3], 7));
+        mesh.lights.push(([4, 5, 6], 11));
         mesh.visibility = 0;
         mesh.sides = crate::mesher::Sides::unsorted(16);
         let capacities = mesh.capacity_bytes();
@@ -2415,6 +2422,7 @@ mod tests {
         assert!(reused.solid.is_empty());
         assert!(reused.translucent.is_empty());
         assert!(reused.block_entities.is_empty());
+        assert!(reused.lights.is_empty());
         assert_eq!(reused.visibility, crate::mesher::ALL_VISIBLE);
         assert_eq!(reused.sides, crate::mesher::Sides::default());
         assert_eq!(pool.bytes, 0);
