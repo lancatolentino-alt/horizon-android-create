@@ -167,7 +167,6 @@ impl Node {
         match self.kind {
             Kind::Motor => d == self.front,
             Kind::Crank | Kind::Drill => d == neg(self.front),
-            Kind::Press => unit && d[self.shaft_axis()] != 0,
             Kind::Gearbox => unit && d[self.axis] == 0,
             Kind::Belt => self.shaft && unit && d[self.shaft_axis()] != 0,
             _ => unit && d[self.axis] != 0,
@@ -606,6 +605,23 @@ fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
         (false, true) => "start",
         _ => "none",
     };
+    if want == "none" {
+        for a in 0..3 {
+            if a == me.axis {
+                continue;
+            }
+            for sgn in [-1, 1] {
+                let mut p = pos;
+                p[a] += sgn;
+                if let Some(n) = node_at(game, p) {
+                    if n.is_chain() && n.axis == me.axis && n.chain_axis() == a && n.first != me.first {
+                        game.native_set_block_property(pos, "axis_along_first", if n.first { "true" } else { "false" });
+                        return;
+                    }
+                }
+            }
+        }
+    }
     let same = game.native_block_property(pos, "part").map(|v| v == want).unwrap_or(true);
     if !same {
         game.native_set_block_property(pos, "part", want);
@@ -715,20 +731,24 @@ fn pressing(item: &str) -> Option<&'static str> {
     }
 }
 
-fn press_tick(game: &mut Game<'_>, pos: [i32; 3], speed: f32) {
-    if game.serving.is_none() && game.options.dedicated.is_none() {
-        return;
+// Whether something pressable lies under the press: on a depot one or two blocks down, or on the ground.
+fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    for below in [1, 2] {
+        let p = [pos[0], pos[1] - below, pos[2]];
+        if let Some(Some((item, _))) = depot_at(game, p) {
+            if pressing(&item).is_some() {
+                return true;
+            }
+        }
     }
-    let rpm = f64::from(speed.abs());
-    if rpm < 1.0 {
-        return;
-    }
-    let t = game.ticks as f64;
-    let now = (rpm * 0.3 * t) % 360.0;
-    let before = (rpm * 0.3 * (t - 1.0)) % 360.0;
-    if !(before < 180.0 && now >= 180.0) {
-        return;
-    }
+    let dim = game.dim.id().to_string();
+    let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+    let found = game.native_item_entities(&dim, [x, y - 2.0, z], [x + 1.0, y, z + 1.0]);
+    found.iter().any(|e| pressing(&e.stack.item).is_some())
+}
+
+// The head hits the bottom: press what lies under it. Whatever sat on a depot stays on it.
+fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
     for below in [1, 2] {
         let p = [pos[0], pos[1] - below, pos[2]];
         if let Some(Some((item, count))) = depot_at(game, p) {
@@ -750,6 +770,32 @@ fn press_tick(game: &mut Game<'_>, pos: [i32; 3], speed: f32) {
             game.spawn_item(made, e.position, [0.0, 0.1, 0.0], 10);
         }
     }
+}
+
+// One tick of the press: a cycle (head down, head up) runs only while there is something to press,
+// at the pace of the shaft. The phase (degrees, 0 = head up, 180 = at the bottom) is kept in the
+// block entity and sent to the clients that draw the head. True when it changed.
+fn press_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32) -> bool {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return false;
+    }
+    let rpm = speed.abs();
+    let phase = get_f32(nbt, "pp");
+    if rpm < 1.0 {
+        return false;
+    }
+    if phase == 0.0 && !pressable_below(game, pos) {
+        return false;
+    }
+    let mut next = phase + rpm * 0.3;
+    if phase < 180.0 && next >= 180.0 {
+        press_now(game, pos);
+    }
+    if next >= 360.0 {
+        next = 0.0;
+    }
+    put_f32(nbt, "pp", next);
+    true
 }
 
 // ---- belts ----
@@ -818,6 +864,73 @@ fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], me: &Node, speed: f32) {
 
 fn say(game: &mut Game<'_>, text: &str) {
     game.native_chat(text);
+}
+
+// Takes the belt through `at` apart: the end pieces turn back into shafts, the middle ones vanish, and a
+// belt connector drops. `skip` is a piece that is being broken anyway.
+fn belt_dismantle(game: &mut Game<'_>, at: [i32; 3], skip: Option<[i32; 3]>) {
+    let Some(me) = node_at(game, at) else { return };
+    if me.kind != Kind::Belt {
+        return;
+    }
+    let line = axis_of(me.front);
+    let mut pieces: Vec<[i32; 3]> = vec![at];
+    for sgn in [-1, 1] {
+        let mut p = at;
+        for _ in 0..40 {
+            p[line] += sgn;
+            match node_at(game, p) {
+                Some(n) if n.kind == Kind::Belt && n.front == me.front => pieces.push(p),
+                _ => break,
+            }
+        }
+    }
+    let shaft_axis = if line == 0 { 2 } else { 0 };
+    let dim = game.dim.id().to_string();
+    let shaft = game.pack.assets.registry.default_state("create:shaft");
+    for p in pieces {
+        if Some(p) == skip {
+            continue;
+        }
+        let part = game.native_block_property(p, "part").map(|v| v.to_string()).unwrap_or_default();
+        if part != "middle" {
+            if let Some(base) = shaft {
+                game.native_set_block(&dim, p, base, 3);
+                game.native_set_block_property(p, "axis", axis_char(shaft_axis));
+            }
+        } else {
+            game.native_set_block(&dim, p, BlockStateId(0), 3);
+        }
+    }
+    let drop = [f64::from(at[0]) + 0.5, f64::from(at[1]) + 1.0, f64::from(at[2]) + 0.5];
+    game.spawn_item(stack_of("create:belt_connector", 1), drop, [0.0, 0.1, 0.0], 10);
+}
+
+// A belt piece checks its neighbours now and then: a start needs a piece ahead, an end one behind, a middle
+// both. If one is gone the belt comes apart.
+fn belt_validate(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return;
+    }
+    let part = game.native_block_property(pos, "part").map(|v| v.to_string()).unwrap_or_default();
+    let line = axis_of(me.front);
+    let need_ahead = part != "end";
+    let need_behind = part != "start";
+    let mut broken = false;
+    for (need, sgn) in [(need_ahead, 1), (need_behind, -1)] {
+        if !need {
+            continue;
+        }
+        let mut p = pos;
+        p[line] += sgn * me.front[line];
+        let ok = matches!(node_at(game, p), Some(n) if n.kind == Kind::Belt && n.front == me.front);
+        if !ok {
+            broken = true;
+        }
+    }
+    if broken {
+        belt_dismantle(game, pos, None);
+    }
 }
 
 // The belt connector: click one shaft, then another shaft on the same axis in a straight horizontal
@@ -903,7 +1016,7 @@ fn drill_id(pos: [i32; 3]) -> i32 {
 fn drill_idle(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
     put_int(nbt, "bp", 0);
     put_int(nbt, "bt", 0);
-    game.destroying.remove(&drill_id(pos));
+    game.destroy_block_progress(drill_id(pos), pos, -1);
 }
 
 fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) {
@@ -942,7 +1055,7 @@ fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
     if wait <= 0 {
         let step = ((break_speed / hardness) as i32).clamp(1, (10 - progress).max(1));
         progress += step;
-        wait = ((hardness / break_speed) as i32).max(1);
+        wait = ((hardness / break_speed) as i32).max(2);
     }
     put_int(nbt, "bt", wait);
     put_int(nbt, "bp", progress);
@@ -950,7 +1063,7 @@ fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
     if progress >= 10 {
         put_int(nbt, "bp", 0);
         put_int(nbt, "bt", 0);
-        game.destroying.remove(&id);
+        game.destroy_block_progress(id, target, -1);
         let drops = game.block_loot_at(target, state, None);
         let dim = game.dim.id().to_string();
         if game.native_set_block(&dim, target, BlockStateId(0), 3) {
@@ -962,9 +1075,7 @@ fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
             }
         }
     } else {
-        let stage = (progress.clamp(1, 10) - 1) as u8;
-        let at = game.world.game_time;
-        game.destroying.insert(id, (target, stage, at));
+        game.destroy_block_progress(id, target, progress.clamp(1, 10) - 1);
     }
 }
 
@@ -1047,11 +1158,14 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if me.kind == Kind::Drill {
         drill_tick(game, pos, &mut entity.nbt, &me, out.speed);
     }
-    if me.kind == Kind::Press {
-        press_tick(game, pos, out.speed);
+    if me.kind == Kind::Press && press_tick(game, pos, &mut entity.nbt, out.speed) {
+        game.native_block_entity_sync(pos);
     }
     if me.kind == Kind::Belt {
         belt_tick(game, pos, &me, out.speed);
+        if (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0 {
+            belt_validate(game, pos, &me);
+        }
     }
     if me.is_chain() && (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0 {
         chain_part(game, pos, &me);
@@ -1078,54 +1192,109 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
     if entity.id == BE_ID {
         let mut c = Compound::new();
         put_f32(&mut c, "speed", get_f32(&entity.nbt, "speed"));
+        put_f32(&mut c, "pp", get_f32(&entity.nbt, "pp"));
         *tag = Some(c);
     }
 }
 
-// A click on the creative motor opens its screen; on the depot it puts the held stack on it or
-// takes it off; on any other kinetic block it tells the player its speed and the network stress
-// (the hand crank also turns for a moment: hold the use button to keep it turning).
+// Clicks. Each use reaches this hook once per hand, so the depot, belt and connector ignore a repeat of
+// the same click. The creative motor is left to the game, which opens its screen the normal way.
+static LAST_CLICK: Mutex<Option<(i64, [i32; 3])>> = Mutex::new(None);
+
+fn fresh_click(game: &Game<'_>, pos: [i32; 3]) -> bool {
+    let now = game.ticks as i64;
+    match LAST_CLICK.lock() {
+        Ok(mut last) => {
+            if let Some((t, p)) = *last {
+                if p == pos && now - t <= 3 {
+                    return false;
+                }
+            }
+            *last = Some((now, pos));
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+fn stack_of(item: &str, count: u32) -> ItemStack {
+    ItemStack { item: Arc::from(item), count, damage: 0, extra: None }
+}
+
+// A held stack goes on the depot; with something already on it, a click takes it back.
+fn depot_click(game: &mut Game<'_>, pos: [i32; 3]) {
+    let Some(content) = depot_at(game, pos) else { return };
+    match content {
+        Some((item, count)) => {
+            depot_set(game, pos, None);
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+            game.spawn_item(stack_of(&item, count), at, [0.0, 0.15, 0.0], 0);
+        }
+        None => {
+            let held = game.held().cloned();
+            if let Some(h) = held {
+                if h.count > 0 {
+                    depot_set(game, pos, Some((h.item.to_string(), h.count)));
+                    *game.held_mut() = None;
+                }
+            }
+        }
+    }
+}
+
+// The held stack is put on the belt piece.
+fn belt_put(game: &mut Game<'_>, pos: [i32; 3]) {
+    let held = game.held().cloned();
+    if let Some(h) = held {
+        if h.count > 0 {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+            game.spawn_item(stack_of(&h.item.to_string(), h.count), at, [0.0, 0.1, 0.0], 10);
+            *game.held_mut() = None;
+        }
+    }
+}
+
+// The depot is broken: what lies on it drops. A belt piece is broken: the whole belt comes apart.
+pub fn destroyed(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
+    let name = game.res.facts().get(state).name.to_string();
+    if name == DEPOT_BLOCK {
+        if let Some(Some((item, count))) = depot_at(game, pos) {
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+            game.spawn_item(stack_of(&item, count), at, [0.0, 0.1, 0.0], 10);
+        }
+    } else if name == "create:belt" {
+        belt_dismantle(game, pos, Some(pos));
+    }
+}
+
+// A click on the depot puts the held stack on it or takes it off; on a belt it puts the held stack on the
+// belt; on the hand crank it turns the crank (hold the use button to keep it turning); on any other kinetic
+// block it tells the player its speed and the network stress.
 pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
     let held_item = game.held().map(|h| h.item.to_string());
     if held_item.as_deref() == Some("create:belt_connector") {
-        belt_connector(game, pos);
+        if fresh_click(game, pos) {
+            belt_connector(game, pos);
+        }
         *canceled = true;
         return;
     }
     let name = game.native_block(pos);
     if name == MOTOR_BLOCK {
-        let key = (pos[0], pos[1], pos[2]);
-        if game.open_mod_menu(key) {
-            game.container = Some(key);
-            game.screen = super::Screen::Inventory;
-            game.capture(false);
-            *canceled = true;
-        }
         return;
     }
     if name == DEPOT_BLOCK {
-        if let Some(content) = depot_at(game, pos) {
-            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
-            match content {
-                Some((item, count)) => {
-                    let stack = ItemStack { item: Arc::from(item.as_str()), count, damage: 0, extra: None };
-                    depot_set(game, pos, None);
-                    game.spawn_item(stack, at, [0.0, 0.15, 0.0], 0);
-                }
-                None => {
-                    let held = game.held().cloned();
-                    if let Some(h) = held {
-                        if h.count > 0 {
-                            depot_set(game, pos, Some((h.item.to_string(), h.count)));
-                            if !game.creative {
-                                *game.held_mut() = None;
-                            }
-                        }
-                    }
-                }
-            }
-            *canceled = true;
+        if fresh_click(game, pos) {
+            depot_click(game, pos);
         }
+        *canceled = true;
+        return;
+    }
+    if name == "create:belt" && held_item.is_some() {
+        if fresh_click(game, pos) {
+            belt_put(game, pos);
+        }
+        *canceled = true;
         return;
     }
     let Some(me) = node_at(game, pos) else { return };
@@ -1180,8 +1349,15 @@ pub fn submit(
     if block == DEPOT_BLOCK {
         if let Some((item, count)) = depot_content(&entity.nbt) {
             let stack = ItemStack { item: Arc::from(item.as_str()), count, damage: 0, extra: None };
+            let is_block = game.pack.assets.registry.default_state(&item).is_some();
             draw.push();
-            draw.translate([0.5, 0.85, 0.5]);
+            if is_block {
+                draw.translate([0.5, 0.95, 0.5]);
+            } else {
+                // A flat item lies on the depot as in Create.
+                draw.translate([0.5, 0.82, 0.5]);
+                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            }
             game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
             draw.pop();
         }
@@ -1195,7 +1371,14 @@ pub fn submit(
         let part = game.native_block_state_property(state, "part").map(|v| v.to_string()).unwrap_or_default();
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         if part == "start" || part == "middle" || part == "end" {
-            game.native_draw_block(draw, "create:belt_part", &[("facing", f.as_str()), ("part", part.as_str())]);
+            // The belt surface is one of eight pictures, each shifted a little further along the belt.
+            let t = draw.game_time as f64 + f64::from(draw.partial);
+            let frame = ((t * speed / 60.0).floor() as i64).rem_euclid(8).to_string();
+            game.native_draw_block(
+                draw,
+                "create:belt_part",
+                &[("facing", f.as_str()), ("part", part.as_str()), ("frame", frame.as_str())],
+            );
         }
         if part != "middle" {
             let a = axis_of(front);
@@ -1249,7 +1432,8 @@ pub fn submit(
     let degrees = (speed * 0.3 * t) % 360.0;
     draw.push();
     if anim == 1 {
-        let dy = -0.45 * (1.0 - degrees.to_radians().cos());
+        let phase = f64::from(get_f32(&entity.nbt, "pp"));
+        let dy = -0.45 * (1.0 - phase.to_radians().cos());
         draw.translate([0.0, dy as f32, 0.0]);
     } else {
         let mut about = [0.0f32; 3];
@@ -1324,8 +1508,7 @@ fn extra_shafts(
     if block == "create:mechanical_drill" {
         half_shaft(game, pos, neg(front), speed, draw);
     } else {
-        let a = axis_of(front);
-        through_shaft(game, pos, if a == 0 { 2 } else { 0 }, speed, draw);
+        through_shaft(game, pos, axis_of(front), speed, draw);
     }
 }
 
@@ -1558,7 +1741,7 @@ const BUTTONS: [Btn; 9] = [
 
 // The button under `at` (GUI pixels from the screens top left).
 fn hit(at: [f32; 2]) -> Option<i32> {
-    if at[0] >= SLIDER_X && at[0] <= SLIDER_X + SLIDER_W && at[1] >= SLIDER_Y && at[1] < SLIDER_Y + SLIDER_H {
+    if at[0] >= SLIDER_X && at[0] <= SLIDER_X + SLIDER_W && at[1] >= SLIDER_Y - 3.0 && at[1] < SLIDER_Y + SLIDER_H + 3.0 {
         let rpm = ((at[0] - SLIDER_X) / SLIDER_W * 512.0 - 256.0).round() as i32;
         return Some(1000 + rpm.clamp(-MOTOR_MAX_RPM, MOTOR_MAX_RPM) + MOTOR_MAX_RPM);
     }
@@ -1731,11 +1914,11 @@ mod tests {
     }
 
     #[test]
-    fn press_takes_a_shaft_across_its_facing() {
+    fn press_takes_a_shaft_along_its_facing() {
         let press = Node::new(Kind::Press, 2, [0, 0, -1]);
-        assert_eq!(link(&press, [1, 0, 0], &shaft(0)), Some(1.0));
-        assert_eq!(link(&press, [-1, 0, 0], &shaft(0)), Some(1.0));
-        assert_eq!(link(&press, [0, 0, 1], &shaft(2)), None);
+        assert_eq!(link(&press, [0, 0, 1], &shaft(2)), Some(1.0));
+        assert_eq!(link(&press, [0, 0, -1], &shaft(2)), Some(1.0));
+        assert_eq!(link(&press, [1, 0, 0], &shaft(0)), None);
     }
 
     #[test]
