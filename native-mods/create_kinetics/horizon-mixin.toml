@@ -157,3 +157,15 @@ bindings = [
   { name = "pos", ty = "[i32; 3]", value = "pos" },
   { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
 ]
+
+[[injection]]
+id = "destroy-block"
+hook = "destroy_block"
+hook_version = 1
+kind = "HEAD"
+helper = "destroy.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "state", ty = "horizon_world::registry::BlockStateId", value = "state" },
+]
