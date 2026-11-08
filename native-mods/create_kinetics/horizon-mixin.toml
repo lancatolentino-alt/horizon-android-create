@@ -169,3 +169,25 @@ bindings = [
   { name = "pos", ty = "[i32; 3]", value = "pos" },
   { name = "state", ty = "horizon_world::registry::BlockStateId", value = "state" },
 ]
+
+[[injection]]
+id = "screen-mouse-pressed"
+hook = "screen_mouse_button_pressed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "mouse_pressed.rs"
+bindings = [
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+  { name = "button", ty = "i32", value = "button" },
+]
+
+[[injection]]
+id = "screen-mouse-released"
+hook = "screen_mouse_button_released_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "mouse_released.rs"
+bindings = [
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+  { name = "button", ty = "i32", value = "button" },
+]
