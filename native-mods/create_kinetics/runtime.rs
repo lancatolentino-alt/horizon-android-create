@@ -7,7 +7,7 @@
 // its whole network: if the consumers stress (impact x rpm) beats the sources capacity the
 // sources stop until the load is cut.
 use super::native_block_entity_draw::BlockEntityDraw;
-use super::native_hooks::NativeScreen;
+use super::native_hooks::{NativeScreen, NativeScreenView};
 use super::{Game, GameLevel};
 use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::hud::HudBatch;
@@ -18,6 +18,7 @@ use horizon_world::level::{LevelAccess, PlacementContext};
 use horizon_world::nbt::{Compound, JavaString, Tag};
 use horizon_world::registry::BlockStateId;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const BE_ID: &str = "create:kinetic";
@@ -130,11 +131,13 @@ pub struct Node {
     pub first: bool,
     // Belts: whether this piece (a start, end or pulley) has a shaft across the belt.
     pub shaft: bool,
+    // Clutches and gearshifts: whether a redstone signal reaches the block.
+    pub powered: bool,
 }
 
 impl Node {
     fn new(kind: Kind, axis: usize, front: [i32; 3]) -> Node {
-        Node { kind, axis, front, src: [0; 3], first: false, shaft: false }
+        Node { kind, axis, front, src: [0; 3], first: false, shaft: false, powered: false }
     }
     fn is_chain(&self) -> bool {
         matches!(self.kind, Kind::Chain | Kind::AdjChain)
@@ -168,6 +171,7 @@ impl Node {
             Kind::Motor => d == self.front,
             Kind::Crank | Kind::Drill => d == neg(self.front),
             Kind::Gearbox => unit && d[self.axis] == 0,
+            Kind::Clutch if self.powered => false,
             Kind::Belt => self.shaft && unit && d[self.shaft_axis()] != 0,
             _ => unit && d[self.axis] != 0,
         }
@@ -237,6 +241,15 @@ fn gearbox_mod(src: [i32; 3], dir: [i32; 3]) -> f32 {
     }
 }
 
+// A powered gearshift turns what it hands on (away from its input) the other way.
+fn shift_mod(node: &Node, dir: [i32; 3]) -> f32 {
+    if node.kind == Kind::Gearshift && node.powered && node.src != [0; 3] && dir != node.src {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
 // The factor `f` with `my_speed = neighbour_speed * f` when `me` and the neighbour at
 // offset `d` (neighbour minus me) are connected, else None. Rules as in Create:
 //  - shaft ends facing each other: same speed;
@@ -246,7 +259,12 @@ fn gearbox_mod(src: [i32; 3], dir: [i32; 3]) -> f32 {
 //    or not by which side of each the neighbour is on.
 pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
     if me.has_end(d) && nb.has_end(neg(d)) {
-        return Some(if nb.kind == Kind::Gearbox { gearbox_mod(nb.src, neg(d)) } else { 1.0 });
+        let f = if nb.kind == Kind::Gearbox {
+            gearbox_mod(nb.src, neg(d))
+        } else {
+            shift_mod(nb, neg(d))
+        };
+        return Some(f);
     }
     if me.is_chain() && nb.is_chain() && me.axis == nb.axis && me.first == nb.first {
         let line = me.chain_axis();
@@ -429,6 +447,9 @@ fn node_at(game: &Game<'_>, p: [i32; 3]) -> Option<Node> {
         if node.is_chain() {
             node.first = game.native_block_property(p, "axis_along_first").map(|v| v == "true").unwrap_or(false);
         }
+        if matches!(kind, Kind::Clutch | Kind::Gearshift) {
+            node.powered = game.native_block_property(p, "powered").map(|v| v == "true").unwrap_or(false);
+        }
         Some(node)
     }
 }
@@ -581,6 +602,18 @@ fn depot_at(game: &mut Game<'_>, pos: [i32; 3]) -> Option<Option<(String, u32)>>
 fn depot_set(game: &mut Game<'_>, pos: [i32; 3], content: Option<(String, u32)>) {
     let _ = game.native_with_mod_block_entity(pos, |e| depot_put(&mut e.nbt, content));
     game.native_block_entity_sync(pos);
+}
+
+// ---- redstone: a clutch lets go while powered, a gearshift turns the other way, a press presses without items ----
+
+fn redstone_sync(game: &mut Game<'_>, pos: [i32; 3]) {
+    let dim = game.dim.id().to_string();
+    let on = game.native_neighbor_signal(&dim, pos) > 0;
+    let want = if on { "true" } else { "false" };
+    let same = game.native_block_property(pos, "powered").map(|v| v == want).unwrap_or(true);
+    if !same {
+        game.native_set_block_property(pos, "powered", want);
+    }
 }
 
 // ---- chain drives: the piece shown follows the neighbours in the chain ----
@@ -784,8 +817,12 @@ fn press_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
     if rpm < 1.0 {
         return false;
     }
-    if phase == 0.0 && !pressable_below(game, pos) {
-        return false;
+    if phase == 0.0 {
+        let dim = game.dim.id().to_string();
+        let signal = game.native_neighbor_signal(&dim, pos) > 0;
+        if !signal && !pressable_below(game, pos) {
+            return false;
+        }
     }
     let mut next = phase + rpm * 0.3;
     if phase < 180.0 && next >= 180.0 {
@@ -1042,6 +1079,7 @@ fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
     }
     let was = [get_int(nbt, "bx", i32::MIN), get_int(nbt, "by", i32::MIN), get_int(nbt, "bz", i32::MIN)];
     if was != target {
+        say(game, &("Drill: working on ".to_string() + &name));
         put_int(nbt, "bx", target[0]);
         put_int(nbt, "by", target[1]);
         put_int(nbt, "bz", target[2]);
@@ -1064,6 +1102,7 @@ fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
         put_int(nbt, "bp", 0);
         put_int(nbt, "bt", 0);
         game.destroy_block_progress(id, target, -1);
+        say(game, &("Drill: broke ".to_string() + &name));
         let drops = game.block_loot_at(target, state, None);
         let dim = game.dim.id().to_string();
         if game.native_set_block(&dim, target, BlockStateId(0), 3) {
@@ -1105,6 +1144,16 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     }
     let Some(me) = node_at(game, pos) else { return };
     let old = get_f32(&entity.nbt, "speed");
+    if me.kind == Kind::Motor {
+        if let Ok(mut slot) = COMMIT.lock() {
+            if let Some((key, value)) = *slot {
+                if key == pos {
+                    put_int(&mut entity.nbt, "rpm", value.clamp(-MOTOR_MAX_RPM, MOTOR_MAX_RPM));
+                    *slot = None;
+                }
+            }
+        }
+    }
     let out = if me.kind.is_source() {
         let target = source_target(game, pos, &me, &entity.nbt);
         put_f32(&mut entity.nbt, "target", target);
@@ -1167,6 +1216,11 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
             belt_validate(game, pos, &me);
         }
     }
+    if matches!(me.kind, Kind::Clutch | Kind::Gearshift)
+        && (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(2) == 0
+    {
+        redstone_sync(game, pos);
+    }
     if me.is_chain() && (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0 {
         chain_part(game, pos, &me);
     }
@@ -1221,24 +1275,36 @@ fn stack_of(item: &str, count: u32) -> ItemStack {
     ItemStack { item: Arc::from(item), count, damage: 0, extra: None }
 }
 
-// A held stack goes on the depot; with something already on it, a click takes it back.
+// Where taken items appear: at the player eyes, so they are picked up at once.
+fn at_player(game: &Game<'_>, pos: [i32; 3]) -> [f64; 3] {
+    match game.eye_position() {
+        Some(p) => p,
+        None => [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5],
+    }
+}
+
+// A click on the depot: a held stack goes on it (more of the same item adds to what lies there); with
+// an empty hand, one item at a time comes back.
 fn depot_click(game: &mut Game<'_>, pos: [i32; 3]) {
     let Some(content) = depot_at(game, pos) else { return };
-    match content {
-        Some((item, count)) => {
-            depot_set(game, pos, None);
-            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
-            game.spawn_item(stack_of(&item, count), at, [0.0, 0.15, 0.0], 0);
+    let held = game.held().cloned();
+    match (content, held) {
+        (Some((item, count)), Some(h)) if h.count > 0 && &*h.item == item.as_str() => {
+            let total = (count + h.count).min(64);
+            depot_set(game, pos, Some((item, total)));
+            *game.held_mut() = None;
         }
-        None => {
-            let held = game.held().cloned();
-            if let Some(h) = held {
-                if h.count > 0 {
-                    depot_set(game, pos, Some((h.item.to_string(), h.count)));
-                    *game.held_mut() = None;
-                }
-            }
+        (Some((item, count)), _) => {
+            let rest = if count > 1 { Some((item.clone(), count - 1)) } else { None };
+            depot_set(game, pos, rest);
+            let at = at_player(game, pos);
+            game.spawn_item(stack_of(&item, 1), at, [0.0, 0.0, 0.0], 0);
         }
+        (None, Some(h)) if h.count > 0 => {
+            depot_set(game, pos, Some((h.item.to_string(), h.count)));
+            *game.held_mut() = None;
+        }
+        _ => {}
     }
 }
 
@@ -1252,6 +1318,32 @@ fn belt_put(game: &mut Game<'_>, pos: [i32; 3]) {
             *game.held_mut() = None;
         }
     }
+}
+
+// An empty hand takes one item off the belt piece, the one nearest the middle.
+fn belt_take(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    let dim = game.dim.id().to_string();
+    let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+    let found = game.native_item_entities(&dim, [x, y + 0.5, z], [x + 1.0, y + 1.9, z + 1.0]);
+    let mut best: Option<(f64, u32, ItemStack, [f64; 3])> = None;
+    for e in found {
+        if e.stack.count == 0 {
+            continue;
+        }
+        let dist = (e.position[0] - x - 0.5).abs() + (e.position[2] - z - 0.5).abs();
+        if best.as_ref().map_or(true, |b| dist < b.0) {
+            best = Some((dist, e.id, e.stack.clone(), e.position));
+        }
+    }
+    let Some((_, id, stack, _)) = best else { return false };
+    let mut rest = stack.clone();
+    rest.count -= 1;
+    if game.native_set_item_entity(&dim, id, rest) {
+        let at = at_player(game, pos);
+        game.spawn_item(stack_of(&stack.item.to_string(), 1), at, [0.0, 0.0, 0.0], 0);
+        return true;
+    }
+    false
 }
 
 // The depot is broken: what lies on it drops. A belt piece is broken: the whole belt comes apart.
@@ -1281,6 +1373,9 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
     }
     let name = game.native_block(pos);
     if name == MOTOR_BLOCK {
+        if let Ok(mut at) = MOTOR_AT.lock() {
+            *at = Some(pos);
+        }
         return;
     }
     if name == DEPOT_BLOCK {
@@ -1296,6 +1391,12 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         }
         *canceled = true;
         return;
+    }
+    if name == "create:belt" && held_item.is_none() {
+        if fresh_click(game, pos) && belt_take(game, pos) {
+            *canceled = true;
+            return;
+        }
     }
     let Some(me) = node_at(game, pos) else { return };
     if me.kind == Kind::Crank {
@@ -1352,10 +1453,10 @@ pub fn submit(
             let is_block = game.pack.assets.registry.default_state(&item).is_some();
             draw.push();
             if is_block {
-                draw.translate([0.5, 0.95, 0.5]);
+                draw.translate([0.5, 0.9, 0.5]);
             } else {
                 // A flat item lies on the depot as in Create.
-                draw.translate([0.5, 0.82, 0.5]);
+                draw.translate([0.5, 0.77, 0.5]);
                 draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
             }
             game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
@@ -1373,7 +1474,7 @@ pub fn submit(
         if part == "start" || part == "middle" || part == "end" {
             // The belt surface is one of eight pictures, each shifted a little further along the belt.
             let t = draw.game_time as f64 + f64::from(draw.partial);
-            let frame = ((t * speed / 60.0).floor() as i64).rem_euclid(8).to_string();
+            let frame = ((-t * speed / 60.0).floor() as i64).rem_euclid(8).to_string();
             game.native_draw_block(
                 draw,
                 "create:belt_part",
@@ -1709,9 +1810,12 @@ pub fn placement(
 }
 
 // ---- the creative motors screen ----
-// A one-slot menu (`data/create/horizon/menu/creative_motor.json`, its slot hidden) whose
-// three data slots are the motors speed and its networks stress (asked for, available).
-// The buttons send ids to the server, which sets the speed.
+// As on Java: "Generated Speed in RPM" over a long track with a handle that shows the speed. Press on
+// the track and slide, let go to confirm; two buttons give the direction. The menu is a one-slot menu
+// (data/create/horizon/menu/creative_motor.json, its slot hidden) whose three data slots are the
+// speed and the stress of its network (asked for, available). A press on the track sets the speed at
+// once (through the menu button, so it works for guests); sliding is followed by the screen and
+// handed to the motor when the press ends (in a world of your own).
 
 struct Btn {
     id: i32,
@@ -1722,33 +1826,64 @@ struct Btn {
     h: f32,
 }
 
-const SLIDER_X: f32 = 11.0;
-const SLIDER_Y: f32 = 42.0;
-const SLIDER_W: f32 = 154.0;
-const SLIDER_H: f32 = 12.0;
+const SLIDER_X: f32 = 46.0;
+const SLIDER_Y: f32 = 30.0;
+const SLIDER_W: f32 = 196.0;
+const SLIDER_H: f32 = 30.0;
 
-const BUTTONS: [Btn; 9] = [
-    Btn { id: 1, label: "-64", x: 11.0, y: 58.0, w: 24.0, h: 16.0 },
-    Btn { id: 2, label: "-16", x: 37.0, y: 58.0, w: 24.0, h: 16.0 },
-    Btn { id: 3, label: "-1", x: 63.0, y: 58.0, w: 24.0, h: 16.0 },
-    Btn { id: 4, label: "+1", x: 89.0, y: 58.0, w: 24.0, h: 16.0 },
-    Btn { id: 5, label: "+16", x: 115.0, y: 58.0, w: 24.0, h: 16.0 },
-    Btn { id: 6, label: "+64", x: 141.0, y: 58.0, w: 24.0, h: 16.0 },
-    Btn { id: 10, label: "Reverse", x: 11.0, y: 78.0, w: 50.0, h: 16.0 },
-    Btn { id: 11, label: "Stop", x: 63.0, y: 78.0, w: 50.0, h: 16.0 },
-    Btn { id: 12, label: "Max", x: 115.0, y: 78.0, w: 50.0, h: 16.0 },
+const BUTTONS: [Btn; 2] = [
+    Btn { id: 20, label: "CW", x: 12.0, y: 30.0, w: 24.0, h: 14.0 },
+    Btn { id: 21, label: "CCW", x: 12.0, y: 46.0, w: 24.0, h: 14.0 },
 ];
 
-// The button under `at` (GUI pixels from the screens top left).
+static DRAG: AtomicBool = AtomicBool::new(false);
+static MOTOR_AT: Mutex<Option<[i32; 3]>> = Mutex::new(None);
+static COMMIT: Mutex<Option<([i32; 3], i32)>> = Mutex::new(None);
+
+// The speed under a pointer at x (GUI pixels from the screen left).
+fn rpm_at(x: f32) -> i32 {
+    ((x - SLIDER_X) / SLIDER_W * 512.0 - 256.0).round().clamp(-256.0, 256.0) as i32
+}
+
+fn on_track(at: [f32; 2]) -> bool {
+    at[0] >= SLIDER_X - 6.0 && at[0] <= SLIDER_X + SLIDER_W + 6.0 && at[1] >= SLIDER_Y - 3.0 && at[1] < SLIDER_Y + SLIDER_H + 3.0
+}
+
+// What a press at `at` (GUI pixels from the screen top left) does: a menu button id.
 fn hit(at: [f32; 2]) -> Option<i32> {
-    if at[0] >= SLIDER_X && at[0] <= SLIDER_X + SLIDER_W && at[1] >= SLIDER_Y - 3.0 && at[1] < SLIDER_Y + SLIDER_H + 3.0 {
-        let rpm = ((at[0] - SLIDER_X) / SLIDER_W * 512.0 - 256.0).round() as i32;
-        return Some(1000 + rpm.clamp(-MOTOR_MAX_RPM, MOTOR_MAX_RPM) + MOTOR_MAX_RPM);
+    if on_track(at) {
+        return Some(1000 + rpm_at(at[0]) + MOTOR_MAX_RPM);
     }
     BUTTONS
         .iter()
         .find(|b| at[0] >= b.x && at[0] < b.x + b.w && at[1] >= b.y && at[1] < b.y + b.h)
         .map(|b| b.id)
+}
+
+fn local(screen: &NativeScreenView<'_>) -> [f32; 2] {
+    [screen.mouse[0] - screen.rect[0], screen.mouse[1] - screen.rect[1]]
+}
+
+pub fn mouse_pressed(screen: &NativeScreenView<'_>, button: i32) {
+    if button != 0 || screen.menu != Some(MOTOR_MENU) {
+        return;
+    }
+    if on_track(local(screen)) {
+        DRAG.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn mouse_released(screen: &NativeScreenView<'_>, button: i32) {
+    if button != 0 || !DRAG.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let at = MOTOR_AT.lock().ok().and_then(|g| *g);
+    if let Some(key) = at {
+        let value = rpm_at(local(screen)[0]);
+        if let Ok(mut slot) = COMMIT.lock() {
+            *slot = Some((key, value));
+        }
+    }
 }
 
 pub fn container(block: &str, container: &mut Option<ModContainer>) {
@@ -1764,58 +1899,72 @@ pub fn container(block: &str, container: &mut Option<ModContainer>) {
 pub fn screen(block: &str, screen: &mut Option<NativeScreen>) {
     if block == MOTOR_BLOCK {
         *screen = Some(NativeScreen {
-            width: 176.0,
-            height: 190.0,
+            width: 256.0,
+            height: 182.0,
             slots: vec![None],
-            inventory_y: 108.0,
-            inventory_x: 8.0,
-            own_labels: false,
+            inventory_y: 98.0,
+            inventory_x: 48.0,
+            own_labels: true,
         });
     }
+}
+
+const GOLD: u32 = 0xFFC9984F;
+const GOLD_DARK: u32 = 0xFF7A5427;
+const BEIGE: u32 = 0xFFE9D3A0;
+const MAROON: u32 = 0xFF2A1210;
+
+fn centred(game: &Game<'_>, batch: &mut HudBatch, text: &str, centre: f32, y: f32, color: u32) {
+    let width = game.native_text_width(text);
+    game.native_text(batch, text, [centre - width / 2.0, y], color, false);
 }
 
 pub fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut HudBatch, origin: [f32; 2]) {
     if block != MOTOR_BLOCK {
         return;
     }
-    let rpm = data.first().copied().unwrap_or(MOTOR_DEFAULT_RPM);
+    let setting = data.first().copied().unwrap_or(MOTOR_DEFAULT_RPM);
     let load = data.get(1).copied().unwrap_or(0);
     let cap = data.get(2).copied().unwrap_or(0);
-    game.native_text(batch, "Rotation Speed", [origin[0] + 8.0, origin[1] + 18.0], 0x404040, false);
-    let value = rpm.to_string() + " RPM";
-    let width = game.native_text_width(&value);
-    game.native_text(batch, &value, [origin[0] + 168.0 - width, origin[1] + 18.0], 0x1F1F1F, false);
-    let stress = "Stress: ".to_string() + &load.to_string() + " / " + &cap.to_string() + " SU";
-    let color = if load > cap { 0xAA0000 } else { 0x404040 };
-    game.native_text(batch, &stress, [origin[0] + 8.0, origin[1] + 30.0], color, false);
-    // The slider: a track from -256 to 256 rpm with the centre at 0 and a thumb at the speed.
-    let slider = [origin[0] + SLIDER_X, origin[1] + SLIDER_Y, SLIDER_W, SLIDER_H];
-    game.native_fill(batch, slider, 0xFF373737);
-    game.native_fill(batch, [slider[0] + 1.0, slider[1] + 1.0, SLIDER_W - 2.0, SLIDER_H - 2.0], 0xFF5A5A5A);
-    let value = rpm.clamp(-MOTOR_MAX_RPM, MOTOR_MAX_RPM);
-    let thumb = SLIDER_X + (value + MOTOR_MAX_RPM) as f32 / 512.0 * SLIDER_W;
-    let centre = SLIDER_X + SLIDER_W / 2.0;
-    let (from, to) = if thumb < centre { (thumb, centre) } else { (centre, thumb) };
-    let fill = if value < 0 { 0xFFB23B3B } else { 0xFF3B9A55 };
-    game.native_fill(batch, [origin[0] + from, slider[1] + 3.0, (to - from).max(0.0), SLIDER_H - 6.0], fill);
-    game.native_fill(batch, [origin[0] + centre - 0.5, slider[1] + 1.0, 1.0, SLIDER_H - 2.0], 0xFF373737);
-    game.native_fill(batch, [origin[0] + thumb - 3.0, slider[1] - 2.0, 6.0, SLIDER_H + 4.0], 0xFF373737);
-    game.native_fill(batch, [origin[0] + thumb - 2.0, slider[1] - 1.0, 4.0, SLIDER_H + 2.0], 0xFFC6C6C6);
     let cursor = game.native_cursor();
-    let over = hit([cursor[0] - origin[0], cursor[1] - origin[1]]);
+    let dragging = DRAG.load(Ordering::Relaxed);
+    let rpm = if dragging { rpm_at(cursor[0] - origin[0]) } else { setting };
+    let (ox, oy) = (origin[0], origin[1]);
+    // the dark board the controls sit on
+    game.native_fill(batch, [ox + 4.0, oy + 4.0, 248.0, 82.0], 0xFF1B100D);
+    centred(game, batch, "Generated Speed in RPM", ox + 128.0, oy + 12.0, 0xE9D3A0);
+    // the direction buttons
+    game.native_fill(batch, [ox + 10.0, oy + 28.0, 28.0, 34.0], GOLD);
     for b in BUTTONS.iter() {
-        let face = if over == Some(b.id) { 0xFFA8A8A8 } else { 0xFF8B8B8B };
-        game.native_fill(batch, [origin[0] + b.x, origin[1] + b.y, b.w, b.h], 0xFF373737);
-        game.native_fill(batch, [origin[0] + b.x + 1.0, origin[1] + b.y + 1.0, b.w - 2.0, b.h - 2.0], face);
-        let label_width = game.native_text_width(b.label);
-        game.native_text(
-            batch,
-            b.label,
-            [origin[0] + b.x + (b.w - label_width) / 2.0, origin[1] + b.y + 4.0],
-            0xFFFFFF,
-            true,
-        );
+        let on = (b.id == 20 && rpm >= 0) || (b.id == 21 && rpm < 0);
+        let over = hit([cursor[0] - ox, cursor[1] - oy]) == Some(b.id);
+        let face = if on { 0xFFF3E3B8 } else if over { 0xFFD8BC83 } else { BEIGE };
+        game.native_fill(batch, [ox + b.x, oy + b.y, b.w, b.h], GOLD_DARK);
+        game.native_fill(batch, [ox + b.x + 1.0, oy + b.y + 1.0, b.w - 2.0, b.h - 2.0], face);
+        let w = game.native_text_width(b.label);
+        game.native_text(batch, b.label, [ox + b.x + (b.w - w) / 2.0, oy + b.y + 3.0], 0x3A2412, false);
     }
+    // the track: ticks every 32 rpm, a brighter one at zero
+    game.native_fill(batch, [ox + SLIDER_X - 3.0, oy + SLIDER_Y - 3.0, SLIDER_W + 6.0, SLIDER_H + 6.0], GOLD);
+    game.native_fill(batch, [ox + SLIDER_X - 1.0, oy + SLIDER_Y - 1.0, SLIDER_W + 2.0, SLIDER_H + 2.0], MAROON);
+    for i in 0..=16 {
+        let x = ox + SLIDER_X + i as f32 * SLIDER_W / 16.0;
+        let tick = if i == 8 { 0xFF8A5A3A } else { 0xFF4A2A22 };
+        game.native_fill(batch, [x - 0.5, oy + SLIDER_Y + 2.0, 1.0, 7.0], tick);
+        game.native_fill(batch, [x - 0.5, oy + SLIDER_Y + SLIDER_H - 9.0, 1.0, 7.0], tick);
+    }
+    // the handle with the speed on it
+    let value = rpm.clamp(-MOTOR_MAX_RPM, MOTOR_MAX_RPM);
+    let thumb = ox + SLIDER_X + (value + MOTOR_MAX_RPM) as f32 / 512.0 * SLIDER_W;
+    game.native_fill(batch, [thumb - 19.0, oy + SLIDER_Y + 5.0, 38.0, 20.0], GOLD_DARK);
+    game.native_fill(batch, [thumb - 18.0, oy + SLIDER_Y + 6.0, 36.0, 18.0], BEIGE);
+    let label = value.to_string();
+    let w = game.native_text_width(&label);
+    game.native_text(batch, &label, [thumb - w / 2.0, oy + SLIDER_Y + 11.0], 0x3A2412, false);
+    centred(game, batch, "Press, slide and let go to confirm", ox + 128.0, oy + 68.0, 0xCDBA8C);
+    let stress = "Stress: ".to_string() + &load.to_string() + " / " + &cap.to_string() + " SU";
+    let color = if load > cap { 0xE05050 } else { 0xA89C78 };
+    centred(game, batch, &stress, ox + 128.0, oy + 77.0, color);
 }
 
 pub fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
@@ -1833,6 +1982,8 @@ pub fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     let cur = motor_rpm(&entity.nbt);
     let next = match id {
         n if n >= 1000 => n - 1000 - MOTOR_MAX_RPM,
+        20 => cur.abs(),
+        21 => -cur.abs(),
         1 => cur - 64,
         2 => cur - 16,
         3 => cur - 1,
@@ -1989,6 +2140,21 @@ mod tests {
     }
 
     #[test]
+    fn clutch_lets_go_and_gearshift_reverses_while_powered() {
+        let mut clutch = node(Kind::Clutch, 0);
+        assert!(clutch.has_end([1, 0, 0]));
+        clutch.powered = true;
+        assert!(!clutch.has_end([1, 0, 0]));
+        let mut shift = node(Kind::Gearshift, 0);
+        shift.src = [-1, 0, 0];
+        assert_eq!(shift_mod(&shift, [1, 0, 0]), 1.0);
+        shift.powered = true;
+        assert_eq!(shift_mod(&shift, [1, 0, 0]), -1.0);
+        assert_eq!(shift_mod(&shift, [-1, 0, 0]), 1.0);
+        assert_eq!(link(&shaft(0), [-1, 0, 0], &shift), Some(-1.0));
+    }
+
+    #[test]
     fn stress_units() {
         assert_eq!(Kind::Crank.capacity(32.0), 256);
         assert_eq!(Kind::Wheel.capacity(8.0), 128);
@@ -1997,14 +2163,14 @@ mod tests {
     }
 
     #[test]
-    fn buttons_are_found_where_they_are_drawn() {
-        assert_eq!(hit([12.0, 60.0]), Some(1));
-        assert_eq!(hit([150.0, 60.0]), Some(6));
-        assert_eq!(hit([120.0, 80.0]), Some(12));
+    fn the_slider_and_buttons_are_found_where_they_are_drawn() {
+        assert_eq!(hit([SLIDER_X, 45.0]), Some(1000));
+        assert_eq!(hit([SLIDER_X + SLIDER_W / 2.0, 45.0]), Some(1256));
+        assert_eq!(hit([SLIDER_X + SLIDER_W, 45.0]), Some(1512));
+        assert_eq!(hit([20.0, 36.0]), Some(20));
+        assert_eq!(hit([20.0, 52.0]), Some(21));
         assert_eq!(hit([0.0, 0.0]), None);
-        assert_eq!(hit([11.0, 45.0]), Some(1000));
-        assert_eq!(hit([88.0, 45.0]), Some(1256));
-        assert_eq!(hit([165.0, 45.0]), Some(1512));
+        assert_eq!(rpm_at(SLIDER_X + SLIDER_W / 4.0), -128);
     }
 
     #[test]
