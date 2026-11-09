@@ -774,6 +774,14 @@ fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
             }
         }
     }
+    for below in [1, 2] {
+        let p = [pos[0], pos[1] - below, pos[2]];
+        if let Some(items) = belt_items_at(game, p) {
+            if items.iter().any(|b| pressing(&b.item).is_some()) {
+                return true;
+            }
+        }
+    }
     let dim = game.dim.id().to_string();
     let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
     let found = game.native_item_entities(&dim, [x, y - 2.0, z], [x + 1.0, y, z + 1.0]);
@@ -784,6 +792,27 @@ fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
     for below in [1, 2] {
         let p = [pos[0], pos[1] - below, pos[2]];
+        if game.native_block(p) == "create:belt" {
+            let changed = game
+                .native_with_mod_block_entity(p, |e| {
+                    let mut v = belt_items(&e.nbt);
+                    let mut any = false;
+                    for b in v.iter_mut() {
+                        if let Some(r) = pressing(&b.item) {
+                            b.item = r.to_string();
+                            any = true;
+                        }
+                    }
+                    if any {
+                        belt_store(&mut e.nbt, &v);
+                    }
+                    any
+                })
+                .unwrap_or(false);
+            if changed {
+                game.native_block_entity_sync(p);
+            }
+        }
         if let Some(Some((item, count))) = depot_at(game, p) {
             if let Some(result) = pressing(&item) {
                 depot_set(game, p, Some((result.to_string(), count)));
@@ -846,57 +875,192 @@ fn is_air(name: &str) -> bool {
     name == "minecraft:air" || name == "minecraft:cave_air" || name == "minecraft:void_air"
 }
 
-fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], me: &Node, speed: f32) {
+const BELT_GAP: f32 = 0.25;
+const BELT_MAX: usize = 4;
+const BELT_TOP: f32 = 0.83;
+
+// An item stack riding a belt piece: where it is along the piece (0 at the back end, 1 at the front end).
+#[derive(Clone)]
+struct BeltItem {
+    item: String,
+    count: u32,
+    p: f32,
+}
+
+// The piece keeps its items as one text: item|count|where;item|count|where...
+fn belt_items(n: &Compound) -> Vec<BeltItem> {
+    let text = get_text(n, "bi");
+    let mut out = Vec::new();
+    for part in text.split(';') {
+        let mut f = part.splitn(3, '|');
+        let (Some(item), Some(count), Some(p)) = (f.next(), f.next(), f.next()) else { continue };
+        let (Ok(count), Ok(p)) = (count.parse::<u32>(), p.parse::<f32>()) else { continue };
+        if !item.is_empty() && count > 0 {
+            out.push(BeltItem { item: item.to_string(), count, p });
+        }
+    }
+    out
+}
+
+fn belt_store(n: &mut Compound, items: &[BeltItem]) {
+    let mut text = String::new();
+    for (i, b) in items.iter().enumerate() {
+        if i > 0 {
+            text.push(';');
+        }
+        text.push_str(&b.item);
+        text.push('|');
+        text.push_str(&b.count.to_string());
+        text.push('|');
+        text.push_str(&b.p.to_string());
+    }
+    n.insert(JavaString::from("bi"), Tag::String(JavaString::from(text.as_str())));
+}
+
+fn belt_items_at(game: &mut Game<'_>, p: [i32; 3]) -> Option<Vec<BeltItem>> {
+    if game.native_block(p) != "create:belt" {
+        return None;
+    }
+    game.native_with_mod_block_entity(p, |e| belt_items(&e.nbt))
+}
+
+// Where on the piece a free spot is for a new item, nearest the middle first.
+fn belt_free_spot(items: &[BeltItem]) -> Option<f32> {
+    if items.len() >= BELT_MAX {
+        return None;
+    }
+    [0.5, 0.25, 0.75, 0.05, 0.95]
+        .iter()
+        .copied()
+        .find(|c| items.iter().all(|b| (b.p - *c).abs() >= BELT_GAP))
+}
+
+// Hands an item that reached the end of the piece to what lies ahead: the next piece, a free depot, or the air.
+fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item: &BeltItem) -> bool {
+    let line = axis_of(me.front);
+    let mut next = pos;
+    next[line] += if sign > 0.0 { me.front[line] } else { -me.front[line] };
+    if let Some(n) = node_at(game, next) {
+        if n.kind == Kind::Belt && n.front == me.front {
+            let entry = if sign > 0.0 { 0.0 } else { 1.0 };
+            let carried = item.clone();
+            let ok = game
+                .native_with_mod_block_entity(next, move |e| {
+                    let mut v = belt_items(&e.nbt);
+                    if v.len() >= BELT_MAX || v.iter().any(|b| (b.p - entry).abs() < BELT_GAP) {
+                        return false;
+                    }
+                    v.push(BeltItem { p: entry, ..carried });
+                    belt_store(&mut e.nbt, &v);
+                    true
+                })
+                .unwrap_or(false);
+            if ok {
+                game.native_block_entity_sync(next);
+            }
+            return ok;
+        }
+    }
+    match depot_at(game, next) {
+        Some(None) => {
+            depot_set(game, next, Some((item.item.clone(), item.count)));
+            return true;
+        }
+        Some(Some(_)) => return false,
+        None => {}
+    }
+    let s = f64::from(sign);
+    let edge = [
+        f64::from(pos[0]) + 0.5 + f64::from(me.front[0]) * s * 0.6,
+        f64::from(pos[1]) + 0.9,
+        f64::from(pos[2]) + 0.5 + f64::from(me.front[2]) * s * 0.6,
+    ];
+    let push = [f64::from(me.front[0]) * s * 0.1, 0.05, f64::from(me.front[2]) * s * 0.1];
+    game.spawn_item(stack_of(&item.item, item.count), edge, push, 20);
+    true
+}
+
+// One tick of a belt piece: items lying on it are taken in, the ones it carries move on at the speed of
+// the belt (a gap apart) and pass to the next piece, a free depot, or fall off the end. True when it changed.
+fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
     if game.serving.is_none() && game.options.dedicated.is_none() {
-        return;
+        return false;
     }
-    if speed.abs() < 1.0 {
-        return;
-    }
-    let sign = if speed > 0.0 { 1 } else { -1 };
-    let dir = [me.front[0] * sign, 0, me.front[2] * sign];
-    // Items slide: set the speed we want after the ground takes its share.
-    let step = f64::from(speed.abs()) / 480.0 / 0.58;
-    let (px, py, pz) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
-    let ahead = [pos[0] + dir[0], pos[1], pos[2] + dir[2]];
-    let free_depot = matches!(depot_at(game, ahead), Some(None));
-    let mut handing: Option<(u32, ItemStack)> = None;
-    for e in game.dropped.iter_mut() {
-        if e.stack.count == 0 {
-            continue;
-        }
-        let (x, y, z) = (e.position.x, e.position.y, e.position.z);
-        if x < px || x >= px + 1.0 || z < pz || z >= pz + 1.0 || y < py + 0.5 || y > py + 1.6 {
-            continue;
-        }
-        e.velocity.x = f64::from(dir[0]) * step;
-        e.velocity.z = f64::from(dir[2]) * step;
-        if dir[0] != 0 {
-            e.velocity.z += (pz + 0.5 - z) * 0.1;
-        } else {
-            e.velocity.x += (px + 0.5 - x) * 0.1;
-        }
-        let along = if dir[0] > 0 {
-            x - px
-        } else if dir[0] < 0 {
-            px + 1.0 - x
-        } else if dir[2] > 0 {
-            z - pz
-        } else {
-            pz + 1.0 - z
-        };
-        if free_depot && along > 0.7 && handing.is_none() {
-            handing = Some((e.id, e.stack.clone()));
+    let mut items = belt_items(nbt);
+    let before = items.len();
+    let mut changed = false;
+    let line = axis_of(me.front);
+    let dim = game.dim.id().to_string();
+    let here = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+    if items.len() < BELT_MAX {
+        let found = game.native_item_entities(&dim, [here[0], here[1] + 0.5, here[2]], [here[0] + 1.0, here[1] + 1.9, here[2] + 1.0]);
+        for e in found {
+            if items.len() >= BELT_MAX {
+                break;
+            }
+            if e.stack.count == 0 {
+                continue;
+            }
+            let along = (e.position[line] - here[line]) as f32;
+            let p = if me.front[line] > 0 { along } else { 1.0 - along };
+            let Some(spot) = belt_free_spot(&items) else { break };
+            let spot = if items.iter().all(|b| (b.p - p).abs() >= BELT_GAP) { p.clamp(0.0, 1.0) } else { spot };
+            let mut gone = e.stack.clone();
+            gone.count = 0;
+            if game.native_set_item_entity(&dim, e.id, gone) {
+                items.push(BeltItem { item: e.stack.item.to_string(), count: e.stack.count, p: spot });
+                changed = true;
+            }
         }
     }
-    if let Some((id, stack)) = handing {
-        let dim = game.dim.id().to_string();
-        let mut gone = stack.clone();
-        gone.count = 0;
-        if game.native_set_item_entity(&dim, id, gone) {
-            depot_set(game, ahead, Some((stack.item.to_string(), stack.count)));
+    if speed.abs() >= 1.0 && !items.is_empty() {
+        let sign = if speed > 0.0 { 1.0f32 } else { -1.0 };
+        let step = speed.abs() / 480.0 * sign;
+        items.sort_by(|a, b| (b.p * sign).partial_cmp(&(a.p * sign)).unwrap_or(std::cmp::Ordering::Equal));
+        let mut ahead: Option<f32> = None;
+        let mut kept: Vec<BeltItem> = Vec::new();
+        for mut b in items {
+            let mut np = b.p + step;
+            if let Some(a) = ahead {
+                let limit = a - BELT_GAP * sign;
+                if sign > 0.0 && np > limit {
+                    np = limit.max(b.p);
+                }
+                if sign < 0.0 && np < limit {
+                    np = limit.min(b.p);
+                }
+            }
+            let exited = if sign > 0.0 { np >= 1.0 } else { np <= 0.0 };
+            if exited {
+                if belt_hand_over(game, pos, me, sign, &b) {
+                    changed = true;
+                    continue;
+                }
+                np = if sign > 0.0 { 0.999 } else { 0.001 };
+            }
+            if (np - b.p).abs() > 1e-6 {
+                changed = true;
+            }
+            b.p = np;
+            ahead = Some(np);
+            kept.push(b);
         }
+        items = kept;
     }
+    belt_store(nbt, &items);
+    changed || items.len() != before
+}
+
+// A broken or taken-apart piece drops what it carried.
+fn belt_spill(game: &mut Game<'_>, p: [i32; 3]) {
+    let Some(items) = belt_items_at(game, p) else { return };
+    let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.9, f64::from(p[2]) + 0.5];
+    for b in items {
+        game.spawn_item(stack_of(&b.item, b.count), at, [0.0, 0.1, 0.0], 10);
+    }
+    let _ = game.native_with_mod_block_entity(p, |e| {
+        e.nbt.remove(&JavaString::from("bi"));
+    });
 }
 
 fn say(game: &mut Game<'_>, text: &str) {
@@ -929,6 +1093,7 @@ fn belt_dismantle(game: &mut Game<'_>, at: [i32; 3], skip: Option<[i32; 3]>) {
         if Some(p) == skip {
             continue;
         }
+        belt_spill(game, p);
         let part = game.native_block_property(p, "part").map(|v| v.to_string()).unwrap_or_default();
         if part != "middle" {
             if let Some(base) = shaft {
@@ -1211,7 +1376,9 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
         game.native_block_entity_sync(pos);
     }
     if me.kind == Kind::Belt {
-        belt_tick(game, pos, &me, out.speed);
+        if belt_tick(game, pos, &mut entity.nbt, &me, out.speed) {
+            game.native_block_entity_sync(pos);
+        }
         if (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0 {
             belt_validate(game, pos, &me);
         }
@@ -1247,6 +1414,8 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let mut c = Compound::new();
         put_f32(&mut c, "speed", get_f32(&entity.nbt, "speed"));
         put_f32(&mut c, "pp", get_f32(&entity.nbt, "pp"));
+        let bi = get_text(&entity.nbt, "bi");
+        c.insert(JavaString::from("bi"), Tag::String(JavaString::from(bi.as_str())));
         *tag = Some(c);
     }
 }
@@ -1308,42 +1477,59 @@ fn depot_click(game: &mut Game<'_>, pos: [i32; 3]) {
     }
 }
 
-// The held stack is put on the belt piece.
+// The held stack is put on the belt piece, where there is room.
 fn belt_put(game: &mut Game<'_>, pos: [i32; 3]) {
     let held = game.held().cloned();
-    if let Some(h) = held {
-        if h.count > 0 {
-            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
-            game.spawn_item(stack_of(&h.item.to_string(), h.count), at, [0.0, 0.1, 0.0], 10);
-            *game.held_mut() = None;
-        }
+    let Some(h) = held else { return };
+    if h.count == 0 {
+        return;
+    }
+    let item = h.item.to_string();
+    let count = h.count;
+    let ok = game
+        .native_with_mod_block_entity(pos, move |e| {
+            let mut v = belt_items(&e.nbt);
+            let Some(p) = belt_free_spot(&v) else { return false };
+            v.push(BeltItem { item, count, p });
+            belt_store(&mut e.nbt, &v);
+            true
+        })
+        .unwrap_or(false);
+    if ok {
+        game.native_block_entity_sync(pos);
+        *game.held_mut() = None;
     }
 }
 
 // An empty hand takes one item off the belt piece, the one nearest the middle.
 fn belt_take(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
-    let dim = game.dim.id().to_string();
-    let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
-    let found = game.native_item_entities(&dim, [x, y + 0.5, z], [x + 1.0, y + 1.9, z + 1.0]);
-    let mut best: Option<(f64, u32, ItemStack, [f64; 3])> = None;
-    for e in found {
-        if e.stack.count == 0 {
-            continue;
-        }
-        let dist = (e.position[0] - x - 0.5).abs() + (e.position[2] - z - 0.5).abs();
-        if best.as_ref().map_or(true, |b| dist < b.0) {
-            best = Some((dist, e.id, e.stack.clone(), e.position));
-        }
-    }
-    let Some((_, id, stack, _)) = best else { return false };
-    let mut rest = stack.clone();
-    rest.count -= 1;
-    if game.native_set_item_entity(&dim, id, rest) {
-        let at = at_player(game, pos);
-        game.spawn_item(stack_of(&stack.item.to_string(), 1), at, [0.0, 0.0, 0.0], 0);
-        return true;
-    }
-    false
+    let taken = game
+        .native_with_mod_block_entity(pos, |e| {
+            let mut v = belt_items(&e.nbt);
+            if v.is_empty() {
+                return None;
+            }
+            let mut best = 0;
+            for i in 0..v.len() {
+                if (v[i].p - 0.5).abs() < (v[best].p - 0.5).abs() {
+                    best = i;
+                }
+            }
+            let item = v[best].item.clone();
+            if v[best].count > 1 {
+                v[best].count -= 1;
+            } else {
+                v.remove(best);
+            }
+            belt_store(&mut e.nbt, &v);
+            Some(item)
+        })
+        .flatten();
+    let Some(item) = taken else { return false };
+    game.native_block_entity_sync(pos);
+    let at = at_player(game, pos);
+    game.spawn_item(stack_of(&item, 1), at, [0.0, 0.0, 0.0], 0);
+    true
 }
 
 // The depot is broken: what lies on it drops. A belt piece is broken: the whole belt comes apart.
@@ -1355,6 +1541,7 @@ pub fn destroyed(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
             game.spawn_item(stack_of(&item, count), at, [0.0, 0.1, 0.0], 10);
         }
     } else if name == "create:belt" {
+        belt_spill(game, pos);
         belt_dismantle(game, pos, Some(pos));
     }
 }
@@ -1485,6 +1672,23 @@ pub fn submit(
             let a = axis_of(front);
             through_shaft(game, pos, if a == 0 { 2 } else { 0 }, speed, draw);
         }
+        // the items riding this piece, moving on between ticks
+        let step = ((speed / 480.0) as f32) * draw.partial;
+        for b in belt_items(&entity.nbt) {
+            let p = (b.p + step).clamp(0.0, 1.0);
+            let line = axis_of(front);
+            let mut at = [0.5, BELT_TOP, 0.5];
+            at[line] = if front[line] > 0 { p } else { 1.0 - p };
+            let stack = ItemStack { item: Arc::from(b.item.as_str()), count: b.count, damage: 0, extra: None };
+            let is_block = game.pack.assets.registry.default_state(&b.item).is_some();
+            draw.push();
+            draw.translate(at);
+            if !is_block {
+                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            }
+            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (b.p * 100.0) as i32);
+            draw.pop();
+        }
         if speed == 0.0 {
             draw.keep();
         }
@@ -1494,7 +1698,7 @@ pub fn submit(
         let Some(value) = game.native_block_state_property(state, "axis") else { return };
         let Some(axis) = parse_axis(&value.to_string()) else { return };
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
-        through_shaft(game, pos, axis, speed, draw);
+        chain_shaft(game, axis, speed, draw);
         if speed == 0.0 {
             draw.keep();
         }
@@ -1579,6 +1783,18 @@ fn through_shaft(game: &Game<'_>, pos: [i32; 3], axis: usize, speed: f64, draw: 
     about[axis] = 1.0;
     draw.push();
     draw.rotate_about(about, spin_degrees(pos, axis, speed, draw), [0.5, 0.5, 0.5]);
+    game.native_draw_block(draw, "create:shaft_part", &[("axis", axis_char(axis))]);
+    draw.pop();
+}
+
+// The shaft of a chain drive: it turns without the half step the cogs need, so the shafts of linked
+// drives stay lined up with each other as in Create.
+fn chain_shaft(game: &Game<'_>, axis: usize, speed: f64, draw: &mut BlockEntityDraw) {
+    let mut about = [0.0f32; 3];
+    about[axis] = 1.0;
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    draw.push();
+    draw.rotate_about(about, ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:shaft_part", &[("axis", axis_char(axis))]);
     draw.pop();
 }
@@ -2152,6 +2368,32 @@ mod tests {
         assert_eq!(shift_mod(&shift, [1, 0, 0]), -1.0);
         assert_eq!(shift_mod(&shift, [-1, 0, 0]), 1.0);
         assert_eq!(link(&shaft(0), [-1, 0, 0], &shift), Some(-1.0));
+    }
+
+    #[test]
+    fn belt_items_survive_a_round_trip() {
+        let mut c = Compound::new();
+        let items = vec![
+            BeltItem { item: "minecraft:iron_ingot".to_string(), count: 3, p: 0.25 },
+            BeltItem { item: "create:pulp".to_string(), count: 1, p: 0.75 },
+        ];
+        belt_store(&mut c, &items);
+        let back = belt_items(&c);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].item, "minecraft:iron_ingot");
+        assert_eq!(back[0].count, 3);
+        assert!((back[1].p - 0.75).abs() < 1e-6);
+        belt_store(&mut c, &[]);
+        assert!(belt_items(&c).is_empty());
+    }
+
+    #[test]
+    fn belt_free_spots_keep_a_gap() {
+        assert_eq!(belt_free_spot(&[]), Some(0.5));
+        let one = vec![BeltItem { item: "a".to_string(), count: 1, p: 0.5 }];
+        assert_eq!(belt_free_spot(&one), Some(0.25));
+        let full: Vec<BeltItem> = (0..BELT_MAX).map(|i| BeltItem { item: "a".to_string(), count: 1, p: i as f32 }).collect();
+        assert_eq!(belt_free_spot(&full), None);
     }
 
     #[test]
