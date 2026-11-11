@@ -2020,7 +2020,7 @@ struct Rec {
 
 // A cheap repeatable random number between 0 and 1.
 fn pseudo(game: &Game<'_>, pos: [i32; 3], salt: i32) -> f32 {
-    let mut h = u64::from(game.ticks) ^ (pos[0] as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut h = (game.ticks as u64) ^ (pos[0] as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^= (pos[1] as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     h ^= (pos[2] as i64 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
     h ^= (salt as i64 as u64).wrapping_mul(0x27D4_EB2F_1656_67C5);
@@ -2282,7 +2282,7 @@ fn mill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32)
     }
     let mut changed = false;
     let mut input = pair_list(nbt, "mi");
-    if (i64::from(game.ticks) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(4) == 0 {
+    if ((game.ticks as i64) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(4) == 0 {
         let dim = game.dim.id().to_string();
         let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
         let found = game.native_item_entities(&dim, [x, y + 0.9, z], [x + 1.0, y + 1.8, z + 1.0]);
@@ -2567,7 +2567,7 @@ fn saw_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, s
     }
     let target = [pos[0] + me.front[0], pos[1] + me.front[1], pos[2] + me.front[2]];
     let blk = game.native_block(target);
-    let due = (i64::from(game.ticks) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0;
+    let due = ((game.ticks as i64) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0;
     if blk == "create:belt" {
         if due {
             saw_belt(game, target);
@@ -2810,7 +2810,7 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
         put_int(nbt, "ct", 0);
         return false;
     }
-    if (i64::from(game.ticks) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) != 0 {
+    if ((game.ticks as i64) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) != 0 {
         return false;
     }
     let Some((front, dirv)) = crafter_at(game, pos) else { return false };
