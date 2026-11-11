@@ -13,6 +13,7 @@ use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::hud::HudBatch;
 use horizon_assets::item_model::DisplayContext;
 use horizon_client::items::ItemStack;
+use horizon_core::geometry::Direction;
 use horizon_core::position::BlockPos;
 use horizon_world::level::{LevelAccess, PlacementContext};
 use horizon_world::nbt::{Compound, JavaString, Tag};
@@ -36,6 +37,34 @@ const NET_LIMIT: usize = 2048;
 const DEPOT_BLOCK: &str = "create:depot";
 const DEPOT_BE: &str = "create:depot_be";
 const HANDLE_RPM: f32 = 16.0;
+// The light a part of a solid block is drawn with: the brightest of the cells around it, in the packing
+// of BlockEntityDraw.light (16 times sky light in the low byte, 16 times block light in the next).
+fn open_light(game: &Game<'_>, pos: [i32; 3]) -> u32 {
+    let (mut block, mut sky) = (0u32, 0u32);
+    for a in 0..3 {
+        for sgn in [-1, 1] {
+            let mut p = pos;
+            p[a] += sgn;
+            let (b, s) = game.native_light(p);
+            block = block.max(u32::from(b));
+            sky = sky.max(u32::from(s));
+        }
+    }
+    (sky * 16) | ((block * 16) << 8)
+}
+
+// A sound for this player (the window), at the centre of the block at `pos`.
+fn sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
+}
+
+const FUNNEL_BE: &str = "create:funnel_be";
+const BASIN_BLOCK: &str = "create:basin";
+const BASIN_BE: &str = "create:basin_be";
+const BASIN_SLOTS: usize = 9;
+// A mixing run is 100 units; each tick adds rpm / 16 units, between 1 and 5.
+const MIX_UNITS: f32 = 100.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -47,6 +76,7 @@ pub enum Kind {
     Wheel,
     Drill,
     Press,
+    Mixer,
     Gearbox,
     Clutch,
     Gearshift,
@@ -60,6 +90,7 @@ pub enum Kind {
     Saw,
     Crusher,
     Crafter,
+    Hose,
 }
 
 pub fn kind_of(block: &str) -> Option<Kind> {
@@ -72,6 +103,7 @@ pub fn kind_of(block: &str) -> Option<Kind> {
         "create:water_wheel" => Some(Kind::Wheel),
         "create:mechanical_drill" => Some(Kind::Drill),
         "create:mechanical_press" => Some(Kind::Press),
+        "create:mechanical_mixer" => Some(Kind::Mixer),
         "create:gearbox" | "create:vertical_gearbox" => Some(Kind::Gearbox),
         "create:clutch" => Some(Kind::Clutch),
         "create:gearshift" => Some(Kind::Gearshift),
@@ -85,13 +117,14 @@ pub fn kind_of(block: &str) -> Option<Kind> {
         "create:mechanical_saw" => Some(Kind::Saw),
         "create:crushing_wheel" => Some(Kind::Crusher),
         "create:mechanical_crafter" => Some(Kind::Crafter),
+        "create:hose_pulley" => Some(Kind::Hose),
         _ => None,
     }
 }
 
 impl Kind {
     fn uses_facing(self) -> bool {
-        matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Drill | Kind::Press | Kind::Belt | Kind::Pump | Kind::Handle | Kind::Saw | Kind::Crafter)
+        matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Drill | Kind::Press | Kind::Mixer | Kind::Belt | Kind::Pump | Kind::Handle | Kind::Hose | Kind::Saw | Kind::Crafter)
     }
     fn is_source(self) -> bool {
         matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Handle)
@@ -106,6 +139,8 @@ impl Kind {
             Kind::Saw => 4,
             Kind::Crusher => 8,
             Kind::Crafter => 2,
+            Kind::Mixer => 4,
+            Kind::Hose => 4,
             _ => 0,
         }
     }
@@ -128,6 +163,7 @@ impl Kind {
             Kind::Wheel => "Water Wheel",
             Kind::Drill => "Mechanical Drill",
             Kind::Press => "Mechanical Press",
+            Kind::Mixer => "Mechanical Mixer",
             Kind::Gearbox => "Gearbox",
             Kind::Clutch => "Clutch",
             Kind::Gearshift => "Gearshift",
@@ -141,6 +177,7 @@ impl Kind {
             Kind::Saw => "Mechanical Saw",
             Kind::Crusher => "Crushing Wheel",
             Kind::Crafter => "Mechanical Crafter",
+            Kind::Hose => "Hose Pulley",
         }
     }
 }
@@ -183,7 +220,7 @@ impl Node {
     fn is_cog(&self) -> bool {
         matches!(
             self.kind,
-            Kind::Cogwheel | Kind::LargeCogwheel | Kind::Pump | Kind::Crusher | Kind::Millstone | Kind::Crafter
+            Kind::Cogwheel | Kind::LargeCogwheel | Kind::Pump | Kind::Crusher | Kind::Millstone | Kind::Crafter | Kind::Mixer
         )
     }
     // The axis the saw shaft runs along: across its facing, the lower axis when first is set.
@@ -197,6 +234,10 @@ impl Node {
         } else {
             high
         }
+    }
+    // A small cog: the cogwheel, the mixer, pump, millstone and crafter, whose cogs mesh with their neighbours.
+    fn small_cog(&self) -> bool {
+        matches!(self.kind, Kind::Cogwheel | Kind::Mixer | Kind::Pump | Kind::Millstone | Kind::Crafter)
     }
     // The presss shaft runs across its facing.
     fn shaft_axis(&self) -> usize {
@@ -217,6 +258,7 @@ impl Node {
             Kind::Crafter => false,
             Kind::Millstone => d == [0, -1, 0],
             Kind::Saw => unit && d[self.saw_axis()] != 0,
+            Kind::Hose => d == cw(self.front),
             Kind::Clutch if self.powered => false,
             Kind::Belt => self.shaft && unit && d[self.shaft_axis()] != 0,
             _ => unit && d[self.axis] != 0,
@@ -225,14 +267,10 @@ impl Node {
 }
 
 // The mechanical pump is a small cogwheel turning on its facing axis (it has no shaft ends).
-fn cog_kind(k: Kind) -> Kind {
-    if k == Kind::Pump || k == Kind::Millstone || k == Kind::Crafter {
-        Kind::Cogwheel
-    } else if k == Kind::Crusher {
-        Kind::LargeCogwheel
-    } else {
-        k
-    }
+
+// Clockwise of a horizontal direction seen from above (north to east).
+fn cw(d: [i32; 3]) -> [i32; 3] {
+    [-d[2], 0, d[0]]
 }
 
 fn neg(d: [i32; 3]) -> [i32; 3] {
@@ -323,9 +361,12 @@ pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
         };
         return Some(f);
     }
-    if me.is_chain() && nb.is_chain() && me.axis == nb.axis && me.first == nb.first {
-        let line = me.chain_axis();
-        if d[line].abs() == 1 && d.iter().filter(|c| **c != 0).count() == 1 {
+    // Chain to chain: each drive has one chain line, across its shaft. Two drives next to each other on
+    // that line link whichever way their shafts run, as long as the line of each points at the other. A
+    // shaft end never pairs with a chain side (it fails the checks above and here).
+    if me.is_chain() && nb.is_chain() && d.iter().filter(|c| **c != 0).count() == 1 {
+        let line = axis_of(d);
+        if me.chain_axis() == line && nb.chain_axis() == line {
             return Some(1.0);
         }
     }
@@ -339,38 +380,30 @@ pub fn link(me: &Node, d: [i32; 3], nb: &Node) -> Option<f32> {
         return None;
     }
     let nonzero = d.iter().filter(|c| **c != 0).count();
-    match (cog_kind(me.kind), cog_kind(nb.kind)) {
-        (Kind::Cogwheel, Kind::Cogwheel) => {
-            if me.axis == nb.axis && d[me.axis] == 0 && nonzero == 1 {
-                Some(-1.0)
-            } else {
-                None
-            }
+    let (small_me, small_nb) = (me.small_cog(), nb.small_cog());
+    if small_me && small_nb {
+        return if me.axis == nb.axis && d[me.axis] == 0 && nonzero == 1 { Some(-1.0) } else { None };
+    }
+    if !small_me && !small_nb {
+        if me.axis == nb.axis {
+            return None;
         }
-        (Kind::LargeCogwheel, Kind::LargeCogwheel) => {
-            if me.axis == nb.axis {
-                return None;
-            }
-            let third = 3 - me.axis - nb.axis;
-            if d[me.axis].abs() == 1 && d[nb.axis].abs() == 1 && d[third] == 0 {
-                let mine = d[me.axis] > 0;
-                let theirs = d[nb.axis] > 0;
-                Some(if mine ^ theirs { -1.0 } else { 1.0 })
-            } else {
-                None
-            }
+        let third = 3 - me.axis - nb.axis;
+        if d[me.axis].abs() == 1 && d[nb.axis].abs() == 1 && d[third] == 0 {
+            let mine = d[me.axis] > 0;
+            let theirs = d[nb.axis] > 0;
+            return Some(if mine ^ theirs { -1.0 } else { 1.0 });
         }
-        _ => {
-            // one small, one large
-            if me.axis != nb.axis || d[me.axis] != 0 || nonzero != 2 {
-                return None;
-            }
-            if cog_kind(me.kind) == Kind::Cogwheel {
-                Some(-2.0)
-            } else {
-                Some(-0.5)
-            }
-        }
+        return None;
+    }
+    // one small, one large
+    if me.axis != nb.axis || d[me.axis] != 0 || nonzero != 2 {
+        return None;
+    }
+    if small_me {
+        Some(-2.0)
+    } else {
+        Some(-0.5)
     }
 }
 
@@ -404,7 +437,7 @@ pub fn offsets(me: &Node) -> Vec<[i32; 3]> {
         return out;
     }
     let (p, q) = ((me.axis + 1) % 3, (me.axis + 2) % 3);
-    if cog_kind(me.kind) == Kind::Cogwheel {
+    if me.small_cog() {
         // small cogs side by side in the plane
         for a in [p, q] {
             for s in [-1, 1] {
@@ -423,7 +456,7 @@ pub fn offsets(me: &Node) -> Vec<[i32; 3]> {
             out.push(d);
         }
     }
-    if cog_kind(me.kind) == Kind::LargeCogwheel {
+    if !me.small_cog() {
         // diagonal in the plane of this axis and each other axis (large <-> large)
         for other in [p, q] {
             for sa in [-1, 1] {
@@ -493,6 +526,10 @@ fn node_at(game: &Game<'_>, p: [i32; 3]) -> Option<Node> {
     let kind = kind_of(&game.native_block(p))?;
     if kind == Kind::Millstone {
         return Some(Node::new(kind, 1, [0; 3]));
+    }
+    if kind == Kind::Hose {
+        let front = parse_dir(&game.native_block_property(p, "facing")?)?;
+        return Some(Node::new(kind, axis_of(cw(front)), front));
     }
     if kind == Kind::Valve {
         let front = parse_dir(&game.native_block_property(p, "facing")?)?;
@@ -672,6 +709,660 @@ fn depot_set(game: &mut Game<'_>, pos: [i32; 3], content: Option<(String, u32)>)
     game.native_block_entity_sync(pos);
 }
 
+// ---- the basin: item stacks kept in the block entity, put in and taken out by hand ----
+// "in" holds what waits to be mixed, "out" what came out of the mixer, each as one text:
+// item|count;item|count (up to nine stacks, 64 each).
+
+fn bag_read(n: &Compound, key: &str) -> Vec<(String, u32)> {
+    let text = get_text(n, key);
+    let mut out = Vec::new();
+    for part in text.split(';') {
+        let mut f = part.splitn(2, '|');
+        let (Some(item), Some(count)) = (f.next(), f.next()) else { continue };
+        let Ok(count) = count.parse::<u32>() else { continue };
+        if !item.is_empty() && count > 0 {
+            out.push((item.to_string(), count));
+        }
+    }
+    out
+}
+
+fn bag_write(n: &mut Compound, key: &str, bag: &[(String, u32)]) {
+    let mut text = String::new();
+    for (i, (item, count)) in bag.iter().enumerate() {
+        if i > 0 {
+            text.push(';');
+        }
+        text.push_str(item);
+        text.push('|');
+        text.push_str(&count.to_string());
+    }
+    n.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
+}
+
+// Adds as much of `count` as fits (first into stacks of the same item, then into new stacks); returns
+// how many went in.
+fn bag_add(bag: &mut Vec<(String, u32)>, item: &str, count: u32) -> u32 {
+    let mut left = count;
+    for entry in bag.iter_mut() {
+        if entry.0 == item && entry.1 < 64 {
+            let put = (64 - entry.1).min(left);
+            entry.1 += put;
+            left -= put;
+        }
+    }
+    while left > 0 && bag.len() < BASIN_SLOTS {
+        let put = left.min(64);
+        bag.push((item.to_string(), put));
+        left -= put;
+    }
+    count - left
+}
+
+fn bag_total(bag: &[(String, u32)], item: &str) -> u32 {
+    bag.iter().filter(|e| e.0 == item).map(|e| e.1).sum()
+}
+
+fn bag_take(bag: &mut Vec<(String, u32)>, item: &str, count: u32) {
+    let mut left = count;
+    for entry in bag.iter_mut() {
+        if entry.0 == item && left > 0 {
+            let t = entry.1.min(left);
+            entry.1 -= t;
+            left -= t;
+        }
+    }
+    bag.retain(|e| e.1 > 0);
+}
+
+// A click on the basin: a held stack goes in (as much as fits); with an empty hand a stack comes out,
+// the finished ones first.
+fn basin_click(game: &mut Game<'_>, pos: [i32; 3]) {
+    let held = game.held().cloned();
+    if let Some(h) = held {
+        if h.count > 0 {
+            let item = h.item.to_string();
+            let count = h.count;
+            let added = game
+                .native_with_mod_block_entity(pos, |e| {
+                    let mut inb = bag_read(&e.nbt, "in");
+                    let n = bag_add(&mut inb, &item, count);
+                    if n > 0 {
+                        bag_write(&mut e.nbt, "in", &inb);
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            if added > 0 {
+                sfx(game, "minecraft:entity.item.frame.add_item", pos, 0.6, 1.1);
+                game.native_block_entity_sync(pos);
+                if added >= count {
+                    *game.held_mut() = None;
+                } else {
+                    let mut rest = h.clone();
+                    rest.count = count - added;
+                    *game.held_mut() = Some(rest);
+                }
+            }
+            return;
+        }
+    }
+    let got = game
+        .native_with_mod_block_entity(pos, |e| {
+            let mut out = bag_read(&e.nbt, "out");
+            if !out.is_empty() {
+                let first = out.remove(0);
+                bag_write(&mut e.nbt, "out", &out);
+                return Some(first);
+            }
+            let mut inb = bag_read(&e.nbt, "in");
+            if !inb.is_empty() {
+                let first = inb.remove(0);
+                bag_write(&mut e.nbt, "in", &inb);
+                return Some(first);
+            }
+            None
+        })
+        .flatten();
+    if let Some((item, count)) = got {
+        sfx(game, "minecraft:entity.item.frame.remove_item", pos, 0.6, 1.1);
+        game.native_block_entity_sync(pos);
+        let at = at_player(game, pos);
+        game.spawn_item(stack_of(&item, count), at, [0.0, 0.0, 0.0], 0);
+    }
+}
+
+// The basin is broken: everything in it drops.
+fn basin_spill(game: &mut Game<'_>, pos: [i32; 3]) {
+    let got = game.native_with_mod_block_entity(pos, |e| {
+        let mut all = bag_read(&e.nbt, "in");
+        all.extend(bag_read(&e.nbt, "out"));
+        all
+    });
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    for (item, count) in got.unwrap_or_default() {
+        game.spawn_item(stack_of(&item, count), at, [0.0, 0.1, 0.0], 10);
+    }
+}
+
+fn basin_mix_flag(game: &mut Game<'_>, basin: [i32; 3], on: bool) {
+    let v = if on { 1 } else { 0 };
+    let changed = game.native_with_mod_block_entity(basin, |e| {
+        let same = get_int(&e.nbt, "mix", 0) == v;
+        put_int(&mut e.nbt, "mix", v);
+        !same
+    });
+    if changed == Some(true) {
+        game.native_block_entity_sync(basin);
+    }
+}
+
+fn basin_target_kind(game: &mut Game<'_>, p: [i32; 3]) -> bool {
+    let name = game.native_block(p);
+    name == DEPOT_BLOCK || name == "create:belt"
+}
+
+// Hands a stack to the depot or belt piece at `p` if it has room. True when it took it.
+fn basin_give(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> bool {
+    let name = game.native_block(p);
+    if name == DEPOT_BLOCK {
+        if let Some(None) = depot_at(game, p) {
+            depot_set(game, p, Some((item.to_string(), count)));
+            return true;
+        }
+        return false;
+    }
+    if name == "create:belt" {
+        let item = item.to_string();
+        let ok = game
+            .native_with_mod_block_entity(p, move |e| {
+                let mut v = belt_items(&e.nbt);
+                let Some(spot) = belt_free_spot(&v) else { return false };
+                v.push(BeltItem { item, count, p: spot, moving: false });
+                belt_store(&mut e.nbt, &v);
+                true
+            })
+            .unwrap_or(false);
+        if ok {
+            game.native_block_entity_sync(p);
+        }
+        return ok;
+    }
+    false
+}
+
+// One tick of a basin: its outlet turns towards a belt or depot beside it (below first), and a finished
+// stack goes out onto it when it has room. True when clients need a fresh picture.
+fn basin_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return false;
+    }
+    let n = get_int(nbt, "bt", 0) + 1;
+    put_int(nbt, "bt", n % 100000);
+    if n % 4 != 0 {
+        return false;
+    }
+    let dirs: [(&str, [i32; 3]); 5] =
+        [("down", [0, -1, 0]), ("east", [1, 0, 0]), ("north", [0, 0, -1]), ("south", [0, 0, 1]), ("west", [-1, 0, 0])];
+    let current = game.native_block_property(pos, "facing").map(|v| v.to_string()).unwrap_or_default();
+    // where each outlet would hand over: straight down, or across the rim at the basin level or one lower
+    let spots = |d: [i32; 3]| -> Vec<[i32; 3]> {
+        if d[1] != 0 {
+            vec![[pos[0], pos[1] - 1, pos[2]]]
+        } else {
+            vec![[pos[0] + d[0], pos[1], pos[2] + d[2]], [pos[0] + d[0], pos[1] - 1, pos[2] + d[2]]]
+        }
+    };
+    let mut wanted = current.clone();
+    for (name, d) in dirs.iter() {
+        if spots(*d).into_iter().any(|p| basin_target_kind(game, p)) {
+            wanted = name.to_string();
+            break;
+        }
+    }
+    if wanted != current && !wanted.is_empty() {
+        game.native_set_block_property(pos, "facing", &wanted);
+    }
+    let out = bag_read(nbt, "out");
+    let Some((item, count)) = out.first().cloned() else { return false };
+    let Some(d) = dirs.iter().find(|(name, _)| *name == wanted.as_str()).map(|(_, d)| *d) else { return false };
+    for p in spots(d) {
+        if basin_give(game, p, &item, count) {
+            let mut rest = out.clone();
+            rest.remove(0);
+            bag_write(nbt, "out", &rest);
+            return true;
+        }
+    }
+    false
+}
+
+// ---- funnels: they move items between the block behind them and the block (or air) in front ----
+// A funnel faces away from the block it sits on. Pulling (extracting off) it takes items lying in
+// its mouth, or off a belt, depot or basin there, and puts them into the block behind it; extracting
+// takes them out of a basin, depot or belt behind it and puts them into the block in front of it, or
+// drops them. The andesite one moves one item at a time, the brass one up to sixteen, twice as often.
+// Vanilla containers (chests, barrels, furnaces) work both ways, through the engine's container calls.
+
+fn funnel_brass(name: &str) -> Option<bool> {
+    match name {
+        "create:andesite_funnel" => Some(false),
+        "create:brass_funnel" => Some(true),
+        _ => None,
+    }
+}
+
+fn direction_of(d: [i32; 3]) -> Direction {
+    match d {
+        [0, -1, 0] => Direction::Down,
+        [0, 1, 0] => Direction::Up,
+        [0, 0, -1] => Direction::North,
+        [0, 0, 1] => Direction::South,
+        [-1, 0, 0] => Direction::West,
+        _ => Direction::East,
+    }
+}
+
+// 1 basin, 2 depot, 3 belt piece, 0 anything else.
+fn funnel_storage(game: &mut Game<'_>, p: [i32; 3]) -> u8 {
+    let name = game.native_block(p);
+    if name == BASIN_BLOCK {
+        1
+    } else if name == DEPOT_BLOCK {
+        2
+    } else if name == "create:belt" {
+        3
+    } else {
+        0
+    }
+}
+
+// Takes up to `amount` items of the first stack the storage at `p` lets go of (a basin gives up only
+// what it finished).
+fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction) -> Option<(String, u32)> {
+    match funnel_storage(game, p) {
+        1 => {
+            let got = game
+                .native_with_mod_block_entity(p, |e| {
+                    let mut out = bag_read(&e.nbt, "out");
+                    if out.is_empty() {
+                        return None;
+                    }
+                    let (item, count) = out[0].clone();
+                    let t = count.min(amount);
+                    if t == count {
+                        out.remove(0);
+                    } else {
+                        out[0].1 -= t;
+                    }
+                    bag_write(&mut e.nbt, "out", &out);
+                    Some((item, t))
+                })
+                .flatten();
+            if got.is_some() {
+                game.native_block_entity_sync(p);
+            }
+            got
+        }
+        2 => {
+            let Some(Some((item, count))) = depot_at(game, p) else { return None };
+            let t = count.min(amount);
+            depot_set(game, p, if t == count { None } else { Some((item.clone(), count - t)) });
+            Some((item, t))
+        }
+        3 => {
+            let got = game
+                .native_with_mod_block_entity(p, |e| {
+                    let mut v = belt_items(&e.nbt);
+                    if v.is_empty() {
+                        return None;
+                    }
+                    let item = v[0].item.clone();
+                    let t = v[0].count.min(amount);
+                    if t == v[0].count {
+                        v.remove(0);
+                    } else {
+                        v[0].count -= t;
+                    }
+                    belt_store(&mut e.nbt, &v);
+                    Some((item, t))
+                })
+                .flatten();
+            if got.is_some() {
+                game.native_block_entity_sync(p);
+            }
+            got
+        }
+        _ => {
+            // a chest, barrel, furnace and the like: the first slot its side `face` lets go of
+            let dim = game.native_dimension().to_string();
+            let Some(slots) = game.native_container_slots(&dim, p, face) else { return None };
+            for slot in slots {
+                if !slot.can_take {
+                    continue;
+                }
+                let Some(have) = slot.stack.as_ref().map(|st| st.count) else { continue };
+                if let Some(out) = game.native_extract_item(&dim, p, face, slot.slot, have.min(amount)) {
+                    return Some((out.item.to_string(), out.count));
+                }
+            }
+            None
+        }
+    }
+}
+
+// Puts what fits of a stack into the storage at `p` (a basin takes it as ingredients); returns how many
+// went in.
+fn storage_give(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> u32 {
+    match funnel_storage(game, p) {
+        1 => {
+            let item = item.to_string();
+            let added = game
+                .native_with_mod_block_entity(p, move |e| {
+                    let mut inb = bag_read(&e.nbt, "in");
+                    let n = bag_add(&mut inb, &item, count);
+                    if n > 0 {
+                        bag_write(&mut e.nbt, "in", &inb);
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            if added > 0 {
+                game.native_block_entity_sync(p);
+            }
+            added
+        }
+        2 => match depot_at(game, p) {
+            Some(None) => {
+                depot_set(game, p, Some((item.to_string(), count)));
+                count
+            }
+            Some(Some((have, n))) if have == item && n < 64 => {
+                let t = count.min(64 - n);
+                depot_set(game, p, Some((have, n + t)));
+                t
+            }
+            _ => 0,
+        },
+        3 => {
+            if basin_give(game, p, item, count) {
+                count
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+// Hands a stack to the block at `p` through its side `face`: our own storage, a vanilla container, or
+// (when `drop_ok`) the air, where the rest drops. Returns how many were taken.
+fn funnel_deliver(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32, face: Direction, drop_ok: bool) -> u32 {
+    if funnel_storage(game, p) != 0 {
+        return storage_give(game, p, item, count);
+    }
+    let leftover = game.native_insert_item(p, face, stack_of(item, count));
+    let rest = leftover.map(|st| st.count).unwrap_or(0).min(count);
+    if rest > 0 && drop_ok && is_air(&game.native_block(p)) {
+        let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.3, f64::from(p[2]) + 0.5];
+        game.spawn_item(stack_of(item, rest), at, [0.0, 0.0, 0.0], 10);
+        return count;
+    }
+    count - rest
+}
+
+// One tick of a funnel on the server. True when it changed something clients should see (never: the
+// storages it works on send their own pictures).
+fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return false;
+    }
+    let name = game.native_block(pos);
+    let Some(brass) = funnel_brass(&name) else { return false };
+    let n = get_int(nbt, "ft", 0) + 1;
+    put_int(nbt, "ft", n % 100000);
+    if n % (if brass { 4 } else { 8 }) != 0 {
+        return false;
+    }
+    let facing = game.native_block_property(pos, "facing").and_then(|v| parse_dir(&v)).unwrap_or([0, 1, 0]);
+    let extracting = game.native_block_property(pos, "extracting").map(|v| v == "true").unwrap_or(false);
+    let dim = game.dim.id().to_string();
+    let powered = game.native_neighbor_signal(&dim, pos) > 0;
+    let was = game.native_block_property(pos, "powered").map(|v| v == "true").unwrap_or(false);
+    if powered != was {
+        game.native_set_block_property(pos, "powered", if powered { "true" } else { "false" });
+    }
+    if powered {
+        return false;
+    }
+    let attached = [pos[0] - facing[0], pos[1] - facing[1], pos[2] - facing[2]];
+    let mouth = [pos[0] + facing[0], pos[1] + facing[1], pos[2] + facing[2]];
+    let amount = if brass { 16 } else { 1 };
+    if extracting {
+        if let Some((item, count)) = storage_take(game, attached, amount, direction_of(facing)) {
+            let accepted = funnel_deliver(game, mouth, &item, count, direction_of(neg(facing)), true);
+            if accepted < count {
+                funnel_deliver(game, attached, &item, count - accepted, direction_of(facing), false);
+            }
+            if accepted > 0 {
+                sfx(game, "minecraft:entity.item.pickup", pos, 0.2, 1.6);
+            }
+        }
+        return false;
+    }
+    // pulling in: first anything lying in the mouth, then a belt, depot or basin there
+    let (x, y, z) = (f64::from(mouth[0]), f64::from(mouth[1]), f64::from(mouth[2]));
+    let found = game.native_item_entities(&dim, [x, y, z], [x + 1.0, y + 1.0, z + 1.0]);
+    for e in found {
+        if e.stack.count == 0 {
+            continue;
+        }
+        let t = e.stack.count.min(amount);
+        let item = e.stack.item.to_string();
+        let accepted = funnel_deliver(game, attached, &item, t, direction_of(facing), false);
+        if accepted > 0 {
+            let mut rest = e.stack.clone();
+            rest.count -= accepted;
+            let _ = game.native_set_item_entity(&dim, e.id, rest);
+            sfx(game, "minecraft:entity.item.pickup", pos, 0.2, 1.6);
+            return false;
+        }
+    }
+    if let Some((item, count)) = storage_take(game, mouth, amount, direction_of(neg(facing))) {
+        let accepted = funnel_deliver(game, attached, &item, count, direction_of(facing), false);
+        if accepted < count {
+            funnel_deliver(game, mouth, &item, count - accepted, direction_of(neg(facing)), false);
+        }
+        if accepted > 0 {
+            sfx(game, "minecraft:entity.item.pickup", pos, 0.2, 1.6);
+        }
+    }
+    false
+}
+
+// ---- the mixer: two blocks above a basin it mixes what lies in it ----
+
+struct MixRecipe {
+    inputs: Vec<(&'static str, u32)>,
+    outputs: Vec<(&'static str, u32)>,
+    heated: bool,
+}
+
+fn mixing_recipes() -> Vec<MixRecipe> {
+    vec![MixRecipe {
+        inputs: vec![("minecraft:copper_ingot", 1), ("create:zinc_ingot", 1)],
+        outputs: vec![("create:brass_ingot", 2)],
+        heated: true,
+    }]
+}
+
+// Until the blaze burner exists a lit campfire, lava or fire under the basin counts as heat.
+fn basin_heated(game: &mut Game<'_>, basin: [i32; 3]) -> bool {
+    let below = [basin[0], basin[1] - 1, basin[2]];
+    let name = game.native_block(below);
+    if name == "minecraft:lava" || name == "minecraft:fire" || name == "minecraft:soul_fire" {
+        return true;
+    }
+    if name == "minecraft:campfire" || name == "minecraft:soul_campfire" {
+        return game.native_block_property(below, "lit").map(|v| v == "true").unwrap_or(false);
+    }
+    false
+}
+
+fn find_mixing(inb: &[(String, u32)], outb: &[(String, u32)], heated: bool) -> Option<MixRecipe> {
+    for r in mixing_recipes() {
+        if r.heated && !heated {
+            continue;
+        }
+        if !r.inputs.iter().all(|(item, n)| bag_total(inb, item) >= *n) {
+            continue;
+        }
+        // the results have to fit
+        let mut trial_in: Vec<(String, u32)> = inb.to_vec();
+        for (item, n) in r.inputs.iter() {
+            bag_take(&mut trial_in, item, *n);
+        }
+        let mut trial_out: Vec<(String, u32)> = outb.to_vec();
+        let fits = r.outputs.iter().all(|(item, n)| bag_add(&mut trial_out, item, *n) == *n);
+        if fits {
+            return Some(r);
+        }
+    }
+    None
+}
+
+// The mixer stops: the basin stops turning its items and the run starts over.
+fn mixer_stop(game: &mut Game<'_>, nbt: &mut Compound, basin: [i32; 3], present: bool) -> bool {
+    if present {
+        basin_mix_flag(game, basin, false);
+    }
+    if get_f32(nbt, "mp") > 0.0 {
+        put_f32(nbt, "mp", 0.0);
+        return true;
+    }
+    false
+}
+
+// One tick of the mixer on the server. "mp" is how far the run has got (0 when idle). True when the
+// clients need a fresh picture (always while it runs, and once when it stops).
+fn mixer_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32) -> bool {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return false;
+    }
+    let basin = [pos[0], pos[1] - 2, pos[2]];
+    let mp = get_f32(nbt, "mp");
+    let rpm = speed.abs();
+    let present = game.native_block(basin) == BASIN_BLOCK;
+    if !present || rpm < 1.0 {
+        return mixer_stop(game, nbt, basin, present);
+    }
+    let Some((inb, outb)) = game.native_with_mod_block_entity(basin, |e| (bag_read(&e.nbt, "in"), bag_read(&e.nbt, "out"))) else {
+        return mixer_stop(game, nbt, basin, present);
+    };
+    let heated = basin_heated(game, basin);
+    let Some(recipe) = find_mixing(&inb, &outb, heated) else {
+        return mixer_stop(game, nbt, basin, present);
+    };
+    if mp == 0.0 {
+        basin_mix_flag(game, basin, true);
+    }
+    let next = mp + (rpm / 16.0).clamp(1.0, 5.0);
+    if (mp as i32) / 10 != (next as i32) / 10 {
+        sfx(game, "minecraft:block.grindstone.use", pos, 0.2, 1.0);
+    }
+    if next >= MIX_UNITS {
+        sfx(game, "minecraft:block.brewing_stand.brew", pos, 0.5, 1.0);
+        let _ = game.native_with_mod_block_entity(basin, |e| {
+            let mut inb = bag_read(&e.nbt, "in");
+            let mut outb = bag_read(&e.nbt, "out");
+            for (item, n) in recipe.inputs.iter() {
+                bag_take(&mut inb, item, *n);
+            }
+            for (item, n) in recipe.outputs.iter() {
+                bag_add(&mut outb, item, *n);
+            }
+            bag_write(&mut e.nbt, "in", &inb);
+            bag_write(&mut e.nbt, "out", &outb);
+            put_int(&mut e.nbt, "mix", 0);
+        });
+        game.native_block_entity_sync(basin);
+        put_f32(nbt, "mp", 0.0);
+        return true;
+    }
+    put_f32(nbt, "mp", next);
+    true
+}
+
+// The mixer on screen: the cog inside it, the pole through its top and the whisk below, going down
+// into the basin while it mixes.
+fn mixer_submit(
+    game: &Game<'_>,
+    pos: [i32; 3],
+    state: BlockStateId,
+    entity: &ModBlockEntity,
+    draw: &mut BlockEntityDraw,
+) {
+    let speed = f64::from(get_f32(&entity.nbt, "speed"));
+    let mut axis = 0usize;
+    if let Some(value) = game.native_block_state_property(state, "facing") {
+        if let Some(front) = parse_dir(&value.to_string()) {
+            axis = axis_of(front);
+        }
+    }
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let across: i32 = (0..3).filter(|i| *i != axis).map(|i| pos[i]).sum();
+    let offset = if across % 2 == 0 { 22.5 } else { 0.0 };
+    let mut about = [0.0f32; 3];
+    about[axis] = 1.0;
+    draw.push();
+    draw.rotate_about(about, ((speed * 0.3 * t) % 360.0 + offset) as f32, [0.5, 0.5, 0.5]);
+    game.native_draw_block(draw, "create:mixer_cog_part", &[("axis", axis_char(axis))]);
+    draw.pop();
+    let mp = f64::from(get_f32(&entity.nbt, "mp"));
+    // down in the first fifth of the run, hold, up in the last fifth
+    let lift = (mp.min(MIX_UNITS as f64 - mp) / 20.0).clamp(0.0, 1.0);
+    let eased = lift * lift * (3.0 - 2.0 * lift);
+    let drop = (eased * 0.94) as f32;
+    draw.push();
+    draw.translate([0.0, -drop, 0.0]);
+    game.native_draw_block(draw, "create:mixer_pole_part", &[]);
+    draw.pop();
+    let spin = if mp > 0.0 { (t * speed * 0.6) % 360.0 } else { 0.0 };
+    draw.push();
+    draw.translate([0.0, -drop, 0.0]);
+    draw.rotate_about([0.0, 1.0, 0.0], spin as f32, [0.5, 0.5, 0.5]);
+    game.native_draw_block(draw, "create:mixer_head_part", &[]);
+    draw.pop();
+}
+
+// The basin on screen: what is in it floats in a ring and turns round while the mixer works.
+fn basin_submit(game: &Game<'_>, pos: [i32; 3], entity: &ModBlockEntity, draw: &mut BlockEntityDraw) {
+    let mut shown = bag_read(&entity.nbt, "in");
+    shown.extend(bag_read(&entity.nbt, "out"));
+    shown.truncate(6);
+    if shown.is_empty() {
+        return;
+    }
+    let mixing = get_int(&entity.nbt, "mix", 0) == 1;
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let turn = if mixing { t * 0.35 } else { 0.0 };
+    let n = shown.len();
+    for (k, (item, count)) in shown.iter().enumerate() {
+        let a = turn + (k as f64) * std::f64::consts::TAU / (n as f64);
+        let r = if n > 1 { 0.2 } else { 0.0 };
+        let bob = 0.015 * (t * 0.15 + k as f64).sin();
+        let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
+        let is_block = game.pack.assets.registry.default_state(item).is_some();
+        draw.push();
+        draw.translate([(0.5 + r * a.cos()) as f32, (0.45 + bob) as f32, (0.5 + r * a.sin()) as f32]);
+        if !is_block {
+            draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+        }
+        game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
+        draw.pop();
+    }
+}
+
 // ---- redstone: a clutch lets go while powered, a gearshift turns the other way, a press presses without items ----
 
 fn redstone_sync(game: &mut Game<'_>, pos: [i32; 3]) {
@@ -688,6 +1379,12 @@ fn redstone_sync(game: &mut Game<'_>, pos: [i32; 3]) {
 // A chain runs along one axis across the shaft. The end piece has its neighbour on the negative
 // side, the start piece on the positive side, the middle on both.
 
+// The value of axis_along_first that makes the chain of a drive with this axis run along `line`.
+fn chain_first_towards(axis: usize, line: usize) -> bool {
+    let low = (0..3).find(|a| *a != axis).unwrap_or(0);
+    line == low
+}
+
 fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
     let line = me.chain_axis();
     let mut has = [false, false];
@@ -695,7 +1392,8 @@ fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
         let mut p = pos;
         p[line] += *sgn;
         if let Some(n) = node_at(game, p) {
-            if n.is_chain() && n.axis == me.axis && n.first == me.first {
+            // the neighbour may face another way; its own chain line has to point back at this drive
+            if n.is_chain() && n.chain_axis() == line {
                 has[i] = true;
             }
         }
@@ -707,6 +1405,9 @@ fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
         _ => "none",
     };
     if want == "none" {
+        // Like Java: a drive that is not linked turns its chain line towards a chain drive beside it that
+        // already runs along that line, or towards one that is not linked either (that one turns back),
+        // as long as the neighbour shaft does not run along the line.
         for a in 0..3 {
             if a == me.axis {
                 continue;
@@ -714,12 +1415,19 @@ fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
             for sgn in [-1, 1] {
                 let mut p = pos;
                 p[a] += sgn;
-                if let Some(n) = node_at(game, p) {
-                    if n.is_chain() && n.axis == me.axis && n.chain_axis() == a && n.first != me.first {
-                        game.native_set_block_property(pos, "axis_along_first", if n.first { "true" } else { "false" });
-                        return;
-                    }
+                let Some(n) = node_at(game, p) else { continue };
+                if !n.is_chain() || n.axis == a {
+                    continue;
                 }
+                let alone = game.native_block_property(p, "part").map(|v| v == "none").unwrap_or(false);
+                if n.chain_axis() != a && !alone {
+                    continue;
+                }
+                let first = chain_first_towards(me.axis, a);
+                if first != me.first {
+                    game.native_set_block_property(pos, "axis_along_first", if first { "true" } else { "false" });
+                }
+                return;
             }
         }
     }
@@ -744,7 +1452,11 @@ fn water_beside(game: &Game<'_>, pos: [i32; 3], me: &Node) -> bool {
             let mut p = pos;
             p[a] += s;
             if game.native_block(p) == "minecraft:water" {
-                return true;
+                // a source block has level 0; flowing water has a higher level
+                let level = game.native_block_property(p, "level").map(|v| v.to_string());
+                if level.map_or(false, |l| l != "0") {
+                    return true;
+                }
             }
         }
     }
@@ -857,7 +1569,7 @@ fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     for below in [1, 2] {
         let p = [pos[0], pos[1] - below, pos[2]];
         if let Some(items) = belt_items_at(game, p) {
-            if items.iter().any(|b| pressing(&b.item).is_some()) {
+            if items.iter().any(|b| pressing(&b.item).is_some() && (b.p - 0.5).abs() < 0.12) {
                 return true;
             }
         }
@@ -868,35 +1580,51 @@ fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     found.iter().any(|e| pressing(&e.stack.item).is_some())
 }
 
-// The head hits the bottom: press what lies under it. Whatever sat on a depot stays on it.
-fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
-    for below in [1, 2] {
-        let p = [pos[0], pos[1] - below, pos[2]];
-        if game.native_block(p) == "create:belt" {
-            let changed = game
-                .native_with_mod_block_entity(p, |e| {
-                    let mut v = belt_items(&e.nbt);
-                    let mut any = false;
-                    for b in v.iter_mut() {
-                        if let Some(r) = pressing(&b.item) {
-                            b.item = r.to_string();
-                            any = true;
-                        }
+// Presses the stack on the belt piece or depot at `p` where it lies: every item of it becomes its result.
+// True when one was pressed.
+fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
+    if game.native_block(p) == "create:belt" {
+        let done = game
+            .native_with_mod_block_entity(p, |e| {
+                let mut v = belt_items(&e.nbt);
+                let mut hit = false;
+                for b in v.iter_mut() {
+                    if (b.p - 0.5).abs() >= 0.12 {
+                        continue;
                     }
-                    if any {
-                        belt_store(&mut e.nbt, &v);
+                    if let Some(r) = pressing(&b.item) {
+                        b.item = r.to_string();
+                        hit = true;
+                        break;
                     }
-                    any
-                })
-                .unwrap_or(false);
-            if changed {
-                game.native_block_entity_sync(p);
-            }
+                }
+                if hit {
+                    belt_store(&mut e.nbt, &v);
+                }
+                hit
+            })
+            .unwrap_or(false);
+        if done {
+            game.native_block_entity_sync(p);
+            return true;
         }
-        if let Some(Some((item, count))) = depot_at(game, p) {
-            if let Some(result) = pressing(&item) {
-                depot_set(game, p, Some((result.to_string(), count)));
-            }
+    }
+    if let Some(Some((item, count))) = depot_at(game, p) {
+        if let Some(result) = pressing(&item) {
+            depot_set(game, p, Some((result.to_string(), count)));
+            return true;
+        }
+    }
+    false
+}
+
+// The head hits the bottom: press one stack, the first it finds (belt or depot one block down, then two,
+// then something lying on the ground), and nothing more.
+fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
+    sfx(game, "minecraft:block.anvil.place", pos, 0.35, 1.7);
+    for below in [1, 2] {
+        if press_one(game, [pos[0], pos[1] - below, pos[2]]) {
+            return;
         }
     }
     let dim = game.dim.id().to_string();
@@ -904,12 +1632,8 @@ fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
     let found = game.native_item_entities(&dim, [x, y - 2.0, z], [x + 1.0, y, z + 1.0]);
     for e in found {
         let Some(result) = pressing(&e.stack.item) else { continue };
-        let count = e.stack.count;
-        let mut gone = e.stack.clone();
-        gone.count = 0;
-        if game.native_set_item_entity(&dim, e.id, gone) {
-            let made = ItemStack { item: Arc::from(result), count, damage: 0, extra: None };
-            game.spawn_item(made, e.position, [0.0, 0.1, 0.0], 10);
+        if game.native_set_item_entity(&dim, e.id, stack_of(result, e.stack.count)) {
+            return;
         }
     }
 }
@@ -933,7 +1657,10 @@ fn press_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
             return false;
         }
     }
-    let mut next = phase + rpm * 0.3;
+    // The pace of Create: a cycle is 240 units, and each tick adds 1 to 60 units (rpm / 512 of the way),
+    // so about 8 ticks per stroke at 256 rpm, 60 at 32 rpm and 240 at 8 rpm. 1.5 degrees per unit.
+    let units = (1.0 + (rpm / 512.0).clamp(0.0, 1.0) * 59.0).floor();
+    let mut next = phase + units * 1.5;
     if phase < 180.0 && next >= 180.0 {
         press_now(game, pos);
     }
@@ -965,18 +1692,20 @@ struct BeltItem {
     item: String,
     count: u32,
     p: f32,
+    moving: bool,
 }
 
-// The piece keeps its items as one text: item|count|where;item|count|where...
+// The piece keeps its items as one text: item|count|where|moving;item|count|where|moving...
 fn belt_items(n: &Compound) -> Vec<BeltItem> {
     let text = get_text(n, "bi");
     let mut out = Vec::new();
     for part in text.split(';') {
-        let mut f = part.splitn(3, '|');
+        let mut f = part.splitn(4, '|');
         let (Some(item), Some(count), Some(p)) = (f.next(), f.next(), f.next()) else { continue };
         let (Ok(count), Ok(p)) = (count.parse::<u32>(), p.parse::<f32>()) else { continue };
+        let moving = f.next() == Some("1");
         if !item.is_empty() && count > 0 {
-            out.push(BeltItem { item: item.to_string(), count, p });
+            out.push(BeltItem { item: item.to_string(), count, p, moving });
         }
     }
     out
@@ -993,8 +1722,36 @@ fn belt_store(n: &mut Compound, items: &[BeltItem]) {
         text.push_str(&b.count.to_string());
         text.push('|');
         text.push_str(&b.p.to_string());
+        text.push('|');
+        text.push_str(if b.moving { "1" } else { "0" });
     }
     n.insert(JavaString::from("bi"), Tag::String(JavaString::from(text.as_str())));
+}
+
+static BELT_VIEW: Mutex<Vec<([i32; 3], String, f64, Vec<BeltItem>)>> = Mutex::new(Vec::new());
+
+// The drawing side: the picture of the piece as last sent and the time it was first seen, so the items
+// can be drawn moving on from where that picture put them, smoothly, whatever the network does.
+fn belt_view(pos: [i32; 3], nbt: &Compound, now: f64) -> (Vec<BeltItem>, f64) {
+    let text = get_text(nbt, "bi");
+    let Ok(mut g) = BELT_VIEW.lock() else { return (belt_items(nbt), now) };
+    if let Some(i) = g.iter().position(|e| e.0 == pos) {
+        if g[i].1 == text {
+            return (g[i].3.clone(), g[i].2);
+        }
+        let v = belt_items(nbt);
+        if v.is_empty() {
+            g.remove(i);
+            return (v, now);
+        }
+        g[i] = (pos, text, now, v.clone());
+        return (v, now);
+    }
+    let v = belt_items(nbt);
+    if !v.is_empty() {
+        g.push((pos, text, now, v.clone()));
+    }
+    (v, now)
 }
 
 fn belt_items_at(game: &mut Game<'_>, p: [i32; 3]) -> Option<Vec<BeltItem>> {
@@ -1030,7 +1787,7 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
                     if v.len() >= BELT_MAX || v.iter().any(|b| (b.p - entry).abs() < BELT_GAP) {
                         return false;
                     }
-                    v.push(BeltItem { p: entry, ..carried });
+                    v.push(BeltItem { p: entry, moving: true, ..carried });
                     belt_store(&mut e.nbt, &v);
                     true
                 })
@@ -1039,6 +1796,11 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
                 game.native_block_entity_sync(next);
             }
             return ok;
+        }
+    }
+    if let Some(n) = node_at(game, next) {
+        if n.kind == Kind::Saw && n.front == [0, 1, 0] && saw_accept(game, next, item) {
+            return true;
         }
     }
     match depot_at(game, next) {
@@ -1056,12 +1818,45 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
         f64::from(pos[2]) + 0.5 + f64::from(me.front[2]) * s * 0.6,
     ];
     let push = [f64::from(me.front[0]) * s * 0.1, 0.05, f64::from(me.front[2]) * s * 0.1];
+    if item.count == 1 && game.native_block(next) == DRAIN {
+        if let Some(fl) = bucket_fluid(&item.item) {
+            if drain_accept(game, next, fl) {
+                game.spawn_item(stack_of("minecraft:bucket", 1), edge, push, 20);
+                return true;
+            }
+        }
+    }
     game.spawn_item(stack_of(&item.item, item.count), edge, push, 20);
     true
 }
 
 // One tick of a belt piece: items lying on it are taken in, the ones it carries move on at the speed of
 // the belt (a gap apart) and pass to the next piece, a free depot, or fall off the end. True when it changed.
+// Which way a belt carries things for a positive speed, along its facing: the top of a roller that turns
+// counterclockwise about its shaft (as the shafts of the belt turn) runs along shaft x up, which is
+// +z, and along z x up, which is -x. 1.0 is with the facing, -1.0 against it.
+fn belt_flip(front: [i32; 3]) -> f32 {
+    if front[0] != 0 {
+        -(front[0] as f32)
+    } else {
+        front[2] as f32
+    }
+}
+
+// A running press stands one or two blocks above this belt piece.
+fn press_above_running(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    for up in [1, 2] {
+        let p = [pos[0], pos[1] + up, pos[2]];
+        if game.native_block(p) == "create:mechanical_press" {
+            let r = game.native_with_mod_block_entity(p, |e| get_f32(&e.nbt, "speed"));
+            if r.map_or(false, |sp| sp.abs() >= 1.0) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
     if game.serving.is_none() && game.options.dedicated.is_none() {
         return false;
@@ -1088,17 +1883,19 @@ fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             let mut gone = e.stack.clone();
             gone.count = 0;
             if game.native_set_item_entity(&dim, e.id, gone) {
-                items.push(BeltItem { item: e.stack.item.to_string(), count: e.stack.count, p: spot });
+                items.push(BeltItem { item: e.stack.item.to_string(), count: e.stack.count, p: spot, moving: false });
                 changed = true;
             }
         }
     }
     if speed.abs() >= 1.0 && !items.is_empty() {
-        let sign = if speed > 0.0 { 1.0f32 } else { -1.0 };
+        let sign = (if speed > 0.0 { 1.0f32 } else { -1.0 }) * belt_flip(me.front);
         let step = speed.abs() / 480.0 * sign;
         items.sort_by(|a, b| (b.p * sign).partial_cmp(&(a.p * sign)).unwrap_or(std::cmp::Ordering::Equal));
         let mut ahead: Option<f32> = None;
         let mut kept: Vec<BeltItem> = Vec::new();
+        // Under a running press a pressable stack waits in the middle of the piece until it is pressed.
+        let hold = items.iter().any(|b| pressing(&b.item).is_some()) && press_above_running(game, pos);
         for mut b in items {
             let mut np = b.p + step;
             if let Some(a) = ahead {
@@ -1110,6 +1907,13 @@ fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
                     np = limit.min(b.p);
                 }
             }
+            if hold && pressing(&b.item).is_some() {
+                if sign > 0.0 && b.p <= 0.5 {
+                    np = np.min(0.5);
+                } else if sign < 0.0 && b.p >= 0.5 {
+                    np = np.max(0.5);
+                }
+            }
             let exited = if sign > 0.0 { np >= 1.0 } else { np <= 0.0 };
             if exited {
                 if belt_hand_over(game, pos, me, sign, &b) {
@@ -1118,7 +1922,11 @@ fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
                 }
                 np = if sign > 0.0 { 0.999 } else { 0.001 };
             }
-            if (np - b.p).abs() > 1e-6 {
+            // Only starting or stopping needs a fresh picture on the clients; they carry the item on
+            // themselves while it moves.
+            let mv = (np - b.p).abs() > 1e-6;
+            if mv != b.moving {
+                b.moving = mv;
                 changed = true;
             }
             b.p = np;
@@ -1126,6 +1934,13 @@ fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             kept.push(b);
         }
         items = kept;
+    } else {
+        for b in items.iter_mut() {
+            if b.moving {
+                b.moving = false;
+                changed = true;
+            }
+        }
     }
     belt_store(nbt, &items);
     changed || items.len() != before
@@ -1381,6 +2196,10 @@ const TANK_CAP: i32 = 8000;
 const SPOUT_CAP: i32 = 1000;
 const PUMP_CAP: i32 = 2000;
 const BUCKET: i32 = 1000;
+const DRAIN: &str = "create:item_drain";
+const GLASS: &str = "create:glass_fluid_pipe";
+const HOSE: &str = "create:hose_pulley";
+const HOSE_MAX: f32 = 24.0;
 
 // down, up, north, south, west, east: the opposite of index i is i ^ 1.
 const DIRS: [[i32; 3]; 6] = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
@@ -1454,7 +2273,7 @@ fn fluid_title(fluid: &str) -> &'static str {
 }
 
 fn is_fluid_block(name: &str) -> bool {
-    matches!(name, PIPE | TANK | SPOUT)
+    matches!(name, PIPE | TANK | SPOUT | DRAIN | GLASS)
 }
 
 // Whether the block at `p` has a fluid port on its face towards `d` (d points from p to the asker).
@@ -1463,6 +2282,12 @@ fn fluid_port(game: &Game<'_>, p: [i32; 3], d: [i32; 3]) -> bool {
     match name.as_str() {
         PIPE | TANK => true,
         SPOUT => d == [0, 1, 0],
+        DRAIN => d != [0, 1, 0],
+        GLASS => game.native_block_property(p, "axis").and_then(|v| parse_axis(&v.to_string())) == Some(axis_of(d)),
+        HOSE => match game.native_block_property(p, "facing").and_then(|v| parse_dir(&v.to_string())) {
+            Some(f) => d == neg(cw(f)),
+            None => false,
+        },
         PUMP | VALVE => match game.native_block_property(p, "facing").and_then(|v| parse_dir(&v.to_string())) {
             Some(f) => axis_of(f) == axis_of(d),
             None => false,
@@ -1482,7 +2307,8 @@ fn pipe_sync(game: &mut Game<'_>, pos: [i32; 3]) {
     let mut n = 0;
     let mut last = 0;
     for (i, d) in DIRS.iter().enumerate() {
-        if fluid_port(game, add3(pos, *d), neg(*d)) {
+        let q = add3(pos, *d);
+        if fluid_port(game, q, neg(*d)) || world_source(game, q).is_some() {
             open[i] = true;
             n += 1;
             last = i;
@@ -1504,12 +2330,45 @@ fn pipe_sync(game: &mut Game<'_>, pos: [i32; 3]) {
     }
 }
 
-// A tank shows a cap where no tank lies above it and a base where none lies below.
+// The tanks of one layer that touch each other sideways.
+fn tank_layer(game: &Game<'_>, pos: [i32; 3]) -> Vec<[i32; 3]> {
+    let mut cells: Vec<[i32; 3]> = vec![pos];
+    let mut i = 0;
+    while i < cells.len() && cells.len() < 32 {
+        let p = cells[i];
+        i += 1;
+        for d in [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]] {
+            let q = add3(p, d);
+            if !cells.contains(&q) && game.native_block(q) == TANK {
+                cells.push(q);
+            }
+        }
+    }
+    cells
+}
+
+// A tank shows a cap where no tank lies above it and a base where none lies below. Tanks side by side
+// form a block up to 3 by 3: corners get a window facing out, edges and the middle stay plain, a single
+// column gets one window.
 fn tank_sync(game: &mut Game<'_>, pos: [i32; 3]) {
     let below = game.native_block([pos[0], pos[1] - 1, pos[2]]) == TANK;
     let above = game.native_block([pos[0], pos[1] + 1, pos[2]]) == TANK;
-    for (prop, want) in [("bottom", !below), ("top", !above)] {
-        let v = if want { "true" } else { "false" };
+    let cells = tank_layer(game, pos);
+    let minx = cells.iter().map(|c| c[0]).min().unwrap_or(pos[0]);
+    let maxx = cells.iter().map(|c| c[0]).max().unwrap_or(pos[0]);
+    let minz = cells.iter().map(|c| c[2]).min().unwrap_or(pos[2]);
+    let maxz = cells.iter().map(|c| c[2]).max().unwrap_or(pos[2]);
+    let w = maxx - minx + 1;
+    let d = maxz - minz + 1;
+    let rect = cells.len() as i32 == w * d && w <= 3 && d <= 3;
+    let mut shape = "window".to_string();
+    if rect && w > 1 && d > 1 {
+        let xs = if pos[0] == minx { "w" } else if pos[0] == maxx { "e" } else { "" };
+        let zs = if pos[2] == minz { "n" } else if pos[2] == maxz { "s" } else { "" };
+        shape = if xs.is_empty() || zs.is_empty() { "plain".to_string() } else { "window_".to_string() + zs + xs };
+    }
+    let wants = [("bottom", if below { "false" } else { "true" }), ("top", if above { "false" } else { "true" }), ("shape", shape.as_str())];
+    for (prop, v) in wants {
         let same = game.native_block_property(pos, prop).map(|x| x == v).unwrap_or(true);
         if !same {
             game.native_set_block_property(pos, prop, v);
@@ -1520,12 +2379,16 @@ fn tank_sync(game: &mut Game<'_>, pos: [i32; 3]) {
 struct Ends {
     tanks: Vec<[i32; 3]>,
     worlds: Vec<[i32; 3]>,
+    // cells where a hose pulley end hangs
+    hoses: Vec<[i32; 3]>,
+    // glass pipes passed, with the direction walked
+    flows: Vec<([i32; 3], [i32; 3])>,
 }
 
 // Walks the pipes from `from` in direction `dir` and collects the ends: tanks and spouts, and world
 // cells where an open pipe end (or an open pump end) touches the world.
-fn walk(game: &Game<'_>, from: [i32; 3], dir: [i32; 3]) -> Ends {
-    let mut ends = Ends { tanks: Vec::new(), worlds: Vec::new() };
+fn walk(game: &mut Game<'_>, from: [i32; 3], dir: [i32; 3]) -> Ends {
+    let mut ends = Ends { tanks: Vec::new(), worlds: Vec::new(), hoses: Vec::new(), flows: Vec::new() };
     let mut seen: HashSet<[i32; 3]> = HashSet::new();
     seen.insert(from);
     let mut stack: Vec<([i32; 3], [i32; 3])> = vec![(from, dir)];
@@ -1550,6 +2413,27 @@ fn walk(game: &Game<'_>, from: [i32; 3], dir: [i32; 3]) -> Ends {
                 }
             }
             TANK => ends.tanks.push(q),
+            DRAIN => {
+                if d != [0, -1, 0] {
+                    ends.tanks.push(q);
+                }
+            }
+            GLASS => {
+                let a = game.native_block_property(q, "axis").and_then(|v| parse_axis(&v.to_string()));
+                if a == Some(axis_of(d)) {
+                    ends.flows.push((q, d));
+                    stack.push((q, d));
+                }
+            }
+            HOSE => {
+                let f = game.native_block_property(q, "facing").and_then(|v| parse_dir(&v.to_string()));
+                if let Some(f) = f {
+                    if d == cw(f) {
+                        let l = game.native_with_mod_block_entity(q, |e| get_f32(&e.nbt, "hl")).unwrap_or(0.0);
+                        ends.hoses.push([q[0], q[1] - 1 - (l.floor() as i32), q[2]]);
+                    }
+                }
+            }
             SPOUT => {
                 if d == [0, -1, 0] {
                     ends.tanks.push(q);
@@ -1626,67 +2510,117 @@ fn pool_of(game: &mut Game<'_>, at: [i32; 3]) -> Pool {
     Pool { cells, fluid, amount, each }
 }
 
-// Puts up to `want` of `fluid` into the pool, lowest tank first. Returns what went in.
+fn put_cell(game: &mut Game<'_>, c: [i32; 3], fl: &str, each: i32, ask: i32) -> i32 {
+    let fl = fl.to_string();
+    let took = game
+        .native_with_mod_block_entity(c, move |e| {
+            let cur = get_int(&e.nbt, "fa", 0);
+            let curf = get_text(&e.nbt, "fl");
+            if cur > 0 && curf != fl {
+                return 0;
+            }
+            let add = (each - cur).max(0).min(ask);
+            if add > 0 {
+                fluid_put(&mut e.nbt, &fl, cur + add);
+            }
+            add
+        })
+        .unwrap_or(0);
+    if took > 0 {
+        game.native_block_entity_sync(c);
+    }
+    took
+}
+
+fn take_cell(game: &mut Game<'_>, c: [i32; 3], ask: i32) -> i32 {
+    let took = game
+        .native_with_mod_block_entity(c, move |e| {
+            let cur = get_int(&e.nbt, "fa", 0);
+            if cur <= 0 {
+                return 0;
+            }
+            let curf = get_text(&e.nbt, "fl");
+            let t = cur.min(ask);
+            fluid_put(&mut e.nbt, &curf, cur - t);
+            t
+        })
+        .unwrap_or(0);
+    if took > 0 {
+        game.native_block_entity_sync(c);
+    }
+    took
+}
+
+// The cells of a pool grouped by layer, lowest layer first. A layer fills and drains evenly.
+fn pool_layers(pool: &Pool) -> Vec<Vec<[i32; 3]>> {
+    let mut out: Vec<Vec<[i32; 3]>> = Vec::new();
+    for c in pool.cells.iter() {
+        if let Some(last) = out.last_mut() {
+            if last[0][1] == c[1] {
+                last.push(*c);
+                continue;
+            }
+        }
+        out.push(vec![*c]);
+    }
+    out
+}
+
+// Puts up to `want` of `fluid` into the pool, lowest layer first. Returns what went in.
 fn pool_put(game: &mut Game<'_>, pool: &Pool, fluid: &str, want: i32) -> i32 {
     if want <= 0 || (pool.amount > 0 && pool.fluid != fluid) {
         return 0;
     }
     let mut left = want;
-    for c in pool.cells.iter() {
+    for layer in pool_layers(pool).iter() {
+        let n = layer.len() as i32;
+        while left > 0 {
+            let share = ((left + n - 1) / n).max(1);
+            let mut progress = 0;
+            for c in layer.iter() {
+                if left <= 0 {
+                    break;
+                }
+                let t = put_cell(game, *c, fluid, pool.each, share.min(left));
+                left -= t;
+                progress += t;
+            }
+            if progress == 0 {
+                break;
+            }
+        }
         if left <= 0 {
             break;
-        }
-        let fl = fluid.to_string();
-        let each = pool.each;
-        let ask = left;
-        let took = game
-            .native_with_mod_block_entity(*c, move |e| {
-                let cur = get_int(&e.nbt, "fa", 0);
-                let curf = get_text(&e.nbt, "fl");
-                if cur > 0 && curf != fl {
-                    return 0;
-                }
-                let add = (each - cur).max(0).min(ask);
-                if add > 0 {
-                    fluid_put(&mut e.nbt, &fl, cur + add);
-                }
-                add
-            })
-            .unwrap_or(0);
-        if took > 0 {
-            game.native_block_entity_sync(*c);
-            left -= took;
         }
     }
     want - left
 }
 
-// Takes up to `want` out of the pool, highest tank first. Returns what came out.
+// Takes up to `want` out of the pool, highest layer first. Returns what came out.
 fn pool_take(game: &mut Game<'_>, pool: &Pool, want: i32) -> i32 {
     if want <= 0 || pool.amount <= 0 {
         return 0;
     }
     let mut left = want;
-    for c in pool.cells.iter().rev() {
+    for layer in pool_layers(pool).iter().rev() {
+        let n = layer.len() as i32;
+        while left > 0 {
+            let share = ((left + n - 1) / n).max(1);
+            let mut progress = 0;
+            for c in layer.iter() {
+                if left <= 0 {
+                    break;
+                }
+                let t = take_cell(game, *c, share.min(left));
+                left -= t;
+                progress += t;
+            }
+            if progress == 0 {
+                break;
+            }
+        }
         if left <= 0 {
             break;
-        }
-        let ask = left;
-        let took = game
-            .native_with_mod_block_entity(*c, move |e| {
-                let cur = get_int(&e.nbt, "fa", 0);
-                if cur <= 0 {
-                    return 0;
-                }
-                let curf = get_text(&e.nbt, "fl");
-                let t = cur.min(ask);
-                fluid_put(&mut e.nbt, &curf, cur - t);
-                t
-            })
-            .unwrap_or(0);
-        if took > 0 {
-            game.native_block_entity_sync(*c);
-            left -= took;
         }
     }
     want - left
@@ -1703,7 +2637,8 @@ fn world_source(game: &Game<'_>, p: [i32; 3]) -> Option<&'static str> {
     };
     match game.native_block_property(p, "level") {
         Some(v) if v == "0" => Some(fluid),
-        _ => None,
+        Some(_) => None,
+        None => Some(fluid),
     }
 }
 
@@ -1758,6 +2693,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
     }
     let mut fluid = get_text(nbt, "fl");
     let mut amt = get_int(nbt, "fa", 0);
+    let mut moved = false;
     // draw in from tanks and spouts at the back
     let mut want = rate.min(PUMP_CAP - amt);
     for c in ins.tanks.iter() {
@@ -1779,6 +2715,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             fluid = pool.fluid.clone();
             amt += got;
             want -= got;
+            moved = true;
         }
     }
     // draw in a source block from an open end at the back, paced by the speed
@@ -1798,6 +2735,24 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             }
             fluid = wf.to_string();
             amt += BUCKET;
+            moved = true;
+            break;
+        }
+    }
+    // draw in from the water or lava body where a hose pulley hangs
+    if PUMP_CAP - amt >= BUCKET && (game.ticks as i64 / 2).rem_euclid(pace) == 0 {
+        let dim = game.dim.id().to_string();
+        for c in ins.hoses.iter() {
+            let Some((src, wf, infinite)) = hose_source(game, *c) else { continue };
+            if amt > 0 && fluid != wf {
+                continue;
+            }
+            if !infinite {
+                game.native_set_block(&dim, src, BlockStateId(0), 3);
+            }
+            fluid = wf.to_string();
+            amt += BUCKET;
+            moved = true;
             break;
         }
     }
@@ -1817,6 +2772,9 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
         let put = pool_put(game, &pool, &fluid, give);
         amt -= put;
         give -= put;
+        if put > 0 {
+            moved = true;
+        }
     }
     // place a source block at an open end at the front once a bucket is ready
     if amt >= BUCKET && !fluid.is_empty() {
@@ -1826,11 +2784,203 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             }
             if is_air(&game.native_block(*c)) && place_fluid(game, *c, &fluid) {
                 amt -= BUCKET;
+                moved = true;
                 break;
             }
         }
     }
+    if amt >= BUCKET && !fluid.is_empty() {
+        for c in outs.hoses.iter() {
+            if hose_place(game, *c, &fluid) {
+                amt -= BUCKET;
+                moved = true;
+                break;
+            }
+        }
+    }
+    if moved && !fluid.is_empty() {
+        let mut flows: Vec<([i32; 3], [i32; 3])> = outs.flows.clone();
+        for (c, d) in ins.flows.iter() {
+            flows.push((*c, neg(*d)));
+        }
+        stamp_flow(game, &flows, &fluid);
+    }
     fluid_put(nbt, &fluid, amt);
+}
+
+// ---- the hose pulley ----
+// Turning one way lowers the hose (until something solid is in the way), the other way raises it. The
+// hose end is an open end for the pump: it draws water or lava from the body it hangs in (the highest
+// source first; a big body of water never runs out) and puts source blocks down where it is free.
+
+fn hose_free(game: &Game<'_>, p: [i32; 3]) -> bool {
+    let n = game.native_block(p).to_string();
+    is_air(&n) || n == "minecraft:water" || n == "minecraft:lava"
+}
+
+fn hose_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32) -> bool {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return false;
+    }
+    if speed.abs() < 1.0 {
+        return false;
+    }
+    let l = get_f32(nbt, "hl");
+    let mut n = (l + speed * 0.002).clamp(0.0, HOSE_MAX);
+    if n > l {
+        let cell = [pos[0], pos[1] - 1 - (n.floor() as i32), pos[2]];
+        if !hose_free(game, cell) {
+            n = l;
+        }
+    }
+    if n != l {
+        put_f32(nbt, "hl", n);
+        true
+    } else {
+        false
+    }
+}
+
+fn hose_source(game: &Game<'_>, end: [i32; 3]) -> Option<([i32; 3], &'static str, bool)> {
+    // the tip may sit in a cell already drained: then look just below it
+    let mut end = end;
+    if !matches!(game.native_block(end).to_string().as_str(), "minecraft:water" | "minecraft:lava") {
+        end = [end[0], end[1] - 1, end[2]];
+    }
+    let name = game.native_block(end).to_string();
+    let fluid = match name.as_str() {
+        "minecraft:water" => "water",
+        "minecraft:lava" => "lava",
+        _ => return None,
+    };
+    let mut seen: HashSet<[i32; 3]> = HashSet::new();
+    seen.insert(end);
+    let mut queue: Vec<[i32; 3]> = vec![end];
+    let mut i = 0;
+    let mut best: Option<[i32; 3]> = None;
+    while i < queue.len() && queue.len() < 400 {
+        let p = queue[i];
+        i += 1;
+        if game.native_block_property(p, "level").map(|v| v == "0").unwrap_or(false) {
+            best = match best {
+                Some(b) if b[1] > p[1] => Some(b),
+                _ => Some(p),
+            };
+        }
+        for d in DIRS.iter() {
+            let q = add3(p, *d);
+            if seen.contains(&q) {
+                continue;
+            }
+            if game.native_block(q) == name {
+                seen.insert(q);
+                queue.push(q);
+            }
+        }
+    }
+    let big = queue.len() >= 400;
+    best.map(|b| (b, fluid, big && fluid == "water"))
+}
+
+fn hose_place(game: &mut Game<'_>, end: [i32; 3], fluid: &str) -> bool {
+    let name = match fluid {
+        "water" => "minecraft:water",
+        "lava" => "minecraft:lava",
+        _ => return false,
+    };
+    let here = game.native_block(end).to_string();
+    let flowing = here == name && game.native_block_property(end, "level").map(|v| v != "0").unwrap_or(false);
+    (is_air(&here) || flowing) && place_fluid(game, end, fluid)
+}
+
+// ---- glass pipes show the fluid moving through them ----
+// A pump stamps the glass pipes it moves fluid through (fluid, direction, time). The block entity draws
+// a moving stripe pattern while the stamp is fresh; the pipe clears it a little after the pump stops.
+
+fn stamp_flow(game: &mut Game<'_>, flows: &[([i32; 3], [i32; 3])], fluid: &str) {
+    let now = game.ticks as i32;
+    for (c, d) in flows.iter() {
+        let idx = DIRS.iter().position(|x| x == d).unwrap_or(0) as i32;
+        let fl = fluid.to_string();
+        let changed = game
+            .native_with_mod_block_entity(*c, move |e| {
+                let old = get_text(&e.nbt, "ff");
+                let oi = get_int(&e.nbt, "fd", -1);
+                put_int(&mut e.nbt, "ft", now);
+                if old != fl || oi != idx {
+                    e.nbt.insert(JavaString::from("ff"), Tag::String(JavaString::from(fl.as_str())));
+                    put_int(&mut e.nbt, "fd", idx);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if changed {
+            game.native_block_entity_sync(*c);
+        }
+    }
+}
+
+fn flow_expire(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
+    if get_text(nbt, "ff").is_empty() {
+        return;
+    }
+    let now = game.ticks as i32;
+    if now.wrapping_sub(get_int(nbt, "ft", now)) > 12 {
+        nbt.remove(&JavaString::from("ff"));
+        nbt.remove(&JavaString::from("fd"));
+        game.native_block_entity_sync(pos);
+    }
+}
+
+// ---- the item drain: empties full buckets (put in by hand, thrown on top, or carried by a belt) ----
+
+fn drain_accept(game: &mut Game<'_>, pos: [i32; 3], fluid: &str) -> bool {
+    let f = fluid.to_string();
+    let ok = game
+        .native_with_mod_block_entity(pos, move |e| {
+            let cur = get_int(&e.nbt, "fa", 0);
+            let cf = get_text(&e.nbt, "fl");
+            if cur + BUCKET > SPOUT_CAP || (cur > 0 && cf != f) {
+                return false;
+            }
+            fluid_put(&mut e.nbt, &f, cur + BUCKET);
+            true
+        })
+        .unwrap_or(false);
+    if ok {
+        game.native_block_entity_sync(pos);
+    }
+    ok
+}
+
+fn drain_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
+    let fluid = get_text(nbt, "fl");
+    let amt = get_int(nbt, "fa", 0);
+    if amt + BUCKET > SPOUT_CAP {
+        return;
+    }
+    let dim = game.dim.id().to_string();
+    let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+    let found = game.native_item_entities(&dim, [x, y + 0.6, z], [x + 1.0, y + 1.9, z + 1.0]);
+    for e in found {
+        if e.stack.count == 0 {
+            continue;
+        }
+        let Some(fl) = bucket_fluid(&e.stack.item) else { continue };
+        if amt > 0 && fluid != fl {
+            continue;
+        }
+        let mut rest = e.stack.clone();
+        rest.count -= 1;
+        if game.native_set_item_entity(&dim, e.id, rest) {
+            game.spawn_item(stack_of("minecraft:bucket", 1), e.position, [0.0, 0.1, 0.0], 10);
+            fluid_put(nbt, fl, amt + BUCKET);
+            game.native_block_entity_sync(pos);
+            return;
+        }
+    }
 }
 
 // ---- the valve ----
@@ -1917,6 +3067,10 @@ fn fluid_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
         tank_sync(game, pos);
     } else if name == SPOUT {
         spout_tick(game, pos, &mut entity.nbt);
+    } else if name == DRAIN {
+        drain_tick(game, pos, &mut entity.nbt);
+    } else if name == GLASS {
+        flow_expire(game, pos, &mut entity.nbt);
     }
 }
 
@@ -1959,10 +3113,48 @@ fn bucket_click(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     false
 }
 
+fn pump_info(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
+    let speed = game.native_with_mod_block_entity(pos, |e| get_f32(&e.nbt, "speed")).unwrap_or(0.0);
+    let amt = game.native_with_mod_block_entity(pos, |e| get_int(&e.nbt, "fa", 0)).unwrap_or(0);
+    let flow = if speed >= 0.0 { me.front } else { neg(me.front) };
+    let outs = walk(game, pos, flow);
+    let ins = walk(game, pos, neg(flow));
+    let s = sect();
+    let line = s.clone()
+        + "7Pump: "
+        + &s
+        + "f"
+        + &(speed as i32).to_string()
+        + " rpm, buffer "
+        + &amt.to_string()
+        + " mB"
+        + &s
+        + "7 | back: "
+        + &s
+        + "f"
+        + &ins.tanks.len().to_string()
+        + " tanks, "
+        + &ins.worlds.len().to_string()
+        + " open"
+        + &s
+        + "7 | front: "
+        + &s
+        + "f"
+        + &outs.tanks.len().to_string()
+        + " tanks, "
+        + &outs.worlds.len().to_string()
+        + " open";
+    game.native_chat(&line);
+}
+
 fn fluid_info(game: &mut Game<'_>, pos: [i32; 3], name: &str) {
     let pool = pool_of(game, pos);
     let total = pool.each * pool.cells.len() as i32;
-    let label = if name == TANK { "Fluid Tank" } else { "Spout" };
+    let label = match name {
+        TANK => "Fluid Tank",
+        DRAIN => "Item Drain",
+        _ => "Spout",
+    };
     let what = if pool.amount > 0 { fluid_title(&pool.fluid) } else { "empty" };
     let s = sect();
     let line = s.clone()
@@ -1992,6 +3184,13 @@ fn fluid_placement(
     name: &str,
     answer: &mut Option<Option<BlockStateId>>,
 ) {
+    if name == GLASS {
+        let look = nearest_looking(context.yaw, context.pitch);
+        if let Some(s) = level.native_state_with_property(state, "axis", axis_char(axis_of(look))) {
+            *answer = Some(Some(s));
+        }
+        return;
+    }
     if name == TANK {
         if let Some(s) = level.native_state_with_property(state, "shape", "window") {
             *answer = Some(Some(s));
@@ -2132,6 +3331,23 @@ fn builtin(kind: &str, item: &str) -> Option<Rec> {
             "create:zinc_ore" | "create:deepslate_zinc_ore" | "create:raw_zinc" => {
                 Some(rec_of(200, &[("create:crushed_raw_zinc", 1, 1.0)]))
             }
+            "minecraft:dandelion" | "minecraft:sunflower" => Some(rec_of(100, &[("minecraft:yellow_dye", 2, 1.0)])),
+            "minecraft:poppy" | "minecraft:red_tulip" | "minecraft:rose_bush" => {
+                Some(rec_of(100, &[("minecraft:red_dye", 2, 1.0)]))
+            }
+            "minecraft:blue_orchid" => Some(rec_of(100, &[("minecraft:light_blue_dye", 2, 1.0)])),
+            "minecraft:allium" => Some(rec_of(100, &[("minecraft:magenta_dye", 2, 1.0)])),
+            "minecraft:azure_bluet" | "minecraft:oxeye_daisy" | "minecraft:white_tulip" => {
+                Some(rec_of(100, &[("minecraft:light_gray_dye", 2, 1.0)]))
+            }
+            "minecraft:orange_tulip" => Some(rec_of(100, &[("minecraft:orange_dye", 2, 1.0)])),
+            "minecraft:pink_tulip" | "minecraft:peony" => Some(rec_of(100, &[("minecraft:pink_dye", 2, 1.0)])),
+            "minecraft:cornflower" => Some(rec_of(100, &[("minecraft:blue_dye", 2, 1.0)])),
+            "minecraft:lily_of_the_valley" => Some(rec_of(100, &[("minecraft:white_dye", 2, 1.0)])),
+            "minecraft:sugar_cane" => Some(rec_of(100, &[("minecraft:sugar", 2, 1.0)])),
+            "minecraft:coal_ore" | "minecraft:deepslate_coal_ore" => Some(rec_of(150, &[("minecraft:coal", 1, 1.0)])),
+            "minecraft:cobblestone" => Some(rec_of(150, &[("minecraft:gravel", 1, 1.0)])),
+            "minecraft:gravel" => Some(rec_of(150, &[("minecraft:sand", 1, 1.0)])),
             _ => None,
         },
         "create:crushing" => match item {
@@ -2318,6 +3534,10 @@ fn mill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32)
     let mut timer = get_int(nbt, "mt", -1);
     if speed.abs() >= 1.0 {
         if let Some((item, count)) = input.first().cloned() {
+            if (game.ticks as i64 + i64::from(pos[0])).rem_euclid(3) == 0 {
+                let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+                puff(game, at, Some(&item), 2);
+            }
             match recipe_for(game, "create:milling", &item) {
                 Some(rec) => {
                     if timer < 0 {
@@ -2424,9 +3644,8 @@ fn millstone_click(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 }
 
 // ---- the mechanical saw ----
-// The blade points along the saw facing. It cuts the items lying on a belt piece or a depot in front of it
-// (or on the ground there), and a log in front of it: the log is sawn through with a crack, and the
-// logs joined to it above and beside it fall with it.
+// A saw facing sideways saws the log in front of it (with a crack); the logs joined to it above and beside
+// it fall with it. A saw facing up is a piece of a belt line and cuts what passes over it.
 
 fn is_log(name: &str) -> bool {
     name.ends_with("_log")
@@ -2443,42 +3662,6 @@ fn crack_clear(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
     }
     put_int(nbt, "bp", 0);
     put_int(nbt, "bt", 0);
-}
-
-fn saw_belt(game: &mut Game<'_>, target: [i32; 3]) {
-    let Some(items) = belt_items_at(game, target) else { return };
-    let mut next = items.clone();
-    let mut changed = false;
-    for b in next.iter_mut() {
-        if let Some(rec) = recipe_for(game, "create:cutting", &b.item) {
-            if let Some(o) = rec.outs.first() {
-                b.item = o.0.clone();
-                b.count = b.count.saturating_mul(o.1);
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        let _ = game.native_with_mod_block_entity(target, move |e| belt_store(&mut e.nbt, &next));
-        game.native_block_entity_sync(target);
-    }
-}
-
-fn saw_ground(game: &mut Game<'_>, target: [i32; 3]) {
-    let dim = game.dim.id().to_string();
-    let (x, y, z) = (f64::from(target[0]), f64::from(target[1]), f64::from(target[2]));
-    let found = game.native_item_entities(&dim, [x, y, z], [x + 1.0, y + 1.0, z + 1.0]);
-    for e in found {
-        let name = e.stack.item.to_string();
-        let Some(rec) = recipe_for(game, "create:cutting", &name) else { continue };
-        let Some(o) = rec.outs.first() else { continue };
-        let count = e.stack.count.saturating_mul(o.1).min(99);
-        let mut gone = e.stack.clone();
-        gone.count = 0;
-        if game.native_set_item_entity(&dim, e.id, gone) {
-            game.spawn_item(stack_of(&o.0, count), e.position, [0.0, 0.1, 0.0], 10);
-        }
-    }
 }
 
 fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32; 3], speed: f32) {
@@ -2511,6 +3694,10 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
     let id = drill_id(pos);
     if progress < 10 {
         game.destroy_block_progress(id, target, progress.clamp(1, 10) - 1);
+        if (game.ticks as i64 + i64::from(pos[0])).rem_euclid(2) == 0 {
+            let at = [f64::from(target[0]) + 0.5, f64::from(target[1]) + 0.5, f64::from(target[2]) + 0.5];
+            puff(game, at, Some(&name), 4);
+        }
         return;
     }
     put_int(nbt, "bp", 0);
@@ -2557,40 +3744,148 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
     }
 }
 
+fn puff(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
+    let options = match item {
+        Some(i) => game.item_particle(&stack_of(i, 1)),
+        None => horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke),
+    };
+    game.particles.send_particles(&options, at, [0.15, 0.0, 0.15], 0.05, count);
+}
+
+// Puts a stack on a belt piece (a free spot), on a free depot, or out into the air; false when it is full.
+fn saw_eject(game: &mut Game<'_>, pos: [i32; 3], m: [i32; 3], item: &str, count: u32) -> bool {
+    let target = add3(pos, m);
+    if let Some(items) = belt_items_at(game, target) {
+        let Some(spot) = belt_free_spot(&items) else { return false };
+        let mut next = items;
+        next.push(BeltItem { item: item.to_string(), count, p: spot });
+        let _ = game.native_with_mod_block_entity(target, move |e| belt_store(&mut e.nbt, &next));
+        game.native_block_entity_sync(target);
+        return true;
+    }
+    match depot_at(game, target) {
+        Some(None) => {
+            depot_set(game, target, Some((item.to_string(), count)));
+            return true;
+        }
+        Some(Some(_)) => return false,
+        None => {}
+    }
+    let at = [
+        f64::from(pos[0]) + 0.5 + f64::from(m[0]) * 0.7,
+        f64::from(pos[1]) + 1.0,
+        f64::from(pos[2]) + 0.5 + f64::from(m[2]) * 0.7,
+    ];
+    game.spawn_item(stack_of(item, count), at, [f64::from(m[0]) * 0.12, 0.1, f64::from(m[2]) * 0.12], 10);
+    true
+}
+
+// A belt hands an item to a saw that faces up and is empty.
+fn saw_accept(game: &mut Game<'_>, p: [i32; 3], item: &BeltItem) -> bool {
+    let name = item.item.clone();
+    let count = item.count;
+    let ok = game
+        .native_with_mod_block_entity(p, move |e| {
+            if !pair_list(&e.nbt, "si").is_empty() || !pair_list(&e.nbt, "so").is_empty() {
+                return false;
+            }
+            pair_store(&mut e.nbt, "si", &[(name, count)]);
+            put_int(&mut e.nbt, "st", -1);
+            true
+        })
+        .unwrap_or(false);
+    if ok {
+        game.native_block_entity_sync(p);
+    }
+    ok
+}
+
+// A saw facing up works as in Create: it is a piece of a belt line. Items lying on it or handed over by a
+// belt are cut while the saw turns and leave the other side (the way the saw turns decides which side).
+fn saw_top(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
+    let mut changed = false;
+    let mut input = pair_list(nbt, "si");
+    let mut outs = pair_list(nbt, "so");
+    let phase = (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(4);
+    if input.is_empty() && outs.is_empty() && phase == 0 {
+        let dim = game.dim.id().to_string();
+        let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+        let found = game.native_item_entities(&dim, [x, y + 0.9, z], [x + 1.0, y + 1.8, z + 1.0]);
+        if let Some(e) = found.into_iter().next() {
+            let mut gone = e.stack.clone();
+            gone.count = 0;
+            if game.native_set_item_entity(&dim, e.id, gone) {
+                input = vec![(e.stack.item.to_string(), e.stack.count)];
+                put_int(nbt, "st", -1);
+                changed = true;
+            }
+        }
+    }
+    let off = if speed < 0.0 { -1 } else { 1 };
+    let mdir = if me.first { [0, 0, -off] } else { [off, 0, 0] };
+    if speed.abs() >= 1.0 {
+        if let Some((item, count)) = outs.first().cloned() {
+            let chunk = count.min(64);
+            if saw_eject(game, pos, mdir, &item, chunk) {
+                if count > chunk {
+                    outs[0].1 = count - chunk;
+                } else {
+                    outs.remove(0);
+                }
+                changed = true;
+            }
+        }
+    }
+    let mut timer = get_int(nbt, "st", -1);
+    if outs.is_empty() && speed.abs() >= 1.0 {
+        if let Some((item, count)) = input.first().cloned() {
+            let rec = recipe_for(game, "create:cutting", &item);
+            if timer < 0 {
+                timer = rec.as_ref().map(|r| r.time).unwrap_or(10);
+                put_int(nbt, "sm", timer.max(1));
+            }
+            timer -= ((speed.abs() / 16.0) as i32).clamp(1, 512);
+            if phase % 2 == 0 {
+                let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.05, f64::from(pos[2]) + 0.5];
+                puff(game, at, Some(&item), 3);
+                let total = get_int(nbt, "sm", 1).max(1);
+                put_int(nbt, "sp", (100 * (total - timer.max(0)) / total).clamp(0, 100));
+                changed = true;
+            }
+            if timer <= 0 {
+                outs = match &rec {
+                    Some(r) => roll_outputs(game, pos, r, count),
+                    None => vec![(item, count)],
+                };
+                input.clear();
+                timer = -1;
+                put_int(nbt, "sp", 0);
+                changed = true;
+            }
+        } else {
+            timer = -1;
+        }
+    }
+    put_int(nbt, "st", timer);
+    if changed {
+        pair_store(nbt, "si", &input);
+        pair_store(nbt, "so", &outs);
+    }
+    changed
+}
+
 fn saw_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
     if !server_side(game) {
         return false;
     }
-    if speed.abs() < 1.0 {
+    if me.front[1] > 0 {
+        return saw_top(game, pos, nbt, me, speed);
+    }
+    if me.front[1] < 0 || speed.abs() < 1.0 {
         crack_clear(game, pos, nbt);
         return false;
     }
     let target = [pos[0] + me.front[0], pos[1] + me.front[1], pos[2] + me.front[2]];
-    let blk = game.native_block(target);
-    let due = ((game.ticks as i64) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0;
-    if blk == "create:belt" {
-        if due {
-            saw_belt(game, target);
-        }
-        crack_clear(game, pos, nbt);
-        return false;
-    }
-    if blk == DEPOT_BLOCK {
-        if due {
-            if let Some(Some((item, count))) = depot_at(game, target) {
-                if let Some(rec) = recipe_for(game, "create:cutting", &item) {
-                    if let Some(o) = rec.outs.first() {
-                        depot_set(game, target, Some((o.0.clone(), count.saturating_mul(o.1).min(99))));
-                    }
-                }
-            }
-        }
-        crack_clear(game, pos, nbt);
-        return false;
-    }
-    if due {
-        saw_ground(game, target);
-    }
     saw_tree(game, pos, nbt, target, speed);
     false
 }
@@ -2633,14 +3928,9 @@ fn triple_store(n: &mut Compound, key: &str, list: &[(String, u32, f32)]) {
     n.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
 }
 
-fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
-    if !server_side(game) {
-        return false;
-    }
-    let mut queue = triple_list(nbt, "cq");
-    let mut changed = false;
-    // the partner two blocks away across the gap (horizontal only)
-    let mut gap: Option<([i32; 3], usize)> = None;
+// The wheel two blocks away across a gap (horizontal only): the gap block, the gap axis and the speed of the
+// other wheel. Only the wheel with the smaller coordinate looks forward; info looks both ways.
+fn crusher_gap(game: &mut Game<'_>, pos: [i32; 3], me: &Node) -> Option<([i32; 3], usize, f32)> {
     for a in [0usize, 2usize] {
         if a == me.axis {
             continue;
@@ -2655,9 +3945,62 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
             continue;
         }
         let Some(r) = read_neighbour(game, p) else { continue };
-        if r.speed * speed < 0.0 {
-            let mut g = pos;
-            g[a] += 1;
+        let mut g = pos;
+        g[a] += 1;
+        return Some((g, a, r.speed));
+    }
+    None
+}
+
+// What a click on a crushing wheel says about its pair.
+fn crusher_info(game: &mut Game<'_>, pos: [i32; 3]) {
+    let Some(me) = node_at(game, pos) else { return };
+    let mine = game.native_with_mod_block_entity(pos, |e| get_f32(&e.nbt, "speed")).unwrap_or(0.0);
+    let mut seen: Option<f32> = None;
+    for a in [0usize, 2usize] {
+        if a == me.axis {
+            continue;
+        }
+        for sgn in [-2, 2] {
+            let mut p = pos;
+            p[a] += sgn;
+            if game.native_block(p) != "create:crushing_wheel" {
+                continue;
+            }
+            let Some(nb) = node_at(game, p) else { continue };
+            if nb.axis != me.axis {
+                continue;
+            }
+            if let Some(r) = read_neighbour(game, p) {
+                seen = Some(r.speed);
+            }
+        }
+    }
+    let text = match seen {
+        None => "no wheel two blocks away on the same axis",
+        Some(other) => {
+            if other * mine < 0.0 {
+                "pair ready: drop items into the gap"
+            } else {
+                "the wheels turn the same way: reverse one of them"
+            }
+        }
+    };
+    let s = sect();
+    let line = s.clone() + "7Crushing Wheel: " + &s + "f" + text;
+    game.native_chat(&line);
+}
+
+fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
+    if !server_side(game) {
+        return false;
+    }
+    let mut queue = triple_list(nbt, "cq");
+    let mut changed = false;
+    let found_gap = crusher_gap(game, pos, me);
+    let mut gap: Option<([i32; 3], usize)> = None;
+    if let Some((g, a, other)) = found_gap {
+        if other * speed < 0.0 {
             gap = Some((g, a));
         }
     }
@@ -2679,8 +4022,9 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
                 let mut gone = e.stack.clone();
                 gone.count = 0;
                 if game.native_set_item_entity(&dim, e.id, gone) {
-                    queue.push((name, e.stack.count, rec.time as f32));
+                    queue.push((name.clone(), e.stack.count, rec.time as f32));
                     changed = true;
+                    puff(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.8, f64::from(g[2]) + 0.5], Some(&name), 6);
                 }
             }
         }
@@ -2695,6 +4039,7 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
             if let Some(rec) = recipe_for(game, "create:crushing", &item) {
                 let outs = roll_outputs(game, g, &rec, count);
                 let at = [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.2, f64::from(g[2]) + 0.5];
+                puff(game, at, Some(&item), 8);
                 for o in outs {
                     game.spawn_item(stack_of(&o.0, o.1.min(99)), at, [0.0, -0.1, 0.0], 10);
                 }
@@ -2992,6 +4337,14 @@ pub fn block_entity(block: &str, entity: &mut Option<(String, Compound)>) {
         *entity = Some((FLUID_BE.to_string(), Compound::new()));
         return;
     }
+    if entity.is_none() && block == BASIN_BLOCK {
+        *entity = Some((BASIN_BE.to_string(), Compound::new()));
+        return;
+    }
+    if entity.is_none() && funnel_brass(block).is_some() {
+        *entity = Some((FUNNEL_BE.to_string(), Compound::new()));
+        return;
+    }
     if entity.is_none() && kind_of(block).is_some() {
         let mut c = Compound::new();
         set_state(&mut c, 0.0, NONE_HOPS, None);
@@ -3000,7 +4353,7 @@ pub fn block_entity(block: &str, entity: &mut Option<(String, Compound)>) {
 }
 
 pub fn ticks(block: &str, ticks: &mut bool) {
-    if kind_of(block).is_some() || is_fluid_block(block) {
+    if kind_of(block).is_some() || is_fluid_block(block) || block == BASIN_BLOCK || funnel_brass(block).is_some() {
         *ticks = true;
     }
 }
@@ -3008,6 +4361,16 @@ pub fn ticks(block: &str, ticks: &mut bool) {
 pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if entity.id == FLUID_BE {
         fluid_tick(game, pos, entity);
+        return;
+    }
+    if entity.id == BASIN_BE {
+        if basin_tick(game, pos, &mut entity.nbt) {
+            game.native_block_entity_sync(pos);
+        }
+        return;
+    }
+    if entity.id == FUNNEL_BE {
+        let _ = funnel_tick(game, pos, &mut entity.nbt);
         return;
     }
     if entity.id != BE_ID {
@@ -3081,6 +4444,9 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if me.kind == Kind::Press && press_tick(game, pos, &mut entity.nbt, out.speed) {
         game.native_block_entity_sync(pos);
     }
+    if me.kind == Kind::Mixer && mixer_tick(game, pos, &mut entity.nbt, out.speed) {
+        game.native_block_entity_sync(pos);
+    }
     if me.kind == Kind::Millstone && mill_tick(game, pos, &mut entity.nbt, out.speed) {
         game.native_block_entity_sync(pos);
     }
@@ -3095,6 +4461,9 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     }
     if me.kind == Kind::Pump {
         pump_step(game, pos, &mut entity.nbt, &me, out.speed);
+    }
+    if me.kind == Kind::Hose && hose_tick(game, pos, &mut entity.nbt, out.speed) {
+        game.native_block_entity_sync(pos);
     }
     if me.kind == Kind::Valve {
         valve_tick(game, pos, &mut entity.nbt, out.speed);
@@ -3130,7 +4499,24 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
 pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
     if entity.id == DEPOT_BE {
         let mut c = Compound::new();
-        depot_put(&mut c, depot_content(&entity.nbt));
+        match depot_content(&entity.nbt) {
+            Some(content) => depot_put(&mut c, Some(content)),
+            None => {
+                // an explicit empty, so a client that merges the tag drops the old item
+                c.insert(JavaString::from("item"), Tag::String(JavaString::from("")));
+                put_int(&mut c, "count", 0);
+            }
+        }
+        *tag = Some(c);
+        return;
+    }
+    if entity.id == BASIN_BE {
+        let mut c = Compound::new();
+        for key in ["in", "out"] {
+            let text = get_text(&entity.nbt, key);
+            c.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
+        }
+        put_int(&mut c, "mix", get_int(&entity.nbt, "mix", 0));
         *tag = Some(c);
         return;
     }
@@ -3139,6 +4525,9 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let fl = get_text(&entity.nbt, "fl");
         c.insert(JavaString::from("fl"), Tag::String(JavaString::from(fl.as_str())));
         put_int(&mut c, "fa", get_int(&entity.nbt, "fa", 0));
+        let ff = get_text(&entity.nbt, "ff");
+        c.insert(JavaString::from("ff"), Tag::String(JavaString::from(ff.as_str())));
+        put_int(&mut c, "fd", get_int(&entity.nbt, "fd", 0));
         *tag = Some(c);
         return;
     }
@@ -3146,8 +4535,17 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let mut c = Compound::new();
         put_f32(&mut c, "speed", get_f32(&entity.nbt, "speed"));
         put_f32(&mut c, "pp", get_f32(&entity.nbt, "pp"));
+        put_f32(&mut c, "mp", get_f32(&entity.nbt, "mp"));
+        put_f32(&mut c, "hl", get_f32(&entity.nbt, "hl"));
         let bi = get_text(&entity.nbt, "bi");
         c.insert(JavaString::from("bi"), Tag::String(JavaString::from(bi.as_str())));
+        put_int(&mut c, "sp", get_int(&entity.nbt, "sp", 0));
+        for key in ["ci", "si"] {
+            let text = get_text(&entity.nbt, key);
+            if !text.is_empty() {
+                c.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
+            }
+        }
         *tag = Some(c);
     }
 }
@@ -3222,7 +4620,7 @@ fn belt_put(game: &mut Game<'_>, pos: [i32; 3]) {
         .native_with_mod_block_entity(pos, move |e| {
             let mut v = belt_items(&e.nbt);
             let Some(p) = belt_free_spot(&v) else { return false };
-            v.push(BeltItem { item, count, p });
+            v.push(BeltItem { item, count, p, moving: false });
             belt_store(&mut e.nbt, &v);
             true
         })
@@ -3276,6 +4674,8 @@ pub fn destroyed(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
         spill_lists(game, pos, &["mi", "mo"]);
     } else if name == "create:mechanical_crafter" {
         spill_lists(game, pos, &["ci"]);
+    } else if name == BASIN_BLOCK {
+        basin_spill(game, pos);
     } else if name == "create:belt" {
         belt_spill(game, pos);
         belt_dismantle(game, pos, Some(pos));
@@ -3301,13 +4701,20 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         }
         return;
     }
-    if name == TANK || name == SPOUT {
+    if name == TANK || name == SPOUT || name == DRAIN {
+        let bucket = held_item.as_deref().map(|h| h == "minecraft:bucket" || bucket_fluid(h).is_some()).unwrap_or(false);
+        if bucket {
+            // Every click event of a tap is cancelled, so the bucket never places water beside the block.
+            *canceled = true;
+        }
         if fresh_click(game, pos) {
             if bucket_click(game, pos) {
                 *canceled = true;
                 return;
             }
-            fluid_info(game, pos, &name);
+            if !bucket {
+                fluid_info(game, pos, &name);
+            }
         }
         return;
     }
@@ -3334,6 +4741,23 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         *canceled = true;
         return;
     }
+    if name == BASIN_BLOCK {
+        if fresh_click(game, pos) {
+            basin_click(game, pos);
+        }
+        *canceled = true;
+        return;
+    }
+    if funnel_brass(&name).is_some() && held_item.is_none() {
+        // an empty hand turns the funnel between pulling in and taking out
+        if fresh_click(game, pos) {
+            let now = game.native_block_property(pos, "extracting").map(|v| v == "true").unwrap_or(false);
+            game.native_set_block_property(pos, "extracting", if now { "false" } else { "true" });
+            sfx(game, "minecraft:block.iron_trapdoor.open", pos, 0.4, 1.4);
+        }
+        *canceled = true;
+        return;
+    }
     if name == "create:belt" && held_item.is_some() {
         if fresh_click(game, pos) {
             belt_put(game, pos);
@@ -3348,6 +4772,9 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         }
     }
     let Some(me) = node_at(game, pos) else { return };
+    if me.kind == Kind::Pump && held_item.is_none() && fresh_click(game, pos) {
+        pump_info(game, pos, &me);
+    }
     if me.kind == Kind::Handle {
         let now = game.ticks as i32;
         let until = now.wrapping_add(CRANK_TICKS);
@@ -3392,6 +4819,9 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
             + " SU";
         game.native_chat(&line);
     }
+    if me.kind == Kind::Crusher {
+        crusher_info(game, pos);
+    }
     if me.kind == Kind::Pump {
         let held = game.native_with_mod_block_entity(pos, |e| (get_text(&e.nbt, "fl"), get_int(&e.nbt, "fa", 0)));
         if let Some((fl, amt)) = held {
@@ -3400,6 +4830,12 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
             let line = s.clone() + "7Pump holds: " + &s + "f" + what + " " + &amt.to_string() + &s + "7 mB";
             game.native_chat(&line);
         }
+    }
+    if me.kind == Kind::Hose {
+        let l = game.native_with_mod_block_entity(pos, |e| get_f32(&e.nbt, "hl")).unwrap_or(0.0);
+        let s = sect();
+        let line = s.clone() + "7Hose length: " + &s + "f" + &((l * 10.0).round() / 10.0).to_string() + &s + "7 blocks (turn one way to lower, the other to raise)";
+        game.native_chat(&line);
     }
     if me.kind == Kind::Valve {
         let open = game.native_block_property(pos, "enabled").map(|v| v == "true").unwrap_or(false);
@@ -3423,22 +4859,80 @@ pub fn submit(
     entity: &ModBlockEntity,
     draw: &mut BlockEntityDraw,
 ) {
+    if block == "create:creative_motor" {
+        draw.light = open_light(game, pos);
+    }
+    if block == BASIN_BLOCK {
+        basin_submit(game, pos, entity, draw);
+        return;
+    }
+    if block == "create:mechanical_mixer" {
+        mixer_submit(game, pos, state, entity, draw);
+        return;
+    }
     if block == DEPOT_BLOCK {
         if let Some((item, count)) = depot_content(&entity.nbt) {
             let stack = ItemStack { item: Arc::from(item.as_str()), count, damage: 0, extra: None };
             let is_block = game.pack.assets.registry.default_state(&item).is_some();
             draw.push();
             if is_block {
-                draw.translate([0.5, 0.9, 0.5]);
+                draw.translate([0.5, 0.95, 0.5]);
             } else {
                 // A flat item lies on the depot as in Create.
-                draw.translate([0.5, 0.77, 0.5]);
+                draw.translate([0.5, 0.84, 0.5]);
                 draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
             }
             game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
             draw.pop();
         }
-        draw.keep();
+        return;
+    }
+    if block == GLASS {
+        let fl = get_text(&entity.nbt, "ff");
+        let Some(a) = game.native_block_state_property(state, "axis") else { return };
+        let Some(axis) = parse_axis(&a.to_string()) else { return };
+        if fl.is_empty() {
+            draw.keep();
+            return;
+        }
+        let dir = DIRS[(get_int(&entity.nbt, "fd", 0).clamp(0, 5)) as usize];
+        let t = draw.game_time as f64 + f64::from(draw.partial);
+        let mut frame = ((t * 0.8) as i64).rem_euclid(8);
+        if dir[axis] < 0 {
+            frame = 7 - frame;
+        }
+        let frame = frame.to_string();
+        game.native_draw_block(draw, "create:pipe_flow_part", &[("axis", axis_char(axis)), ("fluid", fl.as_str()), ("frame", frame.as_str())]);
+        return;
+    }
+    if block == HOSE {
+        let Some(f) = game.native_block_state_property(state, "facing") else { return };
+        let f = f.to_string();
+        let Some(front) = parse_dir(&f) else { return };
+        let speed = f64::from(get_f32(&entity.nbt, "speed"));
+        let l = get_f32(&entity.nbt, "hl") + ((speed / 500.0) as f32) * draw.partial;
+        let l = l.clamp(0.0, HOSE_MAX);
+        let axis = axis_of(cw(front));
+        let mut about = [0.0f32; 3];
+        about[axis] = 1.0;
+        draw.push();
+        draw.rotate_about(about, (speed * 0.3 * (draw.game_time as f64 + f64::from(draw.partial))) as f32 % 360.0, [0.5, 0.5, 0.5]);
+        game.native_draw_block(draw, "create:hose_coil_part", &[("facing", f.as_str())]);
+        draw.pop();
+        let rope = (l - 1.0).ceil().max(0.0) as i32;
+        for k in 0..rope {
+            draw.push();
+            draw.translate([0.0, -((k + 1) as f32), 0.0]);
+            game.native_draw_block(draw, "create:hose_rope_part", &[]);
+            draw.pop();
+        }
+        draw.push();
+        draw.translate([0.0, -l, 0.0]);
+        game.native_draw_block(draw, "create:hose_magnet_part", &[]);
+        draw.pop();
+        if speed == 0.0 {
+            draw.keep();
+        }
         return;
     }
     if block == TANK {
@@ -3446,7 +4940,14 @@ pub fn submit(
         let amt = get_int(&entity.nbt, "fa", 0);
         if amt > 0 && !fl.is_empty() {
             let level = ((amt * 8 + TANK_CAP - 1) / TANK_CAP).clamp(1, 8).to_string();
-            game.native_draw_block(draw, "create:fluid_level_part", &[("fluid", fl.as_str()), ("level", level.as_str())]);
+            let mut ext = 0;
+            for (bit, d) in [[-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]].iter().enumerate() {
+                if game.native_block(add3(pos, *d)) == TANK {
+                    ext |= 1 << bit;
+                }
+            }
+            let ext = ext.to_string();
+            game.native_draw_block(draw, "create:fluid_level_part", &[("ext", ext.as_str()), ("fluid", fl.as_str()), ("level", level.as_str())]);
         }
         draw.keep();
         return;
@@ -3469,9 +4970,10 @@ pub fn submit(
         let part = game.native_block_state_property(state, "part").map(|v| v.to_string()).unwrap_or_default();
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         if part == "start" || part == "middle" || part == "end" {
-            // The belt surface is one of eight pictures, each shifted a little further along the belt.
+            // The belt surface is one of sixteen pictures, each shifted a pixel further along the belt.
             let t = draw.game_time as f64 + f64::from(draw.partial);
-            let frame = ((-t * speed / 60.0).floor() as i64).rem_euclid(8).to_string();
+            let flip = f64::from(belt_flip(front));
+            let frame = ((-flip * t * speed / 30.0).floor() as i64).rem_euclid(16).to_string();
             game.native_draw_block(
                 draw,
                 "create:belt_part",
@@ -3483,9 +4985,15 @@ pub fn submit(
             through_shaft(game, pos, if a == 0 { 2 } else { 0 }, speed, draw);
         }
         // the items riding this piece, moving on between ticks
-        let step = ((speed / 480.0) as f32) * draw.partial;
-        for b in belt_items(&entity.nbt) {
-            let p = (b.p + step).clamp(0.0, 1.0);
+        let now = draw.game_time as f64 + f64::from(draw.partial);
+        let (shown, seen) = belt_view(pos, &entity.nbt, now);
+        let elapsed = (now - seen).clamp(0.0, 30.0);
+        for b in shown {
+            let mut pf = f64::from(b.p);
+            if b.moving {
+                pf += speed / 480.0 * f64::from(belt_flip(front)) * elapsed;
+            }
+            let p = pf.clamp(0.0, 1.0) as f32;
             let line = axis_of(front);
             let mut at = [0.5, BELT_TOP, 0.5];
             at[line] = if front[line] > 0 { p } else { 1.0 - p };
@@ -3508,7 +5016,7 @@ pub fn submit(
         let Some(value) = game.native_block_state_property(state, "axis") else { return };
         let Some(axis) = parse_axis(&value.to_string()) else { return };
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
-        through_shaft(game, pos, axis, speed, draw);
+        chain_shaft(game, axis, speed, draw);
         if speed == 0.0 {
             draw.keep();
         }
@@ -3554,6 +5062,24 @@ pub fn submit(
         draw.rotate_about(about, spin_degrees(pos, axis, speed, draw), [0.5, 0.5, 0.5]);
         game.native_draw_block(draw, "create:cogwheel_shaftless_part", &[("axis", axis_char(axis))]);
         draw.pop();
+        let facing_text = value.to_string();
+        let pointing = game.native_block_state_property(state, "pointing").unwrap_or("up").to_string();
+        game.native_draw_block(
+            draw,
+            "create:crafter_arrow_part",
+            &[("facing", facing_text.as_str()), ("pointing", pointing.as_str())],
+        );
+        if let Some((item, count)) = pair_list(&entity.nbt, "ci").first() {
+            let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
+            draw.push();
+            draw.translate([0.5 + front[0] as f32 * 0.6, 0.5, 0.5 + front[2] as f32 * 0.6]);
+            if front[0] != 0 {
+                draw.rotate_about([0.0, 1.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            }
+            draw.scale([0.6, 0.6, 0.6]);
+            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
+            draw.pop();
+        }
         if speed == 0.0 {
             draw.keep();
         }
@@ -3569,6 +5095,22 @@ pub fn submit(
         node.first = first;
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         through_shaft(game, pos, node.saw_axis(), speed, draw);
+        if let Some((item, count)) = pair_list(&entity.nbt, "si").first() {
+            let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
+            let is_block = game.pack.assets.registry.default_state(item).is_some();
+            let along = (get_int(&entity.nbt, "sp", 0) as f32 / 100.0 - 0.5) * 0.9;
+            let sign = if speed < 0.0 { -1.0f32 } else { 1.0f32 };
+            let (dx, dz) = if first { (0.0f32, -sign) } else { (sign, 0.0f32) };
+            draw.push();
+            if is_block {
+                draw.translate([0.5 + dx * along, 1.15, 0.5 + dz * along]);
+            } else {
+                draw.translate([0.5 + dx * along, 1.02, 0.5 + dz * along]);
+                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            }
+            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
+            draw.pop();
+        }
         let mode = if speed > 0.5 {
             "active"
         } else if speed < -0.5 {
@@ -3626,7 +5168,7 @@ pub fn submit(
     draw.push();
     if anim == 1 {
         let phase = f64::from(get_f32(&entity.nbt, "pp"));
-        let dy = -0.45 * (1.0 - phase.to_radians().cos());
+        let dy = -0.6 * (1.0 - phase.to_radians().cos());
         draw.translate([0.0, dy as f32, 0.0]);
     } else {
         let mut about = [0.0f32; 3];
@@ -3671,6 +5213,18 @@ fn through_shaft(game: &Game<'_>, pos: [i32; 3], axis: usize, speed: f64, draw: 
     about[axis] = 1.0;
     draw.push();
     draw.rotate_about(about, spin_degrees(pos, axis, speed, draw), [0.5, 0.5, 0.5]);
+    game.native_draw_block(draw, "create:shaft_part", &[("axis", axis_char(axis))]);
+    draw.pop();
+}
+
+// The shaft of a chain drive: it turns without the half step the cogs need, so the shafts of linked
+// drives stay lined up with each other as in Create.
+fn chain_shaft(game: &Game<'_>, axis: usize, speed: f64, draw: &mut BlockEntityDraw) {
+    let mut about = [0.0f32; 3];
+    about[axis] = 1.0;
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    draw.push();
+    draw.rotate_about(about, ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:shaft_part", &[("axis", axis_char(axis))]);
     draw.pop();
 }
@@ -3767,6 +5321,10 @@ fn node_from_state(level: &GameLevel<'_>, state: BlockStateId) -> Option<Node> {
     if kind == Kind::Millstone {
         return Some(Node::new(kind, 1, [0; 3]));
     }
+    if kind == Kind::Hose {
+        let front = parse_dir(props.get("facing")?)?;
+        return Some(Node::new(kind, axis_of(cw(front)), front));
+    }
     if kind == Kind::Valve {
         let front = parse_dir(props.get("facing")?)?;
         let first = props.get("axis_along_first").map(|v| v == "true").unwrap_or(false);
@@ -3793,23 +5351,30 @@ fn node_from_state(level: &GameLevel<'_>, state: BlockStateId) -> Option<Node> {
 }
 
 // A new chain drive turns its chain towards a chain drive beside it that has the same axis.
-fn chain_first_for(level: &GameLevel<'_>, at: BlockPos, axis: usize) -> bool {
-    for a in 0..3 {
-        if a == axis {
-            continue;
-        }
-        for sgn in [-1, 1] {
-            let mut d = [0; 3];
-            d[a] = sgn;
-            let nb = BlockPos::new(at.x + d[0], at.y + d[1], at.z + d[2]);
-            if let Some(n) = node_from_state(level, level.block_state(nb)) {
-                if n.is_chain() && n.axis == axis && n.chain_axis() == a {
-                    return n.first;
+// Which way the chain line of a new chain drive runs: along a neighbouring chain drive that already runs
+// that way, else along one that can be turned (its shaft not along the line), else the way the player
+// looks if that is across the shaft. The neighbour may face any way.
+fn chain_first_for(level: &GameLevel<'_>, at: BlockPos, axis: usize, look_axis: usize) -> bool {
+    let mut lines: Vec<usize> = (0..3).filter(|a| *a != axis).collect();
+    if lines.len() == 2 && lines[1] == look_axis {
+        lines.reverse();
+    }
+    for pass in 0..2 {
+        for a in lines.iter() {
+            for sgn in [-1, 1] {
+                let mut d = [0; 3];
+                d[*a] = sgn;
+                let nb = BlockPos::new(at.x + d[0], at.y + d[1], at.z + d[2]);
+                if let Some(n) = node_from_state(level, level.block_state(nb)) {
+                    let fits = if pass == 0 { n.is_chain() && n.chain_axis() == *a } else { n.is_chain() && n.axis != *a };
+                    if fits {
+                        return chain_first_towards(axis, *a);
+                    }
                 }
             }
         }
     }
-    false
+    chain_first_towards(axis, lines.first().copied().unwrap_or(0))
 }
 
 // As Create does: a block lines up with neighbours whose shaft end faces it (a facing block
@@ -3823,8 +5388,24 @@ pub fn placement(
     answer: &mut Option<Option<BlockStateId>>,
 ) {
     let name = level.facts.get(state).name.to_string();
-    if name == PIPE || name == TANK {
+    if name == PIPE || name == TANK || name == GLASS {
         fluid_placement(level, state, context, &name, answer);
+        return;
+    }
+    if funnel_brass(&name).is_some() {
+        // A funnel faces away from the block it is put on; on a basin, depot or belt it starts out
+        // extracting (taking things out of it), anywhere else pulling in.
+        let normal = context.face.normal();
+        let facing = dir_name(normal);
+        let back = BlockPos::new(context.pos.x - normal[0], context.pos.y - normal[1], context.pos.z - normal[2]);
+        let back_name = level.facts.get(level.block_state(back)).name.to_string();
+        let extracting = back_name == BASIN_BLOCK || back_name == DEPOT_BLOCK || back_name == "create:belt";
+        if let Some(s1) = level.native_state_with_property(state, "facing", facing) {
+            let s2 = if extracting { level.native_state_with_property(s1, "extracting", "true") } else { Some(s1) };
+            if let Some(s) = s2 {
+                *answer = Some(Some(s));
+            }
+        }
         return;
     }
     let Some(kind) = kind_of(&name) else { return };
@@ -3865,6 +5446,17 @@ pub fn placement(
     } else if kind == Kind::Valve {
         // The pipe runs along the axis you look along; the shaft goes across it, towards a shaft beside the valve.
         let mut pipe = axis_of(look);
+        if feeding.is_empty() && !context.sneaking {
+            for a in 0..3 {
+                for s in [-1, 1] {
+                    let nb = BlockPos::new(at.x + if a == 0 { s } else { 0 }, at.y + if a == 1 { s } else { 0 }, at.z + if a == 2 { s } else { 0 });
+                    let nn = level.facts.get(level.block_state(nb)).name.to_string();
+                    if matches!(nn.as_str(), PIPE | TANK | GLASS | SPOUT | DRAIN | PUMP | VALVE) && a == axis_of(look) {
+                        pipe = a;
+                    }
+                }
+            }
+        }
         let turn: Option<usize> = feeding.first().map(|d| axis_of(*d));
         if let Some(r) = turn {
             if pipe == r {
@@ -3920,13 +5512,23 @@ pub fn placement(
         }
         let with_facing = level.native_state_with_property(state, "facing", dir_name(facing));
         with_facing.and_then(|s| level.native_state_with_property(s, "pointing", pointing))
+    } else if kind == Kind::Hose {
+        // Horizontal; its shaft side (clockwise of the facing) turns towards a shaft end beside it.
+        let mut f = [look[0], 0, look[2]];
+        if f == [0, 0, 0] {
+            f = [0, 0, 1];
+        }
+        if let Some(d) = feeding.iter().find(|d| d[1] == 0) {
+            f = [d[2], 0, -d[0]];
+        }
+        level.native_state_with_property(state, "facing", dir_name(f))
     } else if kind.uses_facing() {
         // Directions where the neighbour can take a shaft end.
         let mut facing = match kind {
             Kind::Motor => neg(look),
             Kind::Crank | Kind::Handle => neg(look),
             Kind::Drill => look,
-            Kind::Press => {
+            Kind::Press | Kind::Mixer => {
                 let mut h = look;
                 if h[1] != 0 {
                     h = [0, 0, 1];
@@ -3979,7 +5581,7 @@ pub fn placement(
         let mut st = level.native_state_with_property(state, "axis", axis_char(axis));
         if matches!(kind, Kind::Chain | Kind::AdjChain) {
             if let Some(s1) = st {
-                let first = chain_first_for(level, at, axis);
+                let first = chain_first_for(level, at, axis, axis_of(look));
                 if let Some(s2) = level.native_state_with_property(s1, "axis_along_first", if first { "true" } else { "false" }) {
                     st = Some(s2);
                 }
@@ -4010,22 +5612,28 @@ struct Btn {
 }
 
 const SLIDER_X: f32 = 46.0;
-const SLIDER_Y: f32 = 30.0;
+const SLIDER_Y: f32 = 24.0;
 const SLIDER_W: f32 = 196.0;
-const SLIDER_H: f32 = 30.0;
+const SLIDER_H: f32 = 48.0;
 
 const BUTTONS: [Btn; 2] = [
-    Btn { id: 20, label: "CW", x: 12.0, y: 30.0, w: 24.0, h: 14.0 },
-    Btn { id: 21, label: "CCW", x: 12.0, y: 46.0, w: 24.0, h: 14.0 },
+    Btn { id: 20, label: "CW", x: 12.0, y: 38.0, w: 24.0, h: 14.0 },
+    Btn { id: 21, label: "CCW", x: 12.0, y: 54.0, w: 24.0, h: 14.0 },
 ];
 
 static DRAG: AtomicBool = AtomicBool::new(false);
 static MOTOR_AT: Mutex<Option<[i32; 3]>> = Mutex::new(None);
 static COMMIT: Mutex<Option<([i32; 3], i32)>> = Mutex::new(None);
 
-// The speed under a pointer at x (GUI pixels from the screen left).
-fn rpm_at(x: f32) -> i32 {
-    ((x - SLIDER_X) / SLIDER_W * 512.0 - 256.0).round().clamp(-256.0, 256.0) as i32
+// The speed under a pointer (GUI pixels from the screen top left): the further right, the faster;
+// the upper half of the pad turns the other way (negative), the lower half turns forward.
+fn rpm_at(x: f32, y: f32) -> i32 {
+    let mag = ((x - SLIDER_X) / SLIDER_W * 256.0).round().clamp(0.0, 256.0) as i32;
+    if y < SLIDER_Y + SLIDER_H / 2.0 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 fn on_track(at: [f32; 2]) -> bool {
@@ -4035,7 +5643,8 @@ fn on_track(at: [f32; 2]) -> bool {
 // What a press at `at` (GUI pixels from the screen top left) does: a menu button id.
 fn hit(at: [f32; 2]) -> Option<i32> {
     if on_track(at) {
-        return Some(1000 + rpm_at(at[0]) + MOTOR_MAX_RPM);
+        let v = rpm_at(at[0], at[1]);
+        return Some(1000 + v.abs() * 2 + if v < 0 { 1 } else { 0 });
     }
     BUTTONS
         .iter()
@@ -4062,7 +5671,8 @@ pub fn mouse_released(screen: &NativeScreenView<'_>, button: i32) {
     }
     let at = MOTOR_AT.lock().ok().and_then(|g| *g);
     if let Some(key) = at {
-        let value = rpm_at(local(screen)[0]);
+        let l = local(screen);
+        let value = rpm_at(l[0], l[1]);
         if let Ok(mut slot) = COMMIT.lock() {
             *slot = Some((key, value));
         }
@@ -4083,10 +5693,10 @@ pub fn screen(block: &str, screen: &mut Option<NativeScreen>) {
     if block == MOTOR_BLOCK {
         *screen = Some(NativeScreen {
             width: 256.0,
-            height: 182.0,
+            height: 96.0,
             slots: vec![None],
-            inventory_y: 98.0,
-            inventory_x: 48.0,
+            inventory_y: 4000.0,
+            inventory_x: 0.0,
             own_labels: true,
         });
     }
@@ -4111,13 +5721,13 @@ pub fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut HudBa
     let cap = data.get(2).copied().unwrap_or(0);
     let cursor = game.native_cursor();
     let dragging = DRAG.load(Ordering::Relaxed);
-    let rpm = if dragging { rpm_at(cursor[0] - origin[0]) } else { setting };
+    let rpm = if dragging { rpm_at(cursor[0] - origin[0], cursor[1] - origin[1]) } else { setting };
     let (ox, oy) = (origin[0], origin[1]);
     // the dark board the controls sit on
-    game.native_fill(batch, [ox + 4.0, oy + 4.0, 248.0, 82.0], 0xFF1B100D);
-    centred(game, batch, "Generated Speed in RPM", ox + 128.0, oy + 12.0, 0xE9D3A0);
+    game.native_fill(batch, [ox + 2.0, oy + 2.0, 252.0, 92.0], 0xFF1B100D);
+    centred(game, batch, "Generated Speed in RPM", ox + 128.0, oy + 10.0, 0xE9D3A0);
     // the direction buttons
-    game.native_fill(batch, [ox + 10.0, oy + 28.0, 28.0, 34.0], GOLD);
+    game.native_fill(batch, [ox + 10.0, oy + 36.0, 28.0, 34.0], GOLD);
     for b in BUTTONS.iter() {
         let on = (b.id == 20 && rpm >= 0) || (b.id == 21 && rpm < 0);
         let over = hit([cursor[0] - ox, cursor[1] - oy]) == Some(b.id);
@@ -4127,27 +5737,32 @@ pub fn screen_draw(game: &Game<'_>, block: &str, data: &[i32], batch: &mut HudBa
         let w = game.native_text_width(b.label);
         game.native_text(batch, b.label, [ox + b.x + (b.w - w) / 2.0, oy + b.y + 3.0], 0x3A2412, false);
     }
-    // the track: ticks every 32 rpm, a brighter one at zero
+    // the pad: two lanes, the upper one negative (counter clockwise), the lower one positive;
+    // ticks every 32 rpm
     game.native_fill(batch, [ox + SLIDER_X - 3.0, oy + SLIDER_Y - 3.0, SLIDER_W + 6.0, SLIDER_H + 6.0], GOLD);
     game.native_fill(batch, [ox + SLIDER_X - 1.0, oy + SLIDER_Y - 1.0, SLIDER_W + 2.0, SLIDER_H + 2.0], MAROON);
-    for i in 0..=16 {
-        let x = ox + SLIDER_X + i as f32 * SLIDER_W / 16.0;
-        let tick = if i == 8 { 0xFF8A5A3A } else { 0xFF4A2A22 };
-        game.native_fill(batch, [x - 0.5, oy + SLIDER_Y + 2.0, 1.0, 7.0], tick);
-        game.native_fill(batch, [x - 0.5, oy + SLIDER_Y + SLIDER_H - 9.0, 1.0, 7.0], tick);
+    game.native_fill(batch, [ox + SLIDER_X, oy + SLIDER_Y + SLIDER_H / 2.0 - 0.5, SLIDER_W, 1.0], 0xFF4A2A22);
+    for i in 0..=8 {
+        let x = ox + SLIDER_X + i as f32 * SLIDER_W / 8.0;
+        let tick = if i == 0 { 0xFF8A5A3A } else { 0xFF4A2A22 };
+        game.native_fill(batch, [x - 0.5, oy + SLIDER_Y + 1.0, 1.0, 4.0], tick);
+        game.native_fill(batch, [x - 0.5, oy + SLIDER_Y + SLIDER_H - 5.0, 1.0, 4.0], tick);
     }
-    // the handle with the speed on it
+    game.native_text(batch, "- (up)", [ox + SLIDER_X + 3.0, oy + SLIDER_Y + 6.0], 0x8A6A52, false);
+    game.native_text(batch, "+ (down)", [ox + SLIDER_X + 3.0, oy + SLIDER_Y + SLIDER_H - 14.0], 0x8A6A52, false);
+    // the handle with the speed on it: right = faster, up = negative
     let value = rpm.clamp(-MOTOR_MAX_RPM, MOTOR_MAX_RPM);
-    let thumb = ox + SLIDER_X + (value + MOTOR_MAX_RPM) as f32 / 512.0 * SLIDER_W;
-    game.native_fill(batch, [thumb - 19.0, oy + SLIDER_Y + 5.0, 38.0, 20.0], GOLD_DARK);
-    game.native_fill(batch, [thumb - 18.0, oy + SLIDER_Y + 6.0, 36.0, 18.0], BEIGE);
+    let thumb = ox + SLIDER_X + value.abs() as f32 / 256.0 * SLIDER_W;
+    let lane = if value < 0 { oy + SLIDER_Y + 3.0 } else { oy + SLIDER_Y + SLIDER_H / 2.0 + 3.0 };
+    game.native_fill(batch, [thumb - 19.0, lane, 38.0, 18.0], GOLD_DARK);
+    game.native_fill(batch, [thumb - 18.0, lane + 1.0, 36.0, 16.0], BEIGE);
     let label = value.to_string();
     let w = game.native_text_width(&label);
-    game.native_text(batch, &label, [thumb - w / 2.0, oy + SLIDER_Y + 11.0], 0x3A2412, false);
-    centred(game, batch, "Press, slide and let go to confirm", ox + 128.0, oy + 68.0, 0xCDBA8C);
+    game.native_text(batch, &label, [thumb - w / 2.0, lane + 5.0], 0x3A2412, false);
+    centred(game, batch, "Slide right = faster, up = reverse. Let go to confirm", ox + 128.0, oy + 76.0, 0xCDBA8C);
     let stress = "Stress: ".to_string() + &load.to_string() + " / " + &cap.to_string() + " SU";
     let color = if load > cap { 0xE05050 } else { 0xA89C78 };
-    centred(game, batch, &stress, ox + 128.0, oy + 77.0, color);
+    centred(game, batch, &stress, ox + 128.0, oy + 85.0, color);
 }
 
 pub fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
@@ -4164,7 +5779,14 @@ pub fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     }
     let cur = motor_rpm(&entity.nbt);
     let next = match id {
-        n if n >= 1000 => n - 1000 - MOTOR_MAX_RPM,
+        n if n >= 1000 => {
+            let v = n - 1000;
+            if v & 1 == 1 {
+                -(v >> 1)
+            } else {
+                v >> 1
+            }
+        }
         20 => cur.abs(),
         21 => -cur.abs(),
         1 => cur - 64,
@@ -4285,6 +5907,29 @@ mod tests {
         assert_eq!(link(&a, [0, 0, 1], &b), None);
         b.first = false;
         assert_eq!(link(&a, [1, 0, 0], &b), None);
+        // facing each other along the shaft: they link through the shaft ends
+        b.first = true;
+        assert!(link(&a, [0, 1, 0], &b).is_some());
+        // a drive facing another one with its shaft end against a chain side does not link
+        let mut c = node(Kind::Chain, 0);
+        c.first = true;
+        assert_eq!(link(&a, [1, 0, 0], &c), None);
+    }
+
+    #[test]
+    fn chain_drives_with_different_shafts_link_on_one_line() {
+        // axis y with its chain along x, axis z with its chain along x as well: they link along x
+        let mut a = node(Kind::Chain, 1);
+        a.first = true;
+        let mut b = node(Kind::Chain, 2);
+        b.first = true;
+        assert_eq!(a.chain_axis(), 0);
+        assert_eq!(b.chain_axis(), 0);
+        assert_eq!(link(&a, [1, 0, 0], &b), Some(1.0));
+        assert_eq!(link(&b, [-1, 0, 0], &a), Some(1.0));
+        // the line of b turned away: no link
+        b.first = false;
+        assert_eq!(link(&a, [1, 0, 0], &b), None);
     }
 
     #[test]
@@ -4292,6 +5937,62 @@ mod tests {
         assert_eq!(pressing("minecraft:iron_ingot"), Some("create:iron_sheet"));
         assert_eq!(pressing("minecraft:sugar_cane"), Some("minecraft:paper"));
         assert_eq!(pressing("minecraft:dirt"), None);
+    }
+
+    #[test]
+    fn funnels_are_told_apart_and_face_the_right_way() {
+        assert_eq!(funnel_brass("create:andesite_funnel"), Some(false));
+        assert_eq!(funnel_brass("create:brass_funnel"), Some(true));
+        assert_eq!(funnel_brass("create:basin"), None);
+        assert_eq!(direction_of([0, 1, 0]), Direction::Up);
+        assert_eq!(direction_of([0, 0, -1]), Direction::North);
+        assert_eq!(direction_of(neg([1, 0, 0])), Direction::West);
+    }
+
+    #[test]
+    fn a_basin_bag_fills_in_stacks_of_64() {
+        let mut bag: Vec<(String, u32)> = Vec::new();
+        assert_eq!(bag_add(&mut bag, "minecraft:copper_ingot", 40), 40);
+        assert_eq!(bag_add(&mut bag, "minecraft:copper_ingot", 40), 40);
+        assert_eq!(bag.len(), 2);
+        assert_eq!(bag_total(&bag, "minecraft:copper_ingot"), 80);
+        bag_take(&mut bag, "minecraft:copper_ingot", 70);
+        assert_eq!(bag_total(&bag, "minecraft:copper_ingot"), 10);
+        assert_eq!(bag.len(), 1);
+        // nine stacks at most
+        let mut full: Vec<(String, u32)> = Vec::new();
+        for i in 0..BASIN_SLOTS {
+            full.push((i.to_string(), 64));
+        }
+        assert_eq!(bag_add(&mut full, "minecraft:stone", 5), 0);
+    }
+
+    #[test]
+    fn brass_needs_heat_and_room() {
+        let inb = vec![("minecraft:copper_ingot".to_string(), 3), ("create:zinc_ingot".to_string(), 1)];
+        let empty: Vec<(String, u32)> = Vec::new();
+        assert!(find_mixing(&inb, &empty, false).is_none());
+        let r = find_mixing(&inb, &empty, true).expect("brass");
+        assert_eq!(r.outputs, vec![("create:brass_ingot", 2)]);
+        // nothing to mix without the zinc
+        let only = vec![("minecraft:copper_ingot".to_string(), 3)];
+        assert!(find_mixing(&only, &empty, true).is_none());
+        // no room for the result
+        let mut full: Vec<(String, u32)> = Vec::new();
+        for i in 0..BASIN_SLOTS {
+            full.push((i.to_string(), 64));
+        }
+        assert!(find_mixing(&inb, &full, true).is_none());
+    }
+
+    #[test]
+    fn a_chain_turns_towards_a_neighbour() {
+        // axis y: across it x is first, z is second
+        assert!(chain_first_towards(1, 0));
+        assert!(!chain_first_towards(1, 2));
+        // axis x: y is first
+        assert!(chain_first_towards(0, 1));
+        assert!(!chain_first_towards(0, 2));
     }
 
     #[test]
@@ -4341,8 +6042,8 @@ mod tests {
     fn belt_items_survive_a_round_trip() {
         let mut c = Compound::new();
         let items = vec![
-            BeltItem { item: "minecraft:iron_ingot".to_string(), count: 3, p: 0.25 },
-            BeltItem { item: "create:pulp".to_string(), count: 1, p: 0.75 },
+            BeltItem { item: "minecraft:iron_ingot".to_string(), count: 3, p: 0.25, moving: false },
+            BeltItem { item: "create:pulp".to_string(), count: 1, p: 0.75, moving: false },
         ];
         belt_store(&mut c, &items);
         let back = belt_items(&c);
@@ -4357,9 +6058,9 @@ mod tests {
     #[test]
     fn belt_free_spots_keep_a_gap() {
         assert_eq!(belt_free_spot(&[]), Some(0.5));
-        let one = vec![BeltItem { item: "a".to_string(), count: 1, p: 0.5 }];
+        let one = vec![BeltItem { item: "a".to_string(), count: 1, p: 0.5, moving: false }];
         assert_eq!(belt_free_spot(&one), Some(0.25));
-        let full: Vec<BeltItem> = (0..BELT_MAX).map(|i| BeltItem { item: "a".to_string(), count: 1, p: i as f32 }).collect();
+        let full: Vec<BeltItem> = (0..BELT_MAX).map(|i| BeltItem { item: "a".to_string(), count: 1, p: i as f32, moving: false }).collect();
         assert_eq!(belt_free_spot(&full), None);
     }
 
@@ -4418,6 +6119,20 @@ mod tests {
     }
 
     #[test]
+    fn hose_pulley_ports() {
+        let hose = Node::new(Kind::Hose, axis_of(cw([0, 0, -1])), [0, 0, -1]);
+        // facing north: shaft on the east side, rotation axis x
+        assert_eq!(cw([0, 0, -1]), [1, 0, 0]);
+        assert!(hose.has_end([1, 0, 0]));
+        assert!(!hose.has_end([-1, 0, 0]));
+        assert!(!hose.has_end([0, 0, -1]));
+        assert_eq!(cw([1, 0, 0]), [0, 0, 1]);
+        assert_eq!(cw([0, 0, 1]), [-1, 0, 0]);
+        assert_eq!(cw([-1, 0, 0]), [0, 0, -1]);
+        assert_eq!(link(&shaft(0), [-1, 0, 0], &hose), Some(1.0));
+    }
+
+    #[test]
     fn stress_units() {
         assert_eq!(Kind::Crank.capacity(32.0), 256);
         assert_eq!(Kind::Wheel.capacity(8.0), 128);
@@ -4427,13 +6142,15 @@ mod tests {
 
     #[test]
     fn the_slider_and_buttons_are_found_where_they_are_drawn() {
-        assert_eq!(hit([SLIDER_X, 45.0]), Some(1000));
-        assert_eq!(hit([SLIDER_X + SLIDER_W / 2.0, 45.0]), Some(1256));
-        assert_eq!(hit([SLIDER_X + SLIDER_W, 45.0]), Some(1512));
-        assert_eq!(hit([20.0, 36.0]), Some(20));
-        assert_eq!(hit([20.0, 52.0]), Some(21));
+        assert_eq!(hit([SLIDER_X, 60.0]), Some(1000));
+        assert_eq!(hit([SLIDER_X + SLIDER_W / 2.0, 60.0]), Some(1256));
+        assert_eq!(hit([SLIDER_X + SLIDER_W, 60.0]), Some(1512));
+        assert_eq!(hit([SLIDER_X + SLIDER_W, 30.0]), Some(1513));
+        assert_eq!(hit([20.0, 45.0]), Some(20));
+        assert_eq!(hit([20.0, 60.0]), Some(21));
         assert_eq!(hit([0.0, 0.0]), None);
-        assert_eq!(rpm_at(SLIDER_X + SLIDER_W / 4.0), -128);
+        assert_eq!(rpm_at(SLIDER_X + SLIDER_W / 4.0, 30.0), -64);
+        assert_eq!(rpm_at(SLIDER_X + SLIDER_W / 4.0, 60.0), 64);
     }
 
     #[test]
