@@ -3758,7 +3758,7 @@ fn saw_eject(game: &mut Game<'_>, pos: [i32; 3], m: [i32; 3], item: &str, count:
     if let Some(items) = belt_items_at(game, target) {
         let Some(spot) = belt_free_spot(&items) else { return false };
         let mut next = items;
-        next.push(BeltItem { item: item.to_string(), count, p: spot });
+        next.push(BeltItem { item: item.to_string(), count, p: spot, moving: false });
         let _ = game.native_with_mod_block_entity(target, move |e| belt_store(&mut e.nbt, &next));
         game.native_block_entity_sync(target);
         return true;
