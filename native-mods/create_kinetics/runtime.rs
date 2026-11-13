@@ -226,6 +226,9 @@ impl Node {
     // The axis the saw shaft runs along: across its facing, the lower axis when first is set.
     fn saw_axis(&self) -> usize {
         let f = axis_of(self.front);
+        if self.front[1] == 0 {
+            return f;
+        }
         let mut across = (0..3).filter(|a| *a != f);
         let low = across.next().unwrap_or(0);
         let high = across.next().unwrap_or(0);
@@ -257,7 +260,13 @@ impl Node {
             Kind::Pump => false,
             Kind::Crafter => false,
             Kind::Millstone => d == [0, -1, 0],
-            Kind::Saw => unit && d[self.saw_axis()] != 0,
+            Kind::Saw => {
+                if self.front[1] == 0 {
+                    d == neg(self.front)
+                } else {
+                    unit && d[self.saw_axis()] != 0
+                }
+            }
             Kind::Hose => d == cw(self.front),
             Kind::Clutch if self.powered => false,
             Kind::Belt => self.shaft && unit && d[self.shaft_axis()] != 0,
@@ -1580,22 +1589,34 @@ fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     found.iter().any(|e| pressing(&e.stack.item).is_some())
 }
 
-// Presses the stack on the belt piece or depot at `p` where it lies: every item of it becomes its result.
-// True when one was pressed.
+// Presses one item of the stack on the belt piece or depot at `p`. True when one was pressed.
 fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
     if game.native_block(p) == "create:belt" {
         let done = game
             .native_with_mod_block_entity(p, |e| {
                 let mut v = belt_items(&e.nbt);
                 let mut hit = false;
-                for b in v.iter_mut() {
+                let mut found: Option<usize> = None;
+                for (i, b) in v.iter().enumerate() {
                     if (b.p - 0.5).abs() >= 0.12 {
                         continue;
                     }
-                    if let Some(r) = pressing(&b.item) {
-                        b.item = r.to_string();
-                        hit = true;
+                    if pressing(&b.item).is_some() {
+                        found = Some(i);
                         break;
+                    }
+                }
+                if let Some(i) = found {
+                    if let Some(r) = pressing(&v[i].item) {
+                        // one item at a time: the rest of the stack stays as it is
+                        if v[i].count > 1 {
+                            v[i].count -= 1;
+                            let extra = BeltItem { item: r.to_string(), count: 1, p: (v[i].p + 0.05).min(1.0), moving: v[i].moving };
+                            v.push(extra);
+                        } else {
+                            v[i].item = r.to_string();
+                        }
+                        hit = true;
                     }
                 }
                 if hit {
@@ -1611,14 +1632,21 @@ fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
     }
     if let Some(Some((item, count))) = depot_at(game, p) {
         if let Some(result) = pressing(&item) {
-            depot_set(game, p, Some((result.to_string(), count)));
+            // one item at a time: a stack keeps the rest and the pressed item pops out beside it
+            if count > 1 {
+                depot_set(game, p, Some((item.clone(), count - 1)));
+                let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5];
+                game.spawn_item(stack_of(result, 1), at, [0.12, 0.15, 0.0], 10);
+            } else {
+                depot_set(game, p, Some((result.to_string(), 1)));
+            }
             return true;
         }
     }
     false
 }
 
-// The head hits the bottom: press one stack, the first it finds (belt or depot one block down, then two,
+// The head hits the bottom: press one item, the first it finds (belt or depot one block down, then two,
 // then something lying on the ground), and nothing more.
 fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
     sfx(game, "minecraft:block.anvil.place", pos, 0.35, 1.7);
@@ -1632,7 +1660,10 @@ fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
     let found = game.native_item_entities(&dim, [x, y - 2.0, z], [x + 1.0, y, z + 1.0]);
     for e in found {
         let Some(result) = pressing(&e.stack.item) else { continue };
-        if game.native_set_item_entity(&dim, e.id, stack_of(result, e.stack.count)) {
+        let mut rest = e.stack.clone();
+        rest.count = e.stack.count.saturating_sub(1);
+        if game.native_set_item_entity(&dim, e.id, rest) {
+            game.spawn_item(stack_of(result, 1), e.position, [0.0, 0.1, 0.0], 10);
             return;
         }
     }
@@ -1669,6 +1700,31 @@ fn press_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
     }
     put_f32(nbt, "pp", next);
     true
+}
+
+// Create draws a stack lying on a belt, depot or saw as several copies: one for a single item, then one
+// more for each doubling, up to five. Copy k sits a little apart from the first.
+fn stack_copies(count: u32) -> u32 {
+    if count <= 1 {
+        1
+    } else {
+        (1 + (31 - count.leading_zeros())).min(5)
+    }
+}
+
+fn copy_offset(k: u32, is_block: bool) -> [f32; 3] {
+    if is_block {
+        match k {
+            0 => [0.0, 0.0, 0.0],
+            1 => [0.11, 0.0, 0.08],
+            2 => [-0.11, 0.0, 0.08],
+            3 => [0.0, 0.0, -0.12],
+            _ => [0.0, 0.12, 0.0],
+        }
+    } else {
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        [sign * 0.035 * (k as f32), 0.03 * (k as f32), -sign * 0.025 * (k as f32)]
+    }
 }
 
 // ---- belts ----
@@ -1798,6 +1854,9 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
             return ok;
         }
     }
+    if crusher_accept(game, next, item) {
+        return true;
+    }
     if let Some(n) = node_at(game, next) {
         if n.kind == Kind::Saw && n.front == [0, 1, 0] && saw_accept(game, next, item) {
             return true;
@@ -1819,11 +1878,8 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
     ];
     let push = [f64::from(me.front[0]) * s * 0.1, 0.05, f64::from(me.front[2]) * s * 0.1];
     if item.count == 1 && game.native_block(next) == DRAIN {
-        if let Some(fl) = bucket_fluid(&item.item) {
-            if drain_accept(game, next, fl) {
-                game.spawn_item(stack_of("minecraft:bucket", 1), edge, push, 20);
-                return true;
-            }
+        if bucket_fluid(&item.item).is_some() && drain_accept(game, next, &item.item) {
+            return true;
         }
     }
     game.spawn_item(stack_of(&item.item, item.count), edge, push, 20);
@@ -2200,6 +2256,8 @@ const DRAIN: &str = "create:item_drain";
 const GLASS: &str = "create:glass_fluid_pipe";
 const HOSE: &str = "create:hose_pulley";
 const HOSE_MAX: f32 = 24.0;
+const ROPE: &str = "create:hose_rope_part";
+const MAGNET: &str = "create:hose_magnet_part";
 
 // down, up, north, south, west, east: the opposite of index i is i ^ 1.
 const DIRS: [[i32; 3]; 6] = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
@@ -2347,12 +2405,70 @@ fn tank_layer(game: &Game<'_>, pos: [i32; 3]) -> Vec<[i32; 3]> {
     cells
 }
 
+// The footprint of a tank layer. Layers stack into one tank only when their footprints are the same, as in the game.
+fn tank_footprint(game: &Game<'_>, pos: [i32; 3]) -> Vec<(i32, i32)> {
+    let mut v: Vec<(i32, i32)> = tank_layer(game, pos).iter().map(|c| (c[0], c[2])).collect();
+    v.sort();
+    v
+}
+
+fn stacked(game: &Game<'_>, a: [i32; 3], b: [i32; 3]) -> bool {
+    game.native_block(b) == TANK && tank_footprint(game, a) == tank_footprint(game, b)
+}
+
+// A single tank set on top of a 2x2 or 3x3 tank grows into a whole layer: the missing tanks are placed and
+// taken from the tanks you hold (all of them or nothing).
+fn tank_extend(game: &mut Game<'_>, pos: [i32; 3]) {
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    if game.native_block(below) != TANK || tank_layer(game, pos).len() != 1 {
+        return;
+    }
+    let foot = tank_layer(game, below);
+    let minx = foot.iter().map(|c| c[0]).min().unwrap_or(0);
+    let maxx = foot.iter().map(|c| c[0]).max().unwrap_or(0);
+    let minz = foot.iter().map(|c| c[2]).min().unwrap_or(0);
+    let maxz = foot.iter().map(|c| c[2]).max().unwrap_or(0);
+    let (w, d) = (maxx - minx + 1, maxz - minz + 1);
+    if foot.len() < 2 || foot.len() as i32 != w * d || w > 3 || d > 3 {
+        return;
+    }
+    if !foot.iter().any(|c| c[0] == pos[0] && c[2] == pos[2]) {
+        return;
+    }
+    let mut missing: Vec<[i32; 3]> = Vec::new();
+    for c in foot.iter() {
+        let cell = [c[0], pos[1], c[2]];
+        if cell == pos {
+            continue;
+        }
+        if is_air(&game.native_block(cell).to_string()) {
+            missing.push(cell);
+        } else {
+            return;
+        }
+    }
+    let have = match game.held() {
+        Some(h) if h.item.to_string() == "create:fluid_tank" => h.count as i32,
+        _ => 0,
+    };
+    if !game.creative && have < missing.len() as i32 {
+        return;
+    }
+    let Some(st) = game.pack.assets.registry.default_state(TANK) else { return };
+    let dim = game.dim.id().to_string();
+    for cell in missing {
+        if game.native_set_block(&dim, cell, st, 3) && !game.creative {
+            game.consume_held();
+        }
+    }
+}
+
 // A tank shows a cap where no tank lies above it and a base where none lies below. Tanks side by side
 // form a block up to 3 by 3: corners get a window facing out, edges and the middle stay plain, a single
 // column gets one window.
 fn tank_sync(game: &mut Game<'_>, pos: [i32; 3]) {
-    let below = game.native_block([pos[0], pos[1] - 1, pos[2]]) == TANK;
-    let above = game.native_block([pos[0], pos[1] + 1, pos[2]]) == TANK;
+    let below = stacked(game, pos, [pos[0], pos[1] - 1, pos[2]]);
+    let above = stacked(game, pos, [pos[0], pos[1] + 1, pos[2]]);
     let cells = tank_layer(game, pos);
     let minx = cells.iter().map(|c| c[0]).min().unwrap_or(pos[0]);
     let maxx = cells.iter().map(|c| c[0]).max().unwrap_or(pos[0]);
@@ -2487,7 +2603,7 @@ fn pool_of(game: &mut Game<'_>, at: [i32; 3]) -> Pool {
                 if seen.contains(&q) {
                     continue;
                 }
-                if game.native_block(q) == TANK {
+                if game.native_block(q) == TANK && (d[1] == 0 || tank_footprint(game, p) == tank_footprint(game, q)) {
                     seen.insert(q);
                     cells.push(q);
                 }
@@ -2630,6 +2746,15 @@ fn pool_take(game: &mut Game<'_>, pool: &Pool, want: i32) -> i32 {
 
 fn world_source(game: &Game<'_>, p: [i32; 3]) -> Option<&'static str> {
     let name = game.native_block(p).to_string();
+    if name == "minecraft:lava_cauldron" {
+        return Some("lava");
+    }
+    if name == "minecraft:water_cauldron" {
+        return match game.native_block_property(p, "level") {
+            Some(v) if v != "3" => None,
+            _ => Some("water"),
+        };
+    }
     let fluid = match name.as_str() {
         "minecraft:water" => "water",
         "minecraft:lava" => "lava",
@@ -2653,7 +2778,30 @@ fn infinite_water(game: &Game<'_>, p: [i32; 3]) -> bool {
     n >= 2
 }
 
+// What is left when a source block is drawn away: a cauldron stays, anything else becomes air.
+fn world_empty(game: &mut Game<'_>, p: [i32; 3]) {
+    let here = game.native_block(p).to_string();
+    let dim = game.dim.id().to_string();
+    if here == "minecraft:water_cauldron" || here == "minecraft:lava_cauldron" {
+        if let Some(st) = game.pack.assets.registry.default_state("minecraft:cauldron") {
+            game.native_set_block(&dim, p, st, 3);
+            return;
+        }
+    }
+    game.native_set_block(&dim, p, BlockStateId(0), 3);
+}
+
 fn place_fluid(game: &mut Game<'_>, p: [i32; 3], fluid: &str) -> bool {
+    if game.native_block(p) == "minecraft:cauldron" {
+        let cname = if fluid == "lava" { "minecraft:lava_cauldron" } else { "minecraft:water_cauldron" };
+        let Some(st) = game.pack.assets.registry.default_state(cname) else { return false };
+        let dim = game.dim.id().to_string();
+        let ok = game.native_set_block(&dim, p, st, 3);
+        if ok && fluid != "lava" {
+            game.native_set_block_property(p, "level", "3");
+        }
+        return ok;
+    }
     let name = match fluid {
         "water" => "minecraft:water",
         "lava" => "minecraft:lava",
@@ -2680,7 +2828,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
         return;
     }
     let rate = ((rpm * 4.0) as i32).clamp(4, BUCKET);
-    let flow = if speed > 0.0 { me.front } else { neg(me.front) };
+    let flow = if speed > 0.0 { neg(me.front) } else { me.front };
     let outs = walk(game, pos, flow);
     let ins = walk(game, pos, neg(flow));
     let mut out_cells: HashSet<[i32; 3]> = HashSet::new();
@@ -2731,7 +2879,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
                 continue;
             }
             if !(wf == "water" && infinite_water(game, *c)) {
-                game.native_set_block(&dim, *c, BlockStateId(0), 3);
+                world_empty(game, *c);
             }
             fluid = wf.to_string();
             amt += BUCKET;
@@ -2782,7 +2930,8 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             if in_cells.contains(c) {
                 continue;
             }
-            if is_air(&game.native_block(*c)) && place_fluid(game, *c, &fluid) {
+            let here = game.native_block(*c).to_string();
+            if (is_air(&here) || here == "minecraft:cauldron") && place_fluid(game, *c, &fluid) {
                 amt -= BUCKET;
                 moved = true;
                 break;
@@ -2815,7 +2964,60 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
 
 fn hose_free(game: &Game<'_>, p: [i32; 3]) -> bool {
     let n = game.native_block(p).to_string();
-    is_air(&n) || n == "minecraft:water" || n == "minecraft:lava"
+    is_air(&n) || n == "minecraft:water" || n == "minecraft:lava" || n == ROPE || n == MAGNET
+}
+
+// The hose is also made of real blocks in the air cells under the pulley (a rope column and the magnet at
+// its tip), so it stays visible when the pulley block itself is out of view. Water cells are drawn by the
+// block entity instead.
+fn hose_blocks(game: &mut Game<'_>, pos: [i32; 3], l: f32) {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return;
+    }
+    let count = l.floor() as i32;
+    let dim = game.dim.id().to_string();
+    for k in 1..=(HOSE_MAX as i32 + 2) {
+        let cell = [pos[0], pos[1] - k, pos[2]];
+        let here = game.native_block(cell).to_string();
+        let want = if k <= count { Some(ROPE) } else if k == count + 1 { Some(MAGNET) } else { None };
+        match want {
+            Some(w) => {
+                if is_air(&here) || here == "minecraft:water" || here == "minecraft:lava" || ((here == ROPE || here == MAGNET) && here != w) {
+                    let wet = here == "minecraft:water";
+                    if let Some(st) = game.pack.assets.registry.default_state(w) {
+                        if game.native_set_block(&dim, cell, st, 3) && wet {
+                            game.native_set_block_property(cell, "waterlogged", "true");
+                        }
+                    }
+                }
+            }
+            None => {
+                if here == ROPE || here == MAGNET {
+                    // the cell gets its water or lava back when the fluid lies beside it
+                    let mut back = "";
+                    if game.native_block_property(cell, "waterlogged").map(|v| v == "true").unwrap_or(false) {
+                        back = "water";
+                    }
+                    for d in DIRS.iter() {
+                        if back == "water" {
+                            break;
+                        }
+                        let nb = game.native_block(add3(cell, *d)).to_string();
+                        if nb == "minecraft:lava" {
+                            back = "lava";
+                            break;
+                        }
+                        if nb == "minecraft:water" {
+                            back = "water";
+                        }
+                    }
+                    if back.is_empty() || !place_fluid(game, cell, back) {
+                        game.native_set_block(&dim, cell, BlockStateId(0), 3);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn hose_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32) -> bool {
@@ -2845,7 +3047,15 @@ fn hose_source(game: &Game<'_>, end: [i32; 3]) -> Option<([i32; 3], &'static str
     // the tip may sit in a cell already drained: then look just below it
     let mut end = end;
     if !matches!(game.native_block(end).to_string().as_str(), "minecraft:water" | "minecraft:lava") {
-        end = [end[0], end[1] - 1, end[2]];
+        let mut found = [end[0], end[1] - 1, end[2]];
+        for d in [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]] {
+            let c = add3(end, d);
+            if matches!(game.native_block(c).to_string().as_str(), "minecraft:water" | "minecraft:lava") {
+                found = c;
+                break;
+            }
+        }
+        end = found;
     }
     let name = game.native_block(end).to_string();
     let fluid = match name.as_str() {
@@ -2882,15 +3092,47 @@ fn hose_source(game: &Game<'_>, end: [i32; 3]) -> Option<([i32; 3], &'static str
     best.map(|b| (b, fluid, big && fluid == "water"))
 }
 
+// Output as in the game: the fluid fills the space around the tip from the lowest layer up, spreading
+// sideways, one source block per bucket. The space is searched through air and flowing fluid.
 fn hose_place(game: &mut Game<'_>, end: [i32; 3], fluid: &str) -> bool {
-    let name = match fluid {
+    let wn = match fluid {
         "water" => "minecraft:water",
         "lava" => "minecraft:lava",
         _ => return false,
     };
-    let here = game.native_block(end).to_string();
-    let flowing = here == name && game.native_block_property(end, "level").map(|v| v != "0").unwrap_or(false);
-    (is_air(&here) || flowing) && place_fluid(game, end, fluid)
+    let start = end;
+    let mut seen: HashSet<[i32; 3]> = HashSet::new();
+    seen.insert(start);
+    let mut queue: Vec<[i32; 3]> = vec![start];
+    let mut best: Option<[i32; 3]> = None;
+    let mut i = 0;
+    while i < queue.len() && queue.len() < 300 {
+        let p = queue[i];
+        i += 1;
+        let here = game.native_block(p).to_string();
+        let flowing = here == wn && game.native_block_property(p, "level").map(|v| v != "0").unwrap_or(false);
+        if is_air(&here) || flowing {
+            best = match best {
+                Some(b) if b[1] <= p[1] => Some(b),
+                _ => Some(p),
+            };
+        }
+        for d in DIRS.iter() {
+            let q = add3(p, *d);
+            if seen.contains(&q) || q[1] > start[1] + 1 || (q[0] - start[0]).abs() > 12 || (q[2] - start[2]).abs() > 12 {
+                continue;
+            }
+            let nb = game.native_block(q).to_string();
+            if is_air(&nb) || nb == wn || nb == MAGNET || nb == ROPE {
+                seen.insert(q);
+                queue.push(q);
+            }
+        }
+    }
+    match best {
+        Some(b) => place_fluid(game, b, fluid),
+        None => false,
+    }
 }
 
 // ---- glass pipes show the fluid moving through them ----
@@ -2936,19 +3178,28 @@ fn flow_expire(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
 
 // ---- the item drain: empties full buckets (put in by hand, thrown on top, or carried by a belt) ----
 
-fn drain_accept(game: &mut Game<'_>, pos: [i32; 3], fluid: &str) -> bool {
-    let f = fluid.to_string();
-    let ok = game
-        .native_with_mod_block_entity(pos, move |e| {
-            let cur = get_int(&e.nbt, "fa", 0);
-            let cf = get_text(&e.nbt, "fl");
-            if cur + BUCKET > SPOUT_CAP || (cur > 0 && cf != f) {
-                return false;
-            }
-            fluid_put(&mut e.nbt, &f, cur + BUCKET);
-            true
-        })
-        .unwrap_or(false);
+const DRAIN_TIME: i32 = 30;
+
+// Loads a full bucket into the drain: it is held for a while, tipped and emptied, then given back.
+fn drain_load(nbt: &mut Compound, item: &str, now: i32) -> bool {
+    let Some(fl) = bucket_fluid(item) else { return false };
+    if !get_text(nbt, "hi").is_empty() {
+        return false;
+    }
+    let cur = get_int(nbt, "fa", 0);
+    let cf = get_text(nbt, "fl");
+    if cur + BUCKET > SPOUT_CAP || (cur > 0 && cf != fl) {
+        return false;
+    }
+    nbt.insert(JavaString::from("hi"), Tag::String(JavaString::from(item)));
+    put_int(nbt, "ht", now);
+    true
+}
+
+fn drain_accept(game: &mut Game<'_>, pos: [i32; 3], item: &str) -> bool {
+    let it = item.to_string();
+    let now = game.ticks as i32;
+    let ok = game.native_with_mod_block_entity(pos, move |e| drain_load(&mut e.nbt, &it, now)).unwrap_or(false);
     if ok {
         game.native_block_entity_sync(pos);
     }
@@ -2956,27 +3207,37 @@ fn drain_accept(game: &mut Game<'_>, pos: [i32; 3], fluid: &str) -> bool {
 }
 
 fn drain_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
-    let fluid = get_text(nbt, "fl");
-    let amt = get_int(nbt, "fa", 0);
-    if amt + BUCKET > SPOUT_CAP {
+    let now = game.ticks as i32;
+    let held = get_text(nbt, "hi");
+    if !held.is_empty() {
+        if now.wrapping_sub(get_int(nbt, "ht", now)) >= DRAIN_TIME {
+            if let Some(fl) = bucket_fluid(&held) {
+                let amt = get_int(nbt, "fa", 0);
+                fluid_put(nbt, fl, amt + BUCKET);
+            }
+            nbt.remove(&JavaString::from("hi"));
+            nbt.remove(&JavaString::from("ht"));
+            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+            game.spawn_item(stack_of("minecraft:bucket", 1), at, [0.0, 0.15, 0.0], 10);
+            game.native_block_entity_sync(pos);
+        }
         return;
     }
     let dim = game.dim.id().to_string();
     let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
     let found = game.native_item_entities(&dim, [x, y + 0.6, z], [x + 1.0, y + 1.9, z + 1.0]);
     for e in found {
-        if e.stack.count == 0 {
+        if e.stack.count == 0 || bucket_fluid(&e.stack.item).is_none() {
             continue;
         }
-        let Some(fl) = bucket_fluid(&e.stack.item) else { continue };
-        if amt > 0 && fluid != fl {
+        let mut probe = nbt.clone();
+        if !drain_load(&mut probe, &e.stack.item, now) {
             continue;
         }
         let mut rest = e.stack.clone();
         rest.count -= 1;
         if game.native_set_item_entity(&dim, e.id, rest) {
-            game.spawn_item(stack_of("minecraft:bucket", 1), e.position, [0.0, 0.1, 0.0], 10);
-            fluid_put(nbt, fl, amt + BUCKET);
+            drain_load(nbt, &e.stack.item, now);
             game.native_block_entity_sync(pos);
             return;
         }
@@ -3064,6 +3325,7 @@ fn fluid_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if name == PIPE {
         pipe_sync(game, pos);
     } else if name == TANK {
+        tank_extend(game, pos);
         tank_sync(game, pos);
     } else if name == SPOUT {
         spout_tick(game, pos, &mut entity.nbt);
@@ -3084,6 +3346,15 @@ fn give_item(game: &mut Game<'_>, pos: [i32; 3], item: &str) {
 // A bucket on a tank or spout: a full one pours in, an empty one takes a bucket out.
 fn bucket_click(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     let Some(item) = game.held().map(|h| h.item.to_string()) else { return false };
+    if game.native_block(pos) == DRAIN && bucket_fluid(&item).is_some() {
+        if drain_accept(game, pos, &item) {
+            if !game.creative {
+                game.consume_held();
+            }
+            return true;
+        }
+        return false;
+    }
     let pool = pool_of(game, pos);
     let total = pool.each * pool.cells.len() as i32;
     if let Some(fl) = bucket_fluid(&item) {
@@ -3116,7 +3387,7 @@ fn bucket_click(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 fn pump_info(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
     let speed = game.native_with_mod_block_entity(pos, |e| get_f32(&e.nbt, "speed")).unwrap_or(0.0);
     let amt = game.native_with_mod_block_entity(pos, |e| get_int(&e.nbt, "fa", 0)).unwrap_or(0);
-    let flow = if speed >= 0.0 { me.front } else { neg(me.front) };
+    let flow = if speed >= 0.0 { neg(me.front) } else { me.front };
     let outs = walk(game, pos, flow);
     let ins = walk(game, pos, neg(flow));
     let s = sect();
@@ -3534,10 +3805,6 @@ fn mill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32)
     let mut timer = get_int(nbt, "mt", -1);
     if speed.abs() >= 1.0 {
         if let Some((item, count)) = input.first().cloned() {
-            if (game.ticks as i64 + i64::from(pos[0])).rem_euclid(3) == 0 {
-                let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
-                puff(game, at, Some(&item), 2);
-            }
             match recipe_for(game, "create:milling", &item) {
                 Some(rec) => {
                     if timer < 0 {
@@ -3545,6 +3812,10 @@ fn mill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32)
                     }
                     let rate = ((speed.abs() / 16.0) as i32).clamp(1, 512);
                     timer -= rate;
+                    if timer > 0 && (game.ticks as i64 + i64::from(pos[0])).rem_euclid(3) == 0 {
+                        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+                        puff(game, at, Some(&item), 3);
+                    }
                     if timer <= 0 {
                         let rolled = roll_outputs(game, pos, &rec, 1);
                         let mut outs = pair_list(nbt, "mo");
@@ -3750,6 +4021,23 @@ fn puff(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
         None => horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke),
     };
     game.particles.send_particles(&options, at, [0.15, 0.0, 0.15], 0.05, count);
+}
+
+// Puts a stack on a belt piece (a free spot) or a free depot; false when there is neither.
+fn put_on(game: &mut Game<'_>, target: [i32; 3], item: &str, count: u32) -> bool {
+    if let Some(items) = belt_items_at(game, target) {
+        let Some(spot) = belt_free_spot(&items) else { return false };
+        let mut next = items;
+        next.push(BeltItem { item: item.to_string(), count, p: spot, moving: false });
+        let _ = game.native_with_mod_block_entity(target, move |e| belt_store(&mut e.nbt, &next));
+        game.native_block_entity_sync(target);
+        return true;
+    }
+    if let Some(None) = depot_at(game, target) {
+        depot_set(game, target, Some((item.to_string(), count)));
+        return true;
+    }
+    false
 }
 
 // Puts a stack on a belt piece (a free spot), on a free depot, or out into the air; false when it is full.
@@ -3991,6 +4279,33 @@ fn crusher_info(game: &mut Game<'_>, pos: [i32; 3]) {
     game.native_chat(&line);
 }
 
+// A belt ending at the gap between two wheels hands the item to the wheel pair.
+fn crusher_accept(game: &mut Game<'_>, next: [i32; 3], item: &BeltItem) -> bool {
+    for a in [0usize, 2usize] {
+        let mut lo = next;
+        lo[a] -= 1;
+        let mut hi = next;
+        hi[a] += 1;
+        if game.native_block(lo) != "create:crushing_wheel" || game.native_block(hi) != "create:crushing_wheel" {
+            continue;
+        }
+        let Some(rec) = recipe_for(game, "create:crushing", &item.item) else { return false };
+        let name = item.item.clone();
+        let count = item.count;
+        let time = rec.time as f32;
+        return game
+            .native_with_mod_block_entity(lo, move |e| {
+                if !triple_list(&e.nbt, "cq").is_empty() {
+                    return false;
+                }
+                triple_store(&mut e.nbt, "cq", &[(name, count, time)]);
+                true
+            })
+            .unwrap_or(false);
+    }
+    false
+}
+
 fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) -> bool {
     if !server_side(game) {
         return false;
@@ -4011,10 +4326,10 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
         let mut hi = [lo[0] + 1.0, lo[1] + 2.0, lo[2] + 1.0];
         lo[a] -= 0.25;
         hi[a] += 0.25;
-        if queue.len() < 4 {
+        if queue.is_empty() {
             let found = game.native_item_entities(&dim, lo, hi);
             for e in found {
-                if queue.len() >= 4 {
+                if !queue.is_empty() {
                     break;
                 }
                 let name = e.stack.item.to_string();
@@ -4033,15 +4348,21 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
         for (item, count, left) in queue.drain(..) {
             let left = left - rate;
             if left > 0.0 {
+                if (game.ticks as i64).rem_euclid(3) == 0 {
+                    puff(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(&item), 3);
+                }
                 keep.push((item, count, left));
                 continue;
             }
             if let Some(rec) = recipe_for(game, "create:crushing", &item) {
                 let outs = roll_outputs(game, g, &rec, count);
                 let at = [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.2, f64::from(g[2]) + 0.5];
-                puff(game, at, Some(&item), 8);
                 for o in outs {
-                    game.spawn_item(stack_of(&o.0, o.1.min(99)), at, [0.0, -0.1, 0.0], 10);
+                    puff(game, at, Some(&o.0), 6);
+                    let n = o.1.min(99);
+                    if !put_on(game, [g[0], g[1] - 1, g[2]], &o.0, n) {
+                        game.spawn_item(stack_of(&o.0, n), at, [0.0, -0.1, 0.0], 10);
+                    }
                 }
             }
             changed = true;
@@ -4151,11 +4472,22 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
     if !server_side(game) {
         return false;
     }
+    let due = ((game.ticks as i64) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) == 0;
+    if let Some((item, count)) = pair_list(nbt, "co").first().cloned() {
+        if due {
+            let Some((_, d)) = crafter_at(game, pos) else { return false };
+            if put_on(game, add3(pos, d), &item, count) {
+                pair_store(nbt, "co", &[]);
+                return true;
+            }
+        }
+        return false;
+    }
     if speed.abs() < 1.0 {
         put_int(nbt, "ct", 0);
         return false;
     }
-    if ((game.ticks as i64) + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(5) != 0 {
+    if !due {
         return false;
     }
     let Some((front, dirv)) = crafter_at(game, pos) else { return false };
@@ -4169,10 +4501,12 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
     let right = right_vec(front);
     let plane = [[0, 1, 0], [0, -1, 0], right, neg(right)];
     let mut members: Vec<[i32; 3]> = vec![pos];
+    let mut levels: Vec<i32> = vec![0];
     let mut i = 0;
     while i < members.len() && members.len() < 81 {
         let c = members[i];
         i += 1;
+        let level = levels[i - 1];
         for d in plane {
             let q = add3(c, d);
             if members.contains(&q) {
@@ -4181,6 +4515,7 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
             if let Some((f2, d2)) = crafter_at(game, q) {
                 if f2 == front && add3(q, d2) == c {
                     members.push(q);
+                    levels.push(level + 1);
                 }
             }
         }
@@ -4221,12 +4556,36 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
         put_int(nbt, "ct", 0);
         return false;
     };
-    let progress = get_int(nbt, "ct", 0) + ((speed.abs() / 4.0) as i32).clamp(1, 64);
+    let inc = ((speed.abs() / 4.0) as i32).clamp(1, 64);
+    let progress = get_int(nbt, "ct", 0) + inc;
+    // the items slide along the arrows to the last crafter while the work goes on; every crafter
+    // keeps the progress, the hops to go and the time it was written, for the drawing
+    let hops = levels.iter().copied().max().unwrap_or(0).max(1);
+    let stamp = game.ticks as i32;
+    let pct = (progress.min(60) * 100 / 60).min(100);
+    let rate = inc * 100 / 60;
+    for m in members.iter() {
+        if *m == pos {
+            put_int(nbt, "cp", pct);
+            put_int(nbt, "cr", rate);
+            put_int(nbt, "ch", hops);
+            put_int(nbt, "cs", stamp);
+        } else {
+            let _ = game.native_with_mod_block_entity(*m, move |e| {
+                put_int(&mut e.nbt, "cp", pct);
+                put_int(&mut e.nbt, "cr", rate);
+                put_int(&mut e.nbt, "ch", hops);
+                put_int(&mut e.nbt, "cs", stamp);
+            });
+            game.native_block_entity_sync(*m);
+        }
+    }
     if progress < 60 {
         put_int(nbt, "ct", progress);
-        return false;
+        return true;
     }
     put_int(nbt, "ct", 0);
+    put_int(nbt, "cp", 0);
     for m in members.iter() {
         if *m == pos {
             let mut v = pair_list(nbt, "ci");
@@ -4243,17 +4602,15 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
                 }
                 v.retain(|e| e.1 > 0);
                 pair_store(&mut e.nbt, "ci", &v);
+                put_int(&mut e.nbt, "cp", 0);
             });
             game.native_block_entity_sync(*m);
         }
     }
-    let at = [
-        f64::from(pos[0]) + 0.5 + f64::from(dirv[0]) * 0.75,
-        f64::from(pos[1]) + 0.5 + f64::from(dirv[1]) * 0.75,
-        f64::from(pos[2]) + 0.5 + f64::from(dirv[2]) * 0.75,
-    ];
-    let speed_out = [f64::from(dirv[0]) * 0.1, f64::from(dirv[1]) * 0.1 + 0.05, f64::from(dirv[2]) * 0.1];
-    game.spawn_item(result, at, speed_out, 10);
+    pair_store(nbt, "co", &[(result.item.to_string(), result.count)]);
+    if put_on(game, add3(pos, dirv), &result.item.to_string(), result.count) {
+        pair_store(nbt, "co", &[]);
+    }
     true
 }
 
@@ -4265,6 +4622,20 @@ fn crafter_click(game: &mut Game<'_>, pos: [i32; 3], held_item: Option<String>) 
         game.native_set_block_property(pos, "pointing", next);
         say(game, &(String::from("Mechanical Crafter points ") + next));
         return true;
+    }
+    if held_item.is_none() {
+        let out = game
+            .native_with_mod_block_entity(pos, |e| {
+                let v = pair_list(&e.nbt, "co");
+                pair_store(&mut e.nbt, "co", &[]);
+                v
+            })
+            .unwrap_or_default();
+        if !out.is_empty() {
+            game.native_block_entity_sync(pos);
+            give_player(game, pos, &out);
+            return true;
+        }
     }
     if let Some(item) = held_item {
         let count = game.held().map(|h| h.count).unwrap_or(0);
@@ -4281,7 +4652,7 @@ fn crafter_click(game: &mut Game<'_>, pos: [i32; 3], held_item: Option<String>) 
                     }
                     None => 64,
                 };
-                let take = room.min(count);
+                let take = room.min(count).min(1);
                 if take == 0 {
                     return 0;
                 }
@@ -4462,8 +4833,15 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if me.kind == Kind::Pump {
         pump_step(game, pos, &mut entity.nbt, &me, out.speed);
     }
-    if me.kind == Kind::Hose && hose_tick(game, pos, &mut entity.nbt, out.speed) {
-        game.native_block_entity_sync(pos);
+    if me.kind == Kind::Hose {
+        let moved = hose_tick(game, pos, &mut entity.nbt, out.speed);
+        if moved {
+            game.native_block_entity_sync(pos);
+        }
+        if moved || (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(20) == 0 {
+            let l = get_f32(&entity.nbt, "hl");
+            hose_blocks(game, pos, l);
+        }
     }
     if me.kind == Kind::Valve {
         valve_tick(game, pos, &mut entity.nbt, out.speed);
@@ -4528,6 +4906,11 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let ff = get_text(&entity.nbt, "ff");
         c.insert(JavaString::from("ff"), Tag::String(JavaString::from(ff.as_str())));
         put_int(&mut c, "fd", get_int(&entity.nbt, "fd", 0));
+        let hi = get_text(&entity.nbt, "hi");
+        if !hi.is_empty() {
+            c.insert(JavaString::from("hi"), Tag::String(JavaString::from(hi.as_str())));
+            put_int(&mut c, "ht", get_int(&entity.nbt, "ht", 0));
+        }
         *tag = Some(c);
         return;
     }
@@ -4540,11 +4923,12 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let bi = get_text(&entity.nbt, "bi");
         c.insert(JavaString::from("bi"), Tag::String(JavaString::from(bi.as_str())));
         put_int(&mut c, "sp", get_int(&entity.nbt, "sp", 0));
-        for key in ["ci", "si"] {
+        for key in ["cp", "cr", "ch", "cs"] {
+            put_int(&mut c, key, get_int(&entity.nbt, key, 0));
+        }
+        for key in ["ci", "si", "co"] {
             let text = get_text(&entity.nbt, key);
-            if !text.is_empty() {
-                c.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
-            }
+            c.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
         }
         *tag = Some(c);
     }
@@ -4673,12 +5057,21 @@ pub fn destroyed(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
     } else if name == "create:millstone" {
         spill_lists(game, pos, &["mi", "mo"]);
     } else if name == "create:mechanical_crafter" {
-        spill_lists(game, pos, &["ci"]);
+        spill_lists(game, pos, &["ci", "co"]);
     } else if name == BASIN_BLOCK {
         basin_spill(game, pos);
     } else if name == "create:belt" {
         belt_spill(game, pos);
         belt_dismantle(game, pos, Some(pos));
+    } else if name == HOSE {
+        let dim = game.dim.id().to_string();
+        for k in 1..=(HOSE_MAX as i32 + 2) {
+            let cell = [pos[0], pos[1] - k, pos[2]];
+            let here = game.native_block(cell).to_string();
+            if here == ROPE || here == MAGNET {
+                game.native_set_block(&dim, cell, BlockStateId(0), 3);
+            }
+        }
     }
 }
 
@@ -4874,16 +5267,19 @@ pub fn submit(
         if let Some((item, count)) = depot_content(&entity.nbt) {
             let stack = ItemStack { item: Arc::from(item.as_str()), count, damage: 0, extra: None };
             let is_block = game.pack.assets.registry.default_state(&item).is_some();
-            draw.push();
-            if is_block {
-                draw.translate([0.5, 0.95, 0.5]);
-            } else {
-                // A flat item lies on the depot as in Create.
-                draw.translate([0.5, 0.84, 0.5]);
-                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            for k in 0..stack_copies(count) {
+                let o = copy_offset(k, is_block);
+                draw.push();
+                if is_block {
+                    draw.translate([0.5 + o[0], 0.95 + o[1], 0.5 + o[2]]);
+                } else {
+                    // A flat item lies on the depot as in Create.
+                    draw.translate([0.5 + o[0], 0.84 + o[1], 0.5 + o[2]]);
+                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                }
+                game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
+                draw.pop();
             }
-            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
-            draw.pop();
         }
         return;
     }
@@ -4905,6 +5301,49 @@ pub fn submit(
         game.native_draw_block(draw, "create:pipe_flow_part", &[("axis", axis_char(axis)), ("fluid", fl.as_str()), ("frame", frame.as_str())]);
         return;
     }
+    if block == DRAIN {
+        let mut fl = get_text(&entity.nbt, "fl");
+        let mut amt = get_int(&entity.nbt, "fa", 0);
+        let hi = get_text(&entity.nbt, "hi");
+        if !hi.is_empty() {
+            let el = draw.game_time as f32 + draw.partial - get_int(&entity.nbt, "ht", 0) as f32;
+            let prog = (el / DRAIN_TIME as f32).clamp(0.0, 1.0);
+            let tilt = (el / 10.0).clamp(0.0, 1.0) * 75.0;
+            let stack = ItemStack { item: Arc::from(hi.as_str()), count: 1, damage: 0, extra: None };
+            draw.push();
+            draw.translate([0.5, 1.0, 0.5]);
+            draw.rotate_about([0.0, 0.0, 1.0], -tilt, [0.0, 0.0, 0.0]);
+            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
+            draw.pop();
+            if let Some(f) = bucket_fluid(&hi) {
+                if el >= 8.0 {
+                    game.native_draw_block(draw, "create:pour_part", &[("fluid", f)]);
+                }
+                if fl.is_empty() {
+                    fl = f.to_string();
+                }
+                amt += (BUCKET as f32 * prog) as i32;
+            }
+        }
+        if amt > 0 && !fl.is_empty() {
+            let level = ((amt * 8 + SPOUT_CAP - 1) / SPOUT_CAP).clamp(1, 8).to_string();
+            game.native_draw_block(draw, "create:drain_fluid_part", &[("fluid", fl.as_str()), ("level", level.as_str())]);
+        }
+        return;
+    }
+    if block == PIPE {
+        for d in DIRS.iter() {
+            if !pipe_open(game, pos, *d) {
+                continue;
+            }
+            let nb = game.native_block(add3(pos, *d));
+            if nb == PIPE || nb == GLASS {
+                continue;
+            }
+            game.native_draw_block(draw, "create:pipe_rim_part", &[("facing", dir_name(*d))]);
+        }
+        return;
+    }
     if block == HOSE {
         let Some(f) = game.native_block_state_property(state, "facing") else { return };
         let f = f.to_string();
@@ -4919,19 +5358,22 @@ pub fn submit(
         draw.rotate_about(about, (speed * 0.3 * (draw.game_time as f64 + f64::from(draw.partial))) as f32 % 360.0, [0.5, 0.5, 0.5]);
         game.native_draw_block(draw, "create:hose_coil_part", &[("facing", f.as_str())]);
         draw.pop();
+        half_shaft(game, pos, cw(front), speed, draw);
         let rope = (l - 1.0).ceil().max(0.0) as i32;
         for k in 0..rope {
+            if game.native_block([pos[0], pos[1] - (k + 1), pos[2]]) == ROPE {
+                continue;
+            }
             draw.push();
             draw.translate([0.0, -((k + 1) as f32), 0.0]);
             game.native_draw_block(draw, "create:hose_rope_part", &[]);
             draw.pop();
         }
-        draw.push();
-        draw.translate([0.0, -l, 0.0]);
-        game.native_draw_block(draw, "create:hose_magnet_part", &[]);
-        draw.pop();
-        if speed == 0.0 {
-            draw.keep();
+        if game.native_block([pos[0], pos[1] - 1 - (l.floor() as i32), pos[2]]) != MAGNET {
+            draw.push();
+            draw.translate([0.0, -l, 0.0]);
+            game.native_draw_block(draw, "create:hose_magnet_part", &[]);
+            draw.pop();
         }
         return;
     }
@@ -4949,7 +5391,27 @@ pub fn submit(
             let ext = ext.to_string();
             game.native_draw_block(draw, "create:fluid_level_part", &[("ext", ext.as_str()), ("fluid", fl.as_str()), ("level", level.as_str())]);
         }
-        draw.keep();
+        // Tanks side by side show one big cap on top and bottom: each tank draws its share of it.
+        let cells = tank_layer(game, pos);
+        if cells.len() > 1 {
+            let minx = cells.iter().map(|c| c[0]).min().unwrap_or(pos[0]);
+            let maxx = cells.iter().map(|c| c[0]).max().unwrap_or(pos[0]);
+            let minz = cells.iter().map(|c| c[2]).min().unwrap_or(pos[2]);
+            let maxz = cells.iter().map(|c| c[2]).max().unwrap_or(pos[2]);
+            let (w, d) = (maxx - minx + 1, maxz - minz + 1);
+            if cells.len() as i32 == w * d && w <= 3 && d <= 3 {
+                let ux = w.to_string() + "_" + &(pos[0] - minx).to_string();
+                let uz = d.to_string() + "_" + &(pos[2] - minz).to_string();
+                let top = game.native_block_state_property(state, "top").map(|v| v.to_string() == "true").unwrap_or(false);
+                let bottom = game.native_block_state_property(state, "bottom").map(|v| v.to_string() == "true").unwrap_or(false);
+                if top {
+                    game.native_draw_block(draw, "create:tank_cap_part", &[("face", "up"), ("ux", ux.as_str()), ("uz", uz.as_str())]);
+                }
+                if bottom {
+                    game.native_draw_block(draw, "create:tank_cap_part", &[("face", "down"), ("ux", ux.as_str()), ("uz", uz.as_str())]);
+                }
+            }
+        }
         return;
     }
     if block == VALVE {
@@ -4970,10 +5432,9 @@ pub fn submit(
         let part = game.native_block_state_property(state, "part").map(|v| v.to_string()).unwrap_or_default();
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         if part == "start" || part == "middle" || part == "end" {
-            // The belt surface is one of sixteen pictures, each shifted a pixel further along the belt.
+            // The belt surface is one of eight pictures, each shifted a little further along the belt.
             let t = draw.game_time as f64 + f64::from(draw.partial);
-            let flip = f64::from(belt_flip(front));
-            let frame = ((-flip * t * speed / 30.0).floor() as i64).rem_euclid(16).to_string();
+            let frame = ((-t * speed / 60.0).floor() as i64).rem_euclid(8).to_string();
             game.native_draw_block(
                 draw,
                 "create:belt_part",
@@ -4999,13 +5460,16 @@ pub fn submit(
             at[line] = if front[line] > 0 { p } else { 1.0 - p };
             let stack = ItemStack { item: Arc::from(b.item.as_str()), count: b.count, damage: 0, extra: None };
             let is_block = game.pack.assets.registry.default_state(&b.item).is_some();
-            draw.push();
-            draw.translate(at);
-            if !is_block {
-                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            for k in 0..stack_copies(b.count) {
+                let o = copy_offset(k, is_block);
+                draw.push();
+                draw.translate([at[0] + o[0], at[1] + o[1], at[2] + o[2]]);
+                if !is_block {
+                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                }
+                game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (b.p * 100.0) as i32 ^ (k as i32));
+                draw.pop();
             }
-            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (b.p * 100.0) as i32);
-            draw.pop();
         }
         if speed == 0.0 {
             draw.keep();
@@ -5069,14 +5533,48 @@ pub fn submit(
             "create:crafter_arrow_part",
             &[("facing", facing_text.as_str()), ("pointing", pointing.as_str())],
         );
-        if let Some((item, count)) = pair_list(&entity.nbt, "ci").first() {
+        let shown = pair_list(&entity.nbt, "co").first().cloned().or_else(|| pair_list(&entity.nbt, "ci").first().cloned());
+        if let Some((item, count)) = shown.as_ref() {
             let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
+            // sliding along the arrows to the last crafter, then shrinking away into it
+            let now = draw.game_time as f64 + f64::from(draw.partial);
+            let stamp = f64::from(get_int(&entity.nbt, "cs", 0));
+            let cp = get_int(&entity.nbt, "cp", 0);
+            let mut slide = [0.0f32; 3];
+            let mut grow = 0.6f32;
+            if cp > 0 && now - stamp < 15.0 && pair_list(&entity.nbt, "co").is_empty() {
+                let pct = ((f64::from(cp) + f64::from(get_int(&entity.nbt, "cr", 0)) / 5.0 * (now - stamp)).min(100.0)) / 100.0;
+                let t = pct * f64::from(get_int(&entity.nbt, "ch", 1).max(1));
+                let mut cur = pos;
+                let mut done = 0.0f64;
+                for _ in 0..9 {
+                    let Some((f2, d)) = crafter_at(game, cur) else { break };
+                    if f2 != front {
+                        break;
+                    }
+                    let next = add3(cur, d);
+                    match crafter_at(game, next) {
+                        Some((f3, _)) if f3 == front => {}
+                        _ => break,
+                    }
+                    let step = (t - done).clamp(0.0, 1.0) as f32;
+                    for a in 0..3 {
+                        slide[a] += d[a] as f32 * step;
+                    }
+                    done += 1.0;
+                    if t <= done {
+                        break;
+                    }
+                    cur = next;
+                }
+                grow = 0.6 * (1.0 - ((pct - 0.85) / 0.15).clamp(0.0, 1.0)).max(0.02) as f32;
+            }
             draw.push();
-            draw.translate([0.5 + front[0] as f32 * 0.6, 0.5, 0.5 + front[2] as f32 * 0.6]);
+            draw.translate([0.5 + front[0] as f32 * 0.6 + slide[0], 0.5 + slide[1], 0.5 + front[2] as f32 * 0.6 + slide[2]]);
             if front[0] != 0 {
                 draw.rotate_about([0.0, 1.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
             }
-            draw.scale([0.6, 0.6, 0.6]);
+            draw.scale([grow, grow, grow]);
             game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
             draw.pop();
         }
@@ -5094,22 +5592,27 @@ pub fn submit(
         let mut node = Node::new(Kind::Saw, axis_of(front), front);
         node.first = first;
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
-        through_shaft(game, pos, node.saw_axis(), speed, draw);
+        if front[1] == 0 {
+            half_shaft(game, pos, neg(front), speed, draw);
+        } else {
+            through_shaft(game, pos, node.saw_axis(), speed, draw);
+        }
         if let Some((item, count)) = pair_list(&entity.nbt, "si").first() {
             let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
             let is_block = game.pack.assets.registry.default_state(item).is_some();
             let along = (get_int(&entity.nbt, "sp", 0) as f32 / 100.0 - 0.5) * 0.9;
             let sign = if speed < 0.0 { -1.0f32 } else { 1.0f32 };
             let (dx, dz) = if first { (0.0f32, -sign) } else { (sign, 0.0f32) };
-            draw.push();
-            if is_block {
-                draw.translate([0.5 + dx * along, 1.15, 0.5 + dz * along]);
-            } else {
-                draw.translate([0.5 + dx * along, 1.02, 0.5 + dz * along]);
-                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            for k in 0..stack_copies(*count) {
+                let o = copy_offset(k, is_block);
+                draw.push();
+                draw.translate([0.5 + dx * along + o[0], BELT_TOP + o[1], 0.5 + dz * along + o[2]]);
+                if !is_block {
+                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                }
+                game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
+                draw.pop();
             }
-            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
-            draw.pop();
         }
         let mode = if speed > 0.5 {
             "active"
@@ -5483,7 +5986,11 @@ pub fn placement(
         let low = across.next().unwrap_or(0);
         let mut first = false;
         if let Some(d) = feeding.first() {
-            first = axis_of(*d) == low;
+            if f != 1 && d[1] == 0 {
+                facing = neg(*d);
+            } else {
+                first = axis_of(*d) == low;
+            }
         }
         let with_facing = level.native_state_with_property(state, "facing", dir_name(facing));
         with_facing.and_then(|s| level.native_state_with_property(s, "axis_along_first", if first { "true" } else { "false" }))
@@ -5521,7 +6028,9 @@ pub fn placement(
         if let Some(d) = feeding.iter().find(|d| d[1] == 0) {
             f = [d[2], 0, -d[0]];
         }
-        level.native_state_with_property(state, "facing", dir_name(f))
+        let placed = level.native_state_with_property(state, "facing", dir_name(f));
+        let in_water = level.facts.get(level.block_state(at)).name.to_string() == "minecraft:water";
+        placed.map(|st| if in_water { level.native_state_with_property(st, "waterlogged", "true").unwrap_or(st) } else { st })
     } else if kind.uses_facing() {
         // Directions where the neighbour can take a shaft end.
         let mut facing = match kind {
