@@ -1,3 +1,5 @@
+
+
 // Create kinetics and fluids: shafts, cogwheels, large cogwheels, power sources (creative motor, hand
 // crank, water wheel), consumers (mechanical drill, mechanical press) and stress.
 // Injected as `crate::game::create_kinetics`. Each kinetic block has a block entity holding
@@ -36,6 +38,26 @@ const WHEEL_RPM: f32 = 8.0;
 const NET_LIMIT: usize = 2048;
 const DEPOT_BLOCK: &str = "create:depot";
 const DEPOT_BE: &str = "create:depot_be";
+// A flat item (a sheet, an ingot, a stick) lies down; an item with a solid model (a block) does not.
+fn flat_item(game: &Game<'_>, stack: &ItemStack) -> bool {
+    !game.resolve_item(stack, DisplayContext::Ground, None, 0).uses_block_light()
+}
+
+// Where the k-th of n stacks lies on a depot, from its middle.
+fn depot_spot(n: usize, k: usize) -> [f32; 2] {
+    match (n, k) {
+        (1, _) => [0.0, 0.0],
+        (2, 0) => [-0.22, 0.0],
+        (2, _) => [0.22, 0.0],
+        (3, 0) => [-0.22, -0.14],
+        (3, 1) => [0.22, -0.14],
+        (3, _) => [0.0, 0.22],
+        (_, 0) => [-0.22, -0.22],
+        (_, 1) => [0.22, -0.22],
+        (_, 2) => [-0.22, 0.22],
+        _ => [0.22, 0.22],
+    }
+}
 const HANDLE_RPM: f32 = 16.0;
 // The light a part of a solid block is drawn with: the brightest of the cells around it, in the packing
 // of BlockEntityDraw.light (16 times sky light in the low byte, 16 times block light in the next).
@@ -57,6 +79,17 @@ fn open_light(game: &Game<'_>, pos: [i32; 3]) -> u32 {
 fn sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
     let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
     let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
+}
+
+fn bucket_sfx(game: &mut Game<'_>, fluid: &str, fill: bool, pos: [i32; 3]) {
+    let lava = fluid.contains("lava");
+    let ev = match (fill, lava) {
+        (true, false) => "minecraft:item.bucket.fill",
+        (true, true) => "minecraft:item.bucket.fill_lava",
+        (false, false) => "minecraft:item.bucket.empty",
+        (false, true) => "minecraft:item.bucket.empty_lava",
+    };
+    sfx(game, ev, pos, 0.8, 1.0);
 }
 
 const FUNNEL_BE: &str = "create:funnel_be";
@@ -682,30 +715,93 @@ fn get_text(n: &Compound, k: &str) -> String {
     }
 }
 
-fn depot_content(n: &Compound) -> Option<(String, u32)> {
-    let item = get_text(n, "item");
-    let count = get_int(n, "count", 0);
-    if item.is_empty() || count <= 0 {
-        None
-    } else {
-        Some((item, count as u32))
+const DEPOT_SLOTS: usize = 4;
+
+// Adds as much of `count` as fits into stacks of at most 64 in a bag of at most `slots` stacks;
+// returns how many went in.
+fn stacks_add(bag: &mut Vec<(String, u32)>, item: &str, count: u32, slots: usize) -> u32 {
+    let mut left = count;
+    for entry in bag.iter_mut() {
+        if entry.0 == item && entry.1 < 64 {
+            let put = (64 - entry.1).min(left);
+            entry.1 += put;
+            left -= put;
+        }
     }
+    while left > 0 && bag.len() < slots {
+        let put = left.min(64);
+        bag.push((item.to_string(), put));
+        left -= put;
+    }
+    count - left
 }
 
-fn depot_put(n: &mut Compound, content: Option<(String, u32)>) {
-    match content {
+// Everything on the depot: the first stack, then the others (results, by-products).
+fn depot_list(n: &Compound) -> Vec<(String, u32)> {
+    let mut v = Vec::new();
+    let item = get_text(n, "item");
+    let count = get_int(n, "count", 0);
+    if !item.is_empty() && count > 0 {
+        v.push((item, count as u32));
+    }
+    v.extend(bag_read(n, "ex"));
+    v
+}
+fn depot_store(n: &mut Compound, list: &[(String, u32)]) {
+    match list.first() {
         Some((item, count)) => {
             n.insert(JavaString::from("item"), Tag::String(JavaString::from(item.as_str())));
-            put_int(n, "count", count as i32);
+            put_int(n, "count", *count as i32);
         }
         None => {
             n.remove(&JavaString::from("item"));
             n.remove(&JavaString::from("count"));
         }
     }
+    let rest: Vec<(String, u32)> = list.iter().skip(1).cloned().collect();
+    bag_write(n, "ex", &rest);
 }
-
-// What the depot at `pos` holds, if there is a depot there.
+fn depot_content(n: &Compound) -> Option<(String, u32)> {
+    depot_list(n).into_iter().next()
+}
+fn depot_put(n: &mut Compound, content: Option<(String, u32)>) {
+    let mut list = depot_list(n);
+    match content {
+        Some(c) => {
+            if list.is_empty() {
+                list.push(c);
+            } else {
+                list[0] = c;
+            }
+        }
+        None => {
+            if !list.is_empty() {
+                list.remove(0);
+            }
+        }
+    }
+    depot_store(n, &list);
+}
+// Puts a whole stack on the depot when it fits; false leaves the depot as it was.
+fn depot_push_all(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> bool {
+    let item = item.to_string();
+    let ok = game
+        .native_with_mod_block_entity(p, move |e| {
+            let mut list = depot_list(&e.nbt);
+            let mut trial = list.clone();
+            if stacks_add(&mut trial, &item, count, DEPOT_SLOTS) != count {
+                return false;
+            }
+            stacks_add(&mut list, &item, count, DEPOT_SLOTS);
+            depot_store(&mut e.nbt, &list);
+            true
+        })
+        .unwrap_or(false);
+    if ok {
+        game.native_block_entity_sync(p);
+    }
+    ok
+}
 fn depot_at(game: &mut Game<'_>, pos: [i32; 3]) -> Option<Option<(String, u32)>> {
     if game.native_block(pos) != DEPOT_BLOCK {
         return None;
@@ -875,11 +971,7 @@ fn basin_target_kind(game: &mut Game<'_>, p: [i32; 3]) -> bool {
 fn basin_give(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> bool {
     let name = game.native_block(p);
     if name == DEPOT_BLOCK {
-        if let Some(None) = depot_at(game, p) {
-            depot_set(game, p, Some((item.to_string(), count)));
-            return true;
-        }
-        return false;
+        return depot_push_all(game, p, item, count);
     }
     if name == "create:belt" {
         let item = item.to_string();
@@ -951,7 +1043,7 @@ fn basin_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
 // its mouth, or off a belt, depot or basin there, and puts them into the block behind it; extracting
 // takes them out of a basin, depot or belt behind it and puts them into the block in front of it, or
 // drops them. The andesite one moves one item at a time, the brass one up to sixteen, twice as often.
-// Vanilla containers (chests, barrels, furnaces) work both ways, through the engine's container calls.
+// Vanilla containers (chests, barrels, furnaces) work both ways, through the engine container calls.
 
 fn funnel_brass(name: &str) -> Option<bool> {
     match name {
@@ -988,21 +1080,20 @@ fn funnel_storage(game: &mut Game<'_>, p: [i32; 3]) -> u8 {
 
 // Takes up to `amount` items of the first stack the storage at `p` lets go of (a basin gives up only
 // what it finished).
-fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction) -> Option<(String, u32)> {
+fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction, filter: &str) -> Option<(String, u32)> {
+    let want = filter.to_string();
     match funnel_storage(game, p) {
         1 => {
             let got = game
-                .native_with_mod_block_entity(p, |e| {
+                .native_with_mod_block_entity(p, move |e| {
                     let mut out = bag_read(&e.nbt, "out");
-                    if out.is_empty() {
-                        return None;
-                    }
-                    let (item, count) = out[0].clone();
+                    let i = out.iter().position(|st| want.is_empty() || st.0 == want)?;
+                    let (item, count) = out[i].clone();
                     let t = count.min(amount);
                     if t == count {
-                        out.remove(0);
+                        out.remove(i);
                     } else {
-                        out[0].1 -= t;
+                        out[i].1 -= t;
                     }
                     bag_write(&mut e.nbt, "out", &out);
                     Some((item, t))
@@ -1014,24 +1105,37 @@ fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction) 
             got
         }
         2 => {
-            let Some(Some((item, count))) = depot_at(game, p) else { return None };
-            let t = count.min(amount);
-            depot_set(game, p, if t == count { None } else { Some((item.clone(), count - t)) });
-            Some((item, t))
+            let got = game
+                .native_with_mod_block_entity(p, move |e| {
+                    let mut list = depot_list(&e.nbt);
+                    let i = list.iter().position(|st| want.is_empty() || st.0 == want)?;
+                    let (item, count) = list[i].clone();
+                    let t = count.min(amount);
+                    if t == count {
+                        list.remove(i);
+                    } else {
+                        list[i].1 -= t;
+                    }
+                    depot_store(&mut e.nbt, &list);
+                    Some((item, t))
+                })
+                .flatten();
+            if got.is_some() {
+                game.native_block_entity_sync(p);
+            }
+            got
         }
         3 => {
             let got = game
-                .native_with_mod_block_entity(p, |e| {
+                .native_with_mod_block_entity(p, move |e| {
                     let mut v = belt_items(&e.nbt);
-                    if v.is_empty() {
-                        return None;
-                    }
-                    let item = v[0].item.clone();
-                    let t = v[0].count.min(amount);
-                    if t == v[0].count {
-                        v.remove(0);
+                    let i = v.iter().position(|b| want.is_empty() || b.item == want)?;
+                    let item = v[i].item.clone();
+                    let t = v[i].count.min(amount);
+                    if t == v[i].count {
+                        v.remove(i);
                     } else {
-                        v[0].count -= t;
+                        v[i].count -= t;
                     }
                     belt_store(&mut e.nbt, &v);
                     Some((item, t))
@@ -1050,7 +1154,10 @@ fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction) 
                 if !slot.can_take {
                     continue;
                 }
-                let Some(have) = slot.stack.as_ref().map(|st| st.count) else { continue };
+                let Some((have, name)) = slot.stack.as_ref().map(|st| (st.count, st.item.to_string())) else { continue };
+                if !filter.is_empty() && name != filter {
+                    continue;
+                }
                 if let Some(out) = game.native_extract_item(&dim, p, face, slot.slot, have.min(amount)) {
                     return Some((out.item.to_string(), out.count));
                 }
@@ -1081,18 +1188,23 @@ fn storage_give(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> u32
             }
             added
         }
-        2 => match depot_at(game, p) {
-            Some(None) => {
-                depot_set(game, p, Some((item.to_string(), count)));
-                count
+        2 => {
+            let item = item.to_string();
+            let added = game
+                .native_with_mod_block_entity(p, move |e| {
+                    let mut list = depot_list(&e.nbt);
+                    let n = stacks_add(&mut list, &item, count, DEPOT_SLOTS);
+                    if n > 0 {
+                        depot_store(&mut e.nbt, &list);
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            if added > 0 {
+                game.native_block_entity_sync(p);
             }
-            Some(Some((have, n))) if have == item && n < 64 => {
-                let t = count.min(64 - n);
-                depot_set(game, p, Some((have, n + t)));
-                t
-            }
-            _ => 0,
-        },
+            added
+        }
         3 => {
             if basin_give(game, p, item, count) {
                 count
@@ -1106,6 +1218,54 @@ fn storage_give(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> u32
 
 // Hands a stack to the block at `p` through its side `face`: our own storage, a vanilla container, or
 // (when `drop_ok`) the air, where the rest drops. Returns how many were taken.
+// A click on a funnel. Only a wrench turns it between pulling in and taking out. A brass funnel takes any
+// item as its filter (the same item again clears it), and an empty hand steps its count through 1, 2, 4, 8,
+// 16, 32 and 64.
+fn funnel_click(game: &mut Game<'_>, pos: [i32; 3], brass: bool, held: Option<&str>) {
+    if held == Some("create:wrench") {
+        let now = game.native_block_property(pos, "unloading").map(|v| v == "true").unwrap_or(false);
+        game.native_set_block_property(pos, "unloading", if now { "false" } else { "true" });
+        sfx(game, "minecraft:block.iron_trapdoor.open", pos, 0.4, 1.4);
+        say(game, if now { "Funnel: pulling items in" } else { "Funnel: taking items out" });
+        return;
+    }
+    if !brass {
+        return;
+    }
+    match held {
+        Some(item) => {
+            let item = item.to_string();
+            let cleared = game
+                .native_with_mod_block_entity(pos, move |e| {
+                    if get_text(&e.nbt, "flt") == item {
+                        e.nbt.insert(JavaString::from("flt"), Tag::String(JavaString::from("")));
+                        true
+                    } else {
+                        e.nbt.insert(JavaString::from("flt"), Tag::String(JavaString::from(item.as_str())));
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            sfx(game, "minecraft:block.iron_trapdoor.close", pos, 0.4, 1.6);
+            say(game, if cleared { "Brass funnel: filter cleared" } else { "Brass funnel: filter set" });
+        }
+        None => {
+            let now = game.native_with_mod_block_entity(pos, |e| get_int(&e.nbt, "cnt", 16)).unwrap_or(16);
+            let next = match now {
+                1 => 2,
+                2 => 4,
+                4 => 8,
+                8 => 16,
+                16 => 32,
+                32 => 64,
+                _ => 1,
+            };
+            let _ = game.native_with_mod_block_entity(pos, move |e| put_int(&mut e.nbt, "cnt", next));
+            say(game, &("Brass funnel: ".to_string() + &next.to_string() + " items at a time"));
+        }
+    }
+}
+
 fn funnel_deliver(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32, face: Direction, drop_ok: bool) -> u32 {
     if funnel_storage(game, p) != 0 {
         return storage_give(game, p, item, count);
@@ -1134,7 +1294,7 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         return false;
     }
     let facing = game.native_block_property(pos, "facing").and_then(|v| parse_dir(&v)).unwrap_or([0, 1, 0]);
-    let extracting = game.native_block_property(pos, "extracting").map(|v| v == "true").unwrap_or(false);
+    let extracting = game.native_block_property(pos, "unloading").map(|v| v == "true").unwrap_or(false);
     let dim = game.dim.id().to_string();
     let powered = game.native_neighbor_signal(&dim, pos) > 0;
     let was = game.native_block_property(pos, "powered").map(|v| v == "true").unwrap_or(false);
@@ -1146,9 +1306,11 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
     }
     let attached = [pos[0] - facing[0], pos[1] - facing[1], pos[2] - facing[2]];
     let mouth = [pos[0] + facing[0], pos[1] + facing[1], pos[2] + facing[2]];
-    let amount = if brass { 16 } else { 1 };
+    // the brass funnel has a filter item and a count; the andesite one takes anything, one at a time
+    let filter = if brass { get_text(nbt, "flt") } else { String::new() };
+    let amount = if brass { get_int(nbt, "cnt", 16).clamp(1, 64) as u32 } else { 1 };
     if extracting {
-        if let Some((item, count)) = storage_take(game, attached, amount, direction_of(facing)) {
+        if let Some((item, count)) = storage_take(game, attached, amount, direction_of(facing), &filter) {
             let accepted = funnel_deliver(game, mouth, &item, count, direction_of(neg(facing)), true);
             if accepted < count {
                 funnel_deliver(game, attached, &item, count - accepted, direction_of(facing), false);
@@ -1162,12 +1324,20 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
     // pulling in: first anything lying in the mouth, then a belt, depot or basin there
     let (x, y, z) = (f64::from(mouth[0]), f64::from(mouth[1]), f64::from(mouth[2]));
     let found = game.native_item_entities(&dim, [x, y, z], [x + 1.0, y + 1.0, z + 1.0]);
+    let across = [(axis_of(facing) + 1) % 3, (axis_of(facing) + 2) % 3];
     for e in found {
         if e.stack.count == 0 {
             continue;
         }
-        let t = e.stack.count.min(amount);
+        // only what lies near the middle of the mouth is taken, as in Java
+        if across.iter().any(|a| (e.position[*a] - (f64::from(mouth[*a]) + 0.5)).abs() > 0.3) {
+            continue;
+        }
         let item = e.stack.item.to_string();
+        if !filter.is_empty() && item != filter {
+            continue;
+        }
+        let t = e.stack.count.min(amount);
         let accepted = funnel_deliver(game, attached, &item, t, direction_of(facing), false);
         if accepted > 0 {
             let mut rest = e.stack.clone();
@@ -1177,7 +1347,7 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
             return false;
         }
     }
-    if let Some((item, count)) = storage_take(game, mouth, amount, direction_of(neg(facing))) {
+    if let Some((item, count)) = storage_take(game, mouth, amount, direction_of(neg(facing)), &filter) {
         let accepted = funnel_deliver(game, attached, &item, count, direction_of(facing), false);
         if accepted < count {
             funnel_deliver(game, mouth, &item, count - accepted, direction_of(neg(facing)), false);
@@ -1187,6 +1357,100 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         }
     }
     false
+}
+
+// ---- the blaze burner: fed with fuel it heats a basin above it ----
+
+// ---- the blaze burner: fed with fuel it heats a basin above it ----
+
+const BURNER_BLOCK: &str = "create:blaze_burner";
+const BURNER_BE: &str = "create:blaze_burner_be";
+
+// How many ticks one item burns in a blaze burner (a blaze cake lasts and superheats).
+fn burner_fuel_time(item: &str) -> i32 {
+    match item {
+        "minecraft:coal_block" => 16000,
+        "minecraft:coal" | "minecraft:charcoal" => 1600,
+        "minecraft:blaze_rod" => 2400,
+        "minecraft:dried_kelp_block" => 4000,
+        "minecraft:stick" => 100,
+        "create:blaze_cake" => 6000,
+        _ => {
+            if item.ends_with("_planks") || item.ends_with("_log") || item.ends_with("_wood") {
+                300
+            } else {
+                0
+            }
+        }
+    }
+}
+
+// Feeds the burner one item of the held stack. True when it took it.
+fn burner_click(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    let Some(h) = game.held().cloned() else { return false };
+    let item = h.item.to_string();
+    let time = burner_fuel_time(&item);
+    if time == 0 || h.count == 0 {
+        return false;
+    }
+    let cake = item == "create:blaze_cake";
+    let _ = game.native_with_mod_block_entity(pos, move |e| {
+        let fuel = (get_int(&e.nbt, "fuel", 0) + time).min(24000);
+        put_int(&mut e.nbt, "fuel", fuel);
+        if cake {
+            put_int(&mut e.nbt, "sup", 1);
+        }
+    });
+    if h.count > 1 {
+        let mut rest = h.clone();
+        rest.count -= 1;
+        *game.held_mut() = Some(rest);
+    } else {
+        *game.held_mut() = None;
+    }
+    sfx(game, "minecraft:item.firecharge.use", pos, 0.5, 1.0);
+    game.native_block_entity_sync(pos);
+    true
+}
+
+// One tick of a burner on the server: the fuel burns down and flames rise while it burns.
+fn burner_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
+    if game.serving.is_none() && game.options.dedicated.is_none() {
+        return false;
+    }
+    let fuel = get_int(nbt, "fuel", 0);
+    if fuel <= 0 {
+        return false;
+    }
+    put_int(nbt, "fuel", fuel - 1);
+    if fuel % 6 == 0 {
+        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.9, f64::from(pos[2]) + 0.5];
+        game.native_flame_particle(at, false);
+    }
+    if fuel == 1 {
+        put_int(nbt, "sup", 0);
+        return true;
+    }
+    false
+}
+
+fn burner_submit(game: &Game<'_>, entity: &ModBlockEntity, draw: &mut BlockEntityDraw) {
+    let fuel = get_int(&entity.nbt, "fuel", 0);
+    let part = if fuel <= 0 {
+        "create:blaze_head_inert"
+    } else if get_int(&entity.nbt, "sup", 0) == 1 {
+        "create:blaze_head_super"
+    } else if fuel > 2000 {
+        "create:blaze_head_active"
+    } else {
+        "create:blaze_head_idle"
+    };
+    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let bob = (0.02 * (t * 0.08).sin()) as f32;
+    draw.push();
+    draw.translate([0.0, bob, 0.0]);
+    game.native_draw_block(draw, part, &[]);
+    draw.pop();
 }
 
 // ---- the mixer: two blocks above a basin it mixes what lies in it ----
@@ -1209,6 +1473,12 @@ fn mixing_recipes() -> Vec<MixRecipe> {
 fn basin_heated(game: &mut Game<'_>, basin: [i32; 3]) -> bool {
     let below = [basin[0], basin[1] - 1, basin[2]];
     let name = game.native_block(below);
+    if name == BURNER_BLOCK {
+        let fuel = game.native_with_mod_block_entity(below, |e| get_int(&e.nbt, "fuel", 0)).unwrap_or(0);
+        if fuel > 0 {
+            return true;
+        }
+    }
     if name == "minecraft:lava" || name == "minecraft:fire" || name == "minecraft:soul_fire" {
         return true;
     }
@@ -1862,13 +2132,20 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
             return true;
         }
     }
-    match depot_at(game, next) {
-        Some(None) => {
-            depot_set(game, next, Some((item.item.clone(), item.count)));
-            return true;
-        }
-        Some(Some(_)) => return false,
-        None => {}
+    if depot_at(game, next).is_some() {
+        return depot_push_all(game, next, &item.item, item.count);
+    }
+    // A basin ahead takes the stack as ingredients when all of it fits.
+    if game.native_block(next) == BASIN_BLOCK {
+        let name = item.item.clone();
+        let count = item.count;
+        let fits = game
+            .native_with_mod_block_entity(next, move |e| {
+                let mut inb = bag_read(&e.nbt, "in");
+                bag_add(&mut inb, &name, count) == count
+            })
+            .unwrap_or(false);
+        return fits && storage_give(game, next, &item.item, item.count) == item.count;
     }
     let s = f64::from(sign);
     let edge = [
@@ -1881,6 +2158,11 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
         if bucket_fluid(&item.item).is_some() && drain_accept(game, next, &item.item) {
             return true;
         }
+    }
+    // Anything else solid ahead holds the stack at the end of the piece. Only the open air lets it
+    // fall off, otherwise it would land back on the belt and be taken up again, a pop back.
+    if !is_air(&game.native_block(next)) {
+        return false;
     }
     game.spawn_item(stack_of(&item.item, item.count), edge, push, 20);
     true
@@ -2339,7 +2621,7 @@ fn fluid_port(game: &Game<'_>, p: [i32; 3], d: [i32; 3]) -> bool {
     let name = game.native_block(p).to_string();
     match name.as_str() {
         PIPE | TANK => true,
-        SPOUT => d == [0, 1, 0],
+        SPOUT => d != [0, -1, 0],
         DRAIN => d != [0, 1, 0],
         GLASS => game.native_block_property(p, "axis").and_then(|v| parse_axis(&v.to_string())) == Some(axis_of(d)),
         HOSE => match game.native_block_property(p, "facing").and_then(|v| parse_dir(&v.to_string())) {
@@ -2402,7 +2684,16 @@ fn tank_layer(game: &Game<'_>, pos: [i32; 3]) -> Vec<[i32; 3]> {
             }
         }
     }
-    cells
+    let minx = cells.iter().map(|c| c[0]).min().unwrap_or(pos[0]);
+    let maxx = cells.iter().map(|c| c[0]).max().unwrap_or(pos[0]);
+    let minz = cells.iter().map(|c| c[2]).min().unwrap_or(pos[2]);
+    let maxz = cells.iter().map(|c| c[2]).max().unwrap_or(pos[2]);
+    let (w, d) = (maxx - minx + 1, maxz - minz + 1);
+    if w == d && (w == 2 || w == 3) && cells.len() as i32 == w * d {
+        cells
+    } else {
+        vec![pos]
+    }
 }
 
 // The footprint of a tank layer. Layers stack into one tank only when their footprints are the same, as in the game.
@@ -2551,7 +2842,7 @@ fn walk(game: &mut Game<'_>, from: [i32; 3], dir: [i32; 3]) -> Ends {
                 }
             }
             SPOUT => {
-                if d == [0, -1, 0] {
+                if d != [0, 1, 0] {
                     ends.tanks.push(q);
                 }
             }
@@ -2603,7 +2894,7 @@ fn pool_of(game: &mut Game<'_>, at: [i32; 3]) -> Pool {
                 if seen.contains(&q) {
                     continue;
                 }
-                if game.native_block(q) == TANK && (d[1] == 0 || tank_footprint(game, p) == tank_footprint(game, q)) {
+                if game.native_block(q) == TANK && (if d[1] == 0 { tank_layer(game, p).contains(&q) } else { tank_footprint(game, p) == tank_footprint(game, q) }) {
                     seen.insert(q);
                     cells.push(q);
                 }
@@ -2812,10 +3103,6 @@ fn place_fluid(game: &mut Game<'_>, p: [i32; 3], fluid: &str) -> bool {
     game.native_set_block(&dim, p, st, 3)
 }
 
-// ---- the pump ----
-
-// One step of a turning pump (every second tick, server side): draws fluid in from the ends at its
-// back, hands it on to the ends at its front. The pump keeps a small buffer in its block entity.
 fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) {
     if game.serving.is_none() && game.options.dedicated.is_none() {
         return;
@@ -2884,6 +3171,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             fluid = wf.to_string();
             amt += BUCKET;
             moved = true;
+            bucket_sfx(game, wf, true, *c);
             break;
         }
     }
@@ -2901,6 +3189,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             fluid = wf.to_string();
             amt += BUCKET;
             moved = true;
+            bucket_sfx(game, wf, true, *c);
             break;
         }
     }
@@ -2934,6 +3223,7 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             if (is_air(&here) || here == "minecraft:cauldron") && place_fluid(game, *c, &fluid) {
                 amt -= BUCKET;
                 moved = true;
+                bucket_sfx(game, &fluid, false, *c);
                 break;
             }
         }
@@ -2943,9 +3233,13 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
             if hose_place(game, *c, &fluid) {
                 amt -= BUCKET;
                 moved = true;
+                bucket_sfx(game, &fluid, false, *c);
                 break;
             }
         }
+    }
+    if moved && (game.ticks as i64 + i64::from(pos[0])).rem_euclid(30) < 2 {
+        sfx(game, "minecraft:block.water.ambient", pos, 0.4, 0.8);
     }
     if moved && !fluid.is_empty() {
         let mut flows: Vec<([i32; 3], [i32; 3])> = outs.flows.clone();
@@ -2970,7 +3264,7 @@ fn hose_free(game: &Game<'_>, p: [i32; 3]) -> bool {
 // The hose is also made of real blocks in the air cells under the pulley (a rope column and the magnet at
 // its tip), so it stays visible when the pulley block itself is out of view. Water cells are drawn by the
 // block entity instead.
-fn hose_blocks(game: &mut Game<'_>, pos: [i32; 3], l: f32) {
+fn hose_blocks(game: &mut Game<'_>, pos: [i32; 3], l: f32, moving: bool) {
     if game.serving.is_none() && game.options.dedicated.is_none() {
         return;
     }
@@ -2979,7 +3273,9 @@ fn hose_blocks(game: &mut Game<'_>, pos: [i32; 3], l: f32) {
     for k in 1..=(HOSE_MAX as i32 + 2) {
         let cell = [pos[0], pos[1] - k, pos[2]];
         let here = game.native_block(cell).to_string();
-        let want = if k <= count { Some(ROPE) } else if k == count + 1 { Some(MAGNET) } else { None };
+        // while the hose moves the block entity draws the last rope piece and the magnet smoothly
+        let rope_to = if moving { count - 1 } else { count };
+        let want = if k <= rope_to { Some(ROPE) } else if k == count + 1 && !moving { Some(MAGNET) } else { None };
         match want {
             Some(w) => {
                 if is_air(&here) || here == "minecraft:water" || here == "minecraft:lava" || ((here == ROPE || here == MAGNET) && here != w) {
@@ -3202,6 +3498,8 @@ fn drain_accept(game: &mut Game<'_>, pos: [i32; 3], item: &str) -> bool {
     let ok = game.native_with_mod_block_entity(pos, move |e| drain_load(&mut e.nbt, &it, now)).unwrap_or(false);
     if ok {
         game.native_block_entity_sync(pos);
+        let fl = bucket_fluid(item).unwrap_or("water");
+        bucket_sfx(game, fl, false, pos);
     }
     ok
 }
@@ -3266,14 +3564,53 @@ fn valve_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
 
 // ---- the spout: fills empty buckets that lie on a depot or ride a belt under it ----
 
+const SPOUT_TIME: i64 = 20;
+
+// A bucket waiting under the spout: on a depot (the fill takes a moment, with a stream) or on a belt.
+fn spout_bucket(game: &mut Game<'_>, below: [i32; 3]) -> u8 {
+    if let Some(Some((item, _))) = depot_at(game, below) {
+        if item == "minecraft:bucket" {
+            return 1;
+        }
+    }
+    if game.native_block(below) == "create:belt" {
+        let has = game
+            .native_with_mod_block_entity(below, |e| belt_items(&e.nbt).iter().any(|b| b.item == "minecraft:bucket" && b.count == 1))
+            .unwrap_or(false);
+        if has {
+            return 2;
+        }
+    }
+    0
+}
+
 fn spout_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
     let fluid = get_text(nbt, "fl");
     let amt = get_int(nbt, "fa", 0);
-    if amt < BUCKET {
+    let working = get_int(nbt, "sw", 0) == 1;
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    let full = fluid_bucket(&fluid);
+    let kind = if amt >= BUCKET && full.is_some() { spout_bucket(game, below) } else { 0 };
+    if kind == 0 {
+        if working {
+            put_int(nbt, "sw", 0);
+            game.native_block_entity_sync(pos);
+        }
         return;
     }
-    let Some(full) = fluid_bucket(&fluid) else { return };
-    let below = [pos[0], pos[1] - 1, pos[2]];
+    let Some(full) = full else { return };
+    if kind == 1 {
+        if !working {
+            put_int(nbt, "sw", 1);
+            put_int(nbt, "st", game.ticks as i32);
+            game.native_block_entity_sync(pos);
+            bucket_sfx(game, &fluid, false, pos);
+            return;
+        }
+        if (game.ticks as i64) - i64::from(get_int(nbt, "st", 0)) < SPOUT_TIME {
+            return;
+        }
+    }
     let mut done = false;
     if let Some(Some((item, count))) = depot_at(game, below) {
         if item == "minecraft:bucket" {
@@ -3308,24 +3645,31 @@ fn spout_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
         }
     }
     if done {
+        bucket_sfx(game, &fluid, true, pos);
         fluid_put(nbt, &fluid, amt - BUCKET);
+        put_int(nbt, "sw", 0);
         game.native_block_entity_sync(pos);
     }
 }
 
 // Pipes, tanks and spouts tick every fifth tick.
 fn fluid_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
-    if (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[1]) + i64::from(pos[2])).rem_euclid(5) != 0 {
-        return;
-    }
     if game.serving.is_none() && game.options.dedicated.is_none() {
         return;
     }
     let name = game.native_block(pos).to_string();
     if name == PIPE {
         pipe_sync(game, pos);
-    } else if name == TANK {
-        tank_extend(game, pos);
+        return;
+    }
+    if (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[1]) + i64::from(pos[2])).rem_euclid(5) != 0 {
+        return;
+    }
+    if name == TANK {
+        if get_int(&entity.nbt, "ex", 0) == 0 {
+            put_int(&mut entity.nbt, "ex", 1);
+            tank_extend(game, pos);
+        }
         tank_sync(game, pos);
     } else if name == SPOUT {
         spout_tick(game, pos, &mut entity.nbt);
@@ -4020,7 +4364,20 @@ fn puff(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
         Some(i) => game.item_particle(&stack_of(i, 1)),
         None => horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke),
     };
-    game.particles.send_particles(&options, at, [0.15, 0.0, 0.15], 0.05, count);
+    let smoke = horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke);
+    let cell = [at[0].floor() as i32, at[1].floor() as i32, at[2].floor() as i32];
+    for k in 0..count as i32 {
+        let a = f64::from(pseudo(game, cell, k * 7 + 1)) - 0.5;
+        let b = f64::from(pseudo(game, cell, k * 7 + 2)) - 0.5;
+        let c = f64::from(pseudo(game, cell, k * 7 + 3)) - 0.5;
+        let d = f64::from(pseudo(game, cell, k * 7 + 4)) - 0.5;
+        let e = f64::from(pseudo(game, cell, k * 7 + 5)) - 0.5;
+        let pos = [at[0] + a * 0.5, at[1] + b * 0.2, at[2] + c * 0.5];
+        let vel = [d * 0.12, 0.05 + e * 0.05, c * 0.12];
+        // always shown: the particle setting and the distance limiter do not drop these
+        game.particles.add_with(&options, pos, vel, true, true);
+    }
+    game.particles.add_with(&smoke, at, [0.0, 0.03, 0.0], true, true);
 }
 
 // Puts a stack on a belt piece (a free spot) or a free depot; false when there is neither.
@@ -4033,9 +4390,8 @@ fn put_on(game: &mut Game<'_>, target: [i32; 3], item: &str, count: u32) -> bool
         game.native_block_entity_sync(target);
         return true;
     }
-    if let Some(None) = depot_at(game, target) {
-        depot_set(game, target, Some((item.to_string(), count)));
-        return true;
+    if depot_at(game, target).is_some() {
+        return depot_push_all(game, target, item, count);
     }
     false
 }
@@ -4051,13 +4407,8 @@ fn saw_eject(game: &mut Game<'_>, pos: [i32; 3], m: [i32; 3], item: &str, count:
         game.native_block_entity_sync(target);
         return true;
     }
-    match depot_at(game, target) {
-        Some(None) => {
-            depot_set(game, target, Some((item.to_string(), count)));
-            return true;
-        }
-        Some(Some(_)) => return false,
-        None => {}
+    if depot_at(game, target).is_some() {
+        return depot_push_all(game, target, item, count);
     }
     let at = [
         f64::from(pos[0]) + 0.5 + f64::from(m[0]) * 0.7,
@@ -4716,6 +5067,10 @@ pub fn block_entity(block: &str, entity: &mut Option<(String, Compound)>) {
         *entity = Some((FUNNEL_BE.to_string(), Compound::new()));
         return;
     }
+    if entity.is_none() && block == BURNER_BLOCK {
+        *entity = Some((BURNER_BE.to_string(), Compound::new()));
+        return;
+    }
     if entity.is_none() && kind_of(block).is_some() {
         let mut c = Compound::new();
         set_state(&mut c, 0.0, NONE_HOPS, None);
@@ -4724,7 +5079,7 @@ pub fn block_entity(block: &str, entity: &mut Option<(String, Compound)>) {
 }
 
 pub fn ticks(block: &str, ticks: &mut bool) {
-    if kind_of(block).is_some() || is_fluid_block(block) || block == BASIN_BLOCK || funnel_brass(block).is_some() {
+    if kind_of(block).is_some() || is_fluid_block(block) || block == BASIN_BLOCK || block == BURNER_BLOCK || funnel_brass(block).is_some() {
         *ticks = true;
     }
 }
@@ -4742,6 +5097,12 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     }
     if entity.id == FUNNEL_BE {
         let _ = funnel_tick(game, pos, &mut entity.nbt);
+        return;
+    }
+    if entity.id == BURNER_BE {
+        if burner_tick(game, pos, &mut entity.nbt) {
+            game.native_block_entity_sync(pos);
+        }
         return;
     }
     if entity.id != BE_ID {
@@ -4835,12 +5196,24 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     }
     if me.kind == Kind::Hose {
         let moved = hose_tick(game, pos, &mut entity.nbt, out.speed);
+        let was = get_int(&entity.nbt, "hm", 0) == 1;
         if moved {
+            put_int(&mut entity.nbt, "hm", 1);
+            game.native_block_entity_sync(pos);
+        } else if was {
+            // the hose stopped: it settles on a whole block, where the real rope and magnet blocks stand
+            put_int(&mut entity.nbt, "hm", 0);
+            let l = get_f32(&entity.nbt, "hl");
+            let mut t = l.round().clamp(0.0, HOSE_MAX);
+            if t > l && !hose_free(game, [pos[0], pos[1] - 1 - (t as i32), pos[2]]) {
+                t = l.floor();
+            }
+            put_f32(&mut entity.nbt, "hl", t);
             game.native_block_entity_sync(pos);
         }
-        if moved || (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(20) == 0 {
+        if moved || was || (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(20) == 0 {
             let l = get_f32(&entity.nbt, "hl");
-            hose_blocks(game, pos, l);
+            hose_blocks(game, pos, l, moved);
         }
     }
     if me.kind == Kind::Valve {
@@ -4885,6 +5258,15 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
                 put_int(&mut c, "count", 0);
             }
         }
+        let ex = get_text(&entity.nbt, "ex");
+        c.insert(JavaString::from("ex"), Tag::String(JavaString::from(ex.as_str())));
+        *tag = Some(c);
+        return;
+    }
+    if entity.id == BURNER_BE {
+        let mut c = Compound::new();
+        put_int(&mut c, "fuel", get_int(&entity.nbt, "fuel", 0));
+        put_int(&mut c, "sup", get_int(&entity.nbt, "sup", 0));
         *tag = Some(c);
         return;
     }
@@ -4906,11 +5288,10 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let ff = get_text(&entity.nbt, "ff");
         c.insert(JavaString::from("ff"), Tag::String(JavaString::from(ff.as_str())));
         put_int(&mut c, "fd", get_int(&entity.nbt, "fd", 0));
+        put_int(&mut c, "sw", get_int(&entity.nbt, "sw", 0));
         let hi = get_text(&entity.nbt, "hi");
-        if !hi.is_empty() {
-            c.insert(JavaString::from("hi"), Tag::String(JavaString::from(hi.as_str())));
-            put_int(&mut c, "ht", get_int(&entity.nbt, "ht", 0));
-        }
+        c.insert(JavaString::from("hi"), Tag::String(JavaString::from(hi.as_str())));
+        put_int(&mut c, "ht", get_int(&entity.nbt, "ht", 0));
         *tag = Some(c);
         return;
     }
@@ -4966,28 +5347,93 @@ fn at_player(game: &Game<'_>, pos: [i32; 3]) -> [f64; 3] {
     }
 }
 
-// A click on the depot: a held stack goes on it (more of the same item adds to what lies there); with
-// an empty hand, one item at a time comes back.
+// Which of the n stacks on the depot the crosshair is nearest to: the view ray is cut with the depot box
+// and the stack whose place is closest to where it enters is the one.
+fn depot_aim_slot(game: &Game<'_>, pos: [i32; 3], n: usize) -> usize {
+    let Some((o, d)) = game.aim() else { return 0 };
+    let lo = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+    let hi = [lo[0] + 1.0, lo[1] + 0.8125, lo[2] + 1.0];
+    let mut t_in = 0.0f64;
+    for a in 0..3 {
+        if d[a].abs() < 1e-9 {
+            continue;
+        }
+        let (t0, t1) = ((lo[a] - o[a]) / d[a], (hi[a] - o[a]) / d[a]);
+        t_in = t_in.max(t0.min(t1));
+    }
+    let hx = o[0] + d[0] * t_in - lo[0];
+    let hz = o[2] + d[2] * t_in - lo[2];
+    let mut best = 0usize;
+    let mut best_d = f64::MAX;
+    for k in 0..n.min(DEPOT_SLOTS) {
+        let [dx, dz] = depot_spot(n.min(DEPOT_SLOTS), k);
+        let dist = (hx - (0.5 + f64::from(dx))).powi(2) + (hz - (0.5 + f64::from(dz))).powi(2);
+        if dist < best_d {
+            best_d = dist;
+            best = k;
+        }
+    }
+    best
+}
+
+// A click on the depot. By hand it has one slot: a held stack goes on only when the depot is empty (or
+// tops up the same item); the others, results and by-products, come from the press, a basin or a funnel.
+// An empty hand takes the whole stack the crosshair is on.
 fn depot_click(game: &mut Game<'_>, pos: [i32; 3]) {
-    let Some(content) = depot_at(game, pos) else { return };
+    if depot_at(game, pos).is_none() {
+        return;
+    }
     let held = game.held().cloned();
-    match (content, held) {
-        (Some((item, count)), Some(h)) if h.count > 0 && &*h.item == item.as_str() => {
-            let total = (count + h.count).min(64);
-            depot_set(game, pos, Some((item, total)));
-            *game.held_mut() = None;
+    if let Some(h) = held {
+        if h.count > 0 {
+            let item = h.item.to_string();
+            let count = h.count;
+            let added = game
+                .native_with_mod_block_entity(pos, move |e| {
+                    let mut list = depot_list(&e.nbt);
+                    let slots = if list.is_empty() { 1 } else { list.len() };
+                    let n = stacks_add(&mut list, &item, count, slots);
+                    if n > 0 {
+                        depot_store(&mut e.nbt, &list);
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            if added > 0 {
+                sfx(game, "minecraft:entity.item.frame.add_item", pos, 0.6, 1.0);
+                game.native_block_entity_sync(pos);
+                if added >= count {
+                    *game.held_mut() = None;
+                } else {
+                    let mut rest = h.clone();
+                    rest.count = count - added;
+                    *game.held_mut() = Some(rest);
+                }
+            }
+            return;
         }
-        (Some((item, count)), _) => {
-            let rest = if count > 1 { Some((item.clone(), count - 1)) } else { None };
-            depot_set(game, pos, rest);
-            let at = at_player(game, pos);
-            game.spawn_item(stack_of(&item, 1), at, [0.0, 0.0, 0.0], 0);
-        }
-        (None, Some(h)) if h.count > 0 => {
-            depot_set(game, pos, Some((h.item.to_string(), h.count)));
-            *game.held_mut() = None;
-        }
-        _ => {}
+    }
+    let have = game.native_with_mod_block_entity(pos, |e| depot_list(&e.nbt).len()).unwrap_or(0);
+    if have == 0 {
+        return;
+    }
+    let idx = depot_aim_slot(game, pos, have);
+    let taken = game
+        .native_with_mod_block_entity(pos, move |e| {
+            let mut list = depot_list(&e.nbt);
+            if idx >= list.len() {
+                return None;
+            }
+            let st = list.remove(idx);
+            depot_store(&mut e.nbt, &list);
+            Some(st)
+        })
+        .flatten();
+    if let Some((item, count)) = taken {
+        sfx(game, "minecraft:entity.item.frame.remove_item", pos, 0.6, 1.0);
+        game.native_block_entity_sync(pos);
+        let at = at_player(game, pos);
+        game.spawn_item(stack_of(&item, count), at, [0.0, 0.0, 0.0], 0);
     }
 }
 
@@ -5050,8 +5496,9 @@ fn belt_take(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
 pub fn destroyed(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
     let name = game.res.facts().get(state).name.to_string();
     if name == DEPOT_BLOCK {
-        if let Some(Some((item, count))) = depot_at(game, pos) {
-            let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+        let all = game.native_with_mod_block_entity(pos, |e| depot_list(&e.nbt)).unwrap_or_default();
+        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+        for (item, count) in all {
             game.spawn_item(stack_of(&item, count), at, [0.0, 0.1, 0.0], 10);
         }
     } else if name == "create:millstone" {
@@ -5141,12 +5588,15 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         *canceled = true;
         return;
     }
-    if funnel_brass(&name).is_some() && held_item.is_none() {
-        // an empty hand turns the funnel between pulling in and taking out
+    if name == BURNER_BLOCK && held_item.is_some() {
+        if fresh_click(game, pos) && burner_click(game, pos) {
+            *canceled = true;
+            return;
+        }
+    }
+    if let Some(brass) = funnel_brass(&name) {
         if fresh_click(game, pos) {
-            let now = game.native_block_property(pos, "extracting").map(|v| v == "true").unwrap_or(false);
-            game.native_set_block_property(pos, "extracting", if now { "false" } else { "true" });
-            sfx(game, "minecraft:block.iron_trapdoor.open", pos, 0.4, 1.4);
+            funnel_click(game, pos, brass, held_item.as_deref());
         }
         *canceled = true;
         return;
@@ -5259,27 +5709,39 @@ pub fn submit(
         basin_submit(game, pos, entity, draw);
         return;
     }
+    if block == BURNER_BLOCK {
+        burner_submit(game, entity, draw);
+        return;
+    }
     if block == "create:mechanical_mixer" {
         mixer_submit(game, pos, state, entity, draw);
         return;
     }
     if block == DEPOT_BLOCK {
-        if let Some((item, count)) = depot_content(&entity.nbt) {
-            let stack = ItemStack { item: Arc::from(item.as_str()), count, damage: 0, extra: None };
-            let is_block = game.pack.assets.registry.default_state(&item).is_some();
-            for k in 0..stack_copies(count) {
-                let o = copy_offset(k, is_block);
-                draw.push();
-                if is_block {
-                    draw.translate([0.5 + o[0], 0.95 + o[1], 0.5 + o[2]]);
-                } else {
-                    // A flat item lies on the depot as in Create.
-                    draw.translate([0.5 + o[0], 0.84 + o[1], 0.5 + o[2]]);
-                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
-                }
-                game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
-                draw.pop();
+        let list = depot_list(&entity.nbt);
+        let n = list.len().min(DEPOT_SLOTS);
+        for (k, (item, count)) in list.iter().take(n).enumerate() {
+            let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
+            let [dx, dz] = depot_spot(n, k);
+            draw.push();
+            if flat_item(game, &stack) {
+                // A flat item lies on the depot as in Create.
+                draw.translate([0.5 + dx, 0.84, 0.5 + dz]);
+                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            } else {
+                // A solid item sits on the top of the depot (13 of 16), whatever its size.
+                let (lo, _) = game.resolve_item(&stack, DisplayContext::Ground, None, 0).bounding_box();
+                draw.translate([0.5 + dx, 0.8125 - lo.y + 0.005, 0.5 + dz]);
             }
+            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
+            draw.pop();
+        }
+        return;
+    }
+    if block == SPOUT {
+        let fl = get_text(&entity.nbt, "fl");
+        if get_int(&entity.nbt, "sw", 0) == 1 && !fl.is_empty() {
+            game.native_draw_block(draw, "create:spout_stream_part", &[("fluid", fl.as_str())]);
         }
         return;
     }
@@ -5359,19 +5821,26 @@ pub fn submit(
         game.native_draw_block(draw, "create:hose_coil_part", &[("facing", f.as_str())]);
         draw.pop();
         half_shaft(game, pos, cw(front), speed, draw);
-        let rope = (l - 1.0).ceil().max(0.0) as i32;
-        for k in 0..rope {
-            if game.native_block([pos[0], pos[1] - (k + 1), pos[2]]) == ROPE {
+        let whole = l.floor() as i32;
+        let part = l - whole as f32;
+        for k in 1..=whole {
+            if game.native_block([pos[0], pos[1] - k, pos[2]]) == ROPE {
                 continue;
             }
             draw.push();
-            draw.translate([0.0, -((k + 1) as f32), 0.0]);
+            draw.translate([0.0, -(k as f32), 0.0]);
             game.native_draw_block(draw, "create:hose_rope_part", &[]);
             draw.pop();
         }
-        if game.native_block([pos[0], pos[1] - 1 - (l.floor() as i32), pos[2]]) != MAGNET {
+        if part > 0.01 {
             draw.push();
             draw.translate([0.0, -l, 0.0]);
+            game.native_draw_block(draw, "create:hose_rope_part", &[]);
+            draw.pop();
+        }
+        if part > 0.01 || game.native_block([pos[0], pos[1] - 1 - whole, pos[2]]) != MAGNET {
+            draw.push();
+            draw.translate([0.0, -(l + 1.0), 0.0]);
             game.native_draw_block(draw, "create:hose_magnet_part", &[]);
             draw.pop();
         }
@@ -5383,10 +5852,18 @@ pub fn submit(
         if amt > 0 && !fl.is_empty() {
             let level = ((amt * 8 + TANK_CAP - 1) / TANK_CAP).clamp(1, 8).to_string();
             let mut ext = 0;
+            let layer = tank_layer(game, pos);
             for (bit, d) in [[-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]].iter().enumerate() {
-                if game.native_block(add3(pos, *d)) == TANK {
+                if layer.contains(&add3(pos, *d)) {
                     ext |= 1 << bit;
                 }
+            }
+            let has = |k: &str| game.native_block_state_property(state, k).map(|v| v.to_string() == "true").unwrap_or(false);
+            if has("bottom") {
+                ext |= 16;
+            }
+            if has("top") {
+                ext |= 32;
             }
             let ext = ext.to_string();
             game.native_draw_block(draw, "create:fluid_level_part", &[("ext", ext.as_str()), ("fluid", fl.as_str()), ("level", level.as_str())]);
@@ -5537,11 +6014,11 @@ pub fn submit(
         if let Some((item, count)) = shown.as_ref() {
             let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
             // sliding along the arrows to the last crafter, then shrinking away into it
-            let now = draw.game_time as f64 + f64::from(draw.partial);
+            let now = game.ticks as f64 + f64::from(draw.partial);
             let stamp = f64::from(get_int(&entity.nbt, "cs", 0));
             let cp = get_int(&entity.nbt, "cp", 0);
             let mut slide = [0.0f32; 3];
-            let mut grow = 0.6f32;
+            let mut grow = 1.15f32;
             if cp > 0 && now - stamp < 15.0 && pair_list(&entity.nbt, "co").is_empty() {
                 let pct = ((f64::from(cp) + f64::from(get_int(&entity.nbt, "cr", 0)) / 5.0 * (now - stamp)).min(100.0)) / 100.0;
                 let t = pct * f64::from(get_int(&entity.nbt, "ch", 1).max(1));
@@ -5567,7 +6044,7 @@ pub fn submit(
                     }
                     cur = next;
                 }
-                grow = 0.6 * (1.0 - ((pct - 0.85) / 0.15).clamp(0.0, 1.0)).max(0.02) as f32;
+                grow = 1.15 * (1.0 - ((pct - 0.85) / 0.15).clamp(0.0, 1.0)).max(0.02) as f32;
             }
             draw.push();
             draw.translate([0.5 + front[0] as f32 * 0.6 + slide[0], 0.5 + slide[1], 0.5 + front[2] as f32 * 0.6 + slide[2]]);
@@ -5904,7 +6381,7 @@ pub fn placement(
         let back_name = level.facts.get(level.block_state(back)).name.to_string();
         let extracting = back_name == BASIN_BLOCK || back_name == DEPOT_BLOCK || back_name == "create:belt";
         if let Some(s1) = level.native_state_with_property(state, "facing", facing) {
-            let s2 = if extracting { level.native_state_with_property(s1, "extracting", "true") } else { Some(s1) };
+            let s2 = if extracting { level.native_state_with_property(s1, "unloading", "true") } else { Some(s1) };
             if let Some(s) = s2 {
                 *answer = Some(Some(s));
             }
@@ -6669,3 +7146,5 @@ mod tests {
         assert_eq!(nearest_looking(0.0, 90.0), [0, -1, 0]);
     }
 }
+
+
