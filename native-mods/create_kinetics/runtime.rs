@@ -3128,11 +3128,7 @@ fn place_fluid(game: &mut Game<'_>, p: [i32; 3], fluid: &str) -> bool {
 // A block sound (source 4 is the block volume slider). A bucket sound for the fluid: lava has its own.
 fn sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
     let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
-    if game.native_window() {
-        let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
-    } else {
-        let _ = game.native_play_sound(sound, at, 4, volume, pitch);
-    }
+    let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
 }
 
 fn bucket_sfx(game: &mut Game<'_>, fluid: &str, fill: bool, pos: [i32; 3]) {
