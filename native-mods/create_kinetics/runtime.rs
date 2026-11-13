@@ -1,5 +1,3 @@
-
-
 // Create kinetics and fluids: shafts, cogwheels, large cogwheels, power sources (creative motor, hand
 // crank, water wheel), consumers (mechanical drill, mechanical press) and stress.
 // Injected as `crate::game::create_kinetics`. Each kinetic block has a block entity holding
@@ -38,6 +36,7 @@ const WHEEL_RPM: f32 = 8.0;
 const NET_LIMIT: usize = 2048;
 const DEPOT_BLOCK: &str = "create:depot";
 const DEPOT_BE: &str = "create:depot_be";
+const HANDLE_RPM: f32 = 16.0;
 // A flat item (a sheet, an ingot, a stick) lies down; an item with a solid model (a block) does not.
 fn flat_item(game: &Game<'_>, stack: &ItemStack) -> bool {
     !game.resolve_item(stack, DisplayContext::Ground, None, 0).uses_block_light()
@@ -58,7 +57,7 @@ fn depot_spot(n: usize, k: usize) -> [f32; 2] {
         _ => [0.22, 0.22],
     }
 }
-const HANDLE_RPM: f32 = 16.0;
+
 // The light a part of a solid block is drawn with: the brightest of the cells around it, in the packing
 // of BlockEntityDraw.light (16 times sky light in the low byte, 16 times block light in the next).
 fn open_light(game: &Game<'_>, pos: [i32; 3]) -> u32 {
@@ -75,21 +74,13 @@ fn open_light(game: &Game<'_>, pos: [i32; 3]) -> u32 {
     (sky * 16) | ((block * 16) << 8)
 }
 
-// A sound for this player (the window), at the centre of the block at `pos`.
-fn sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
-    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
-    let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
-}
-
-fn bucket_sfx(game: &mut Game<'_>, fluid: &str, fill: bool, pos: [i32; 3]) {
-    let lava = fluid.contains("lava");
-    let ev = match (fill, lava) {
-        (true, false) => "minecraft:item.bucket.fill",
-        (true, true) => "minecraft:item.bucket.fill_lava",
-        (false, false) => "minecraft:item.bucket.empty",
-        (false, true) => "minecraft:item.bucket.empty_lava",
-    };
-    sfx(game, ev, pos, 0.8, 1.0);
+// A small local particle (the window only).
+fn puff(game: &mut Game<'_>, kind: horizon_client::particles::ParticleType, at: [f64; 3]) {
+    use horizon_client::particles::ParticleOptions;
+    if !game.native_window() {
+        return;
+    }
+    game.particles.add(&ParticleOptions::simple(kind), at, [0.0, 0.05, 0.0]);
 }
 
 const FUNNEL_BE: &str = "create:funnel_be";
@@ -301,6 +292,7 @@ impl Node {
                 }
             }
             Kind::Hose => d == cw(self.front),
+            Kind::Mixer => false,
             Kind::Clutch if self.powered => false,
             Kind::Belt => self.shaft && unit && d[self.shaft_axis()] != 0,
             _ => unit && d[self.axis] != 0,
@@ -1361,8 +1353,6 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
 
 // ---- the blaze burner: fed with fuel it heats a basin above it ----
 
-// ---- the blaze burner: fed with fuel it heats a basin above it ----
-
 const BURNER_BLOCK: &str = "create:blaze_burner";
 const BURNER_BE: &str = "create:blaze_burner_be";
 
@@ -1569,44 +1559,39 @@ fn mixer_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
         return true;
     }
     put_f32(nbt, "mp", next);
+    if (next as i32) % 3 == 0 {
+        let at = [f64::from(basin[0]) + 0.5, f64::from(basin[1]) + 0.75, f64::from(basin[2]) + 0.5];
+        puff(game, horizon_client::particles::ParticleType::Splash, at);
+    }
     true
 }
 
-// The mixer on screen: the cog inside it, the pole through its top and the whisk below, going down
-// into the basin while it mixes.
+// The mixer on screen: its cog inside turns about the vertical axis whenever it is powered, the pole
+// comes through the top and the whisk below spins; while it mixes they go down into the basin.
 fn mixer_submit(
     game: &Game<'_>,
     pos: [i32; 3],
-    state: BlockStateId,
+    _state: BlockStateId,
     entity: &ModBlockEntity,
     draw: &mut BlockEntityDraw,
 ) {
     let speed = f64::from(get_f32(&entity.nbt, "speed"));
-    let mut axis = 0usize;
-    if let Some(value) = game.native_block_state_property(state, "facing") {
-        if let Some(front) = parse_dir(&value.to_string()) {
-            axis = axis_of(front);
-        }
-    }
     let t = draw.game_time as f64 + f64::from(draw.partial);
-    let across: i32 = (0..3).filter(|i| *i != axis).map(|i| pos[i]).sum();
-    let offset = if across % 2 == 0 { 22.5 } else { 0.0 };
-    let mut about = [0.0f32; 3];
-    about[axis] = 1.0;
+    let offset = if (pos[0] + pos[2]).rem_euclid(2) == 0 { 22.5 } else { 0.0 };
     draw.push();
-    draw.rotate_about(about, ((speed * 0.3 * t) % 360.0 + offset) as f32, [0.5, 0.5, 0.5]);
-    game.native_draw_block(draw, "create:mixer_cog_part", &[("axis", axis_char(axis))]);
+    draw.rotate_about([0.0, 1.0, 0.0], ((speed * 0.3 * t) % 360.0 + offset) as f32, [0.5, 0.5, 0.5]);
+    game.native_draw_block(draw, "create:mixer_cog_part", &[("axis", "y")]);
     draw.pop();
     let mp = f64::from(get_f32(&entity.nbt, "mp"));
     // down in the first fifth of the run, hold, up in the last fifth
     let lift = (mp.min(MIX_UNITS as f64 - mp) / 20.0).clamp(0.0, 1.0);
     let eased = lift * lift * (3.0 - 2.0 * lift);
-    let drop = (eased * 0.94) as f32;
+    let drop = (eased * 1.3) as f32;
     draw.push();
     draw.translate([0.0, -drop, 0.0]);
     game.native_draw_block(draw, "create:mixer_pole_part", &[]);
     draw.pop();
-    let spin = if mp > 0.0 { (t * speed * 0.6) % 360.0 } else { 0.0 };
+    let spin = (t * speed * 0.6) % 360.0;
     draw.push();
     draw.translate([0.0, -drop, 0.0]);
     draw.rotate_about([0.0, 1.0, 0.0], spin as f32, [0.5, 0.5, 0.5]);
@@ -1839,8 +1824,11 @@ fn pressing(item: &str) -> Option<&'static str> {
 fn pressable_below(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     for below in [1, 2] {
         let p = [pos[0], pos[1] - below, pos[2]];
-        if let Some(Some((item, _))) = depot_at(game, p) {
-            if pressing(&item).is_some() {
+        if game.native_block(p) == DEPOT_BLOCK {
+            let any = game
+                .native_with_mod_block_entity(p, |e| depot_list(&e.nbt).iter().any(|st| pressing(&st.0).is_some()))
+                .unwrap_or(false);
+            if any {
                 return true;
             }
         }
@@ -1900,16 +1888,41 @@ fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
             return true;
         }
     }
-    if let Some(Some((item, count))) = depot_at(game, p) {
-        if let Some(result) = pressing(&item) {
-            // one item at a time: a stack keeps the rest and the pressed item pops out beside it
-            if count > 1 {
-                depot_set(game, p, Some((item.clone(), count - 1)));
-                let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5];
-                game.spawn_item(stack_of(result, 1), at, [0.12, 0.15, 0.0], 10);
-            } else {
-                depot_set(game, p, Some((result.to_string(), 1)));
-            }
+    if game.native_block(p) == DEPOT_BLOCK {
+        let (hit, spill) = game
+            .native_with_mod_block_entity(p, |e| {
+                let mut list = depot_list(&e.nbt);
+                let mut hit = false;
+                let mut spill: Option<String> = None;
+                for i in 0..list.len() {
+                    if let Some(r) = pressing(&list[i].0) {
+                        // one item at a time: the rest of the stack stays, the pressed item takes a slot
+                        if list[i].1 > 1 {
+                            list[i].1 -= 1;
+                            if list.len() < DEPOT_SLOTS {
+                                list.push((r.to_string(), 1));
+                            } else {
+                                spill = Some(r.to_string());
+                            }
+                        } else {
+                            list[i].0 = r.to_string();
+                        }
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
+                    depot_store(&mut e.nbt, &list);
+                }
+                (hit, spill)
+            })
+            .unwrap_or((false, None));
+        if let Some(r) = spill {
+            let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5];
+            game.spawn_item(stack_of(&r, 1), at, [0.12, 0.15, 0.0], 10);
+        }
+        if hit {
+            game.native_block_entity_sync(p);
             return true;
         }
     }
@@ -2008,7 +2021,7 @@ fn is_air(name: &str) -> bool {
     name == "minecraft:air" || name == "minecraft:cave_air" || name == "minecraft:void_air"
 }
 
-const BELT_GAP: f32 = 0.25;
+const BELT_GAP: f32 = 0.5;
 const BELT_MAX: usize = 4;
 const BELT_TOP: f32 = 0.83;
 
@@ -2132,8 +2145,13 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
             return true;
         }
     }
-    if depot_at(game, next).is_some() {
-        return depot_push_all(game, next, &item.item, item.count);
+    match depot_at(game, next) {
+        Some(None) => {
+            depot_set(game, next, Some((item.item.clone(), item.count)));
+            return true;
+        }
+        Some(Some(_)) => return false,
+        None => {}
     }
     // A basin ahead takes the stack as ingredients when all of it fits.
     if game.native_block(next) == BASIN_BLOCK {
@@ -2147,6 +2165,11 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
             .unwrap_or(false);
         return fits && storage_give(game, next, &item.item, item.count) == item.count;
     }
+    // Anything else solid ahead holds the stack at the end of the piece. Only the open air lets it
+    // fall off, otherwise it would land back on the belt and be taken up again, a pop back.
+    if !is_air(&game.native_block(next)) {
+        return false;
+    }
     let s = f64::from(sign);
     let edge = [
         f64::from(pos[0]) + 0.5 + f64::from(me.front[0]) * s * 0.6,
@@ -2158,11 +2181,6 @@ fn belt_hand_over(game: &mut Game<'_>, pos: [i32; 3], me: &Node, sign: f32, item
         if bucket_fluid(&item.item).is_some() && drain_accept(game, next, &item.item) {
             return true;
         }
-    }
-    // Anything else solid ahead holds the stack at the end of the piece. Only the open air lets it
-    // fall off, otherwise it would land back on the belt and be taken up again, a pop back.
-    if !is_air(&game.native_block(next)) {
-        return false;
     }
     game.spawn_item(stack_of(&item.item, item.count), edge, push, 20);
     true
@@ -3101,6 +3119,31 @@ fn place_fluid(game: &mut Game<'_>, p: [i32; 3], fluid: &str) -> bool {
     let Some(st) = game.pack.assets.registry.default_state(name) else { return false };
     let dim = game.dim.id().to_string();
     game.native_set_block(&dim, p, st, 3)
+}
+
+// ---- the pump ----
+
+// One step of a turning pump (every second tick, server side): draws fluid in from the ends at its
+// back, hands it on to the ends at its front. The pump keeps a small buffer in its block entity.
+// A block sound (source 4 is the block volume slider). A bucket sound for the fluid: lava has its own.
+fn sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    if game.native_window() {
+        let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
+    } else {
+        let _ = game.native_play_sound(sound, at, 4, volume, pitch);
+    }
+}
+
+fn bucket_sfx(game: &mut Game<'_>, fluid: &str, fill: bool, pos: [i32; 3]) {
+    let lava = fluid.contains("lava");
+    let ev = match (fill, lava) {
+        (true, false) => "minecraft:item.bucket.fill",
+        (true, true) => "minecraft:item.bucket.fill_lava",
+        (false, false) => "minecraft:item.bucket.empty",
+        (false, true) => "minecraft:item.bucket.empty_lava",
+    };
+    sfx(game, ev, pos, 0.8, 1.0);
 }
 
 fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, speed: f32) {
@@ -4158,7 +4201,7 @@ fn mill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32)
                     timer -= rate;
                     if timer > 0 && (game.ticks as i64 + i64::from(pos[0])).rem_euclid(3) == 0 {
                         let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
-                        puff(game, at, Some(&item), 3);
+                        spray(game, at, Some(&item), 3);
                     }
                     if timer <= 0 {
                         let rolled = roll_outputs(game, pos, &rec, 1);
@@ -4311,7 +4354,7 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
         game.destroy_block_progress(id, target, progress.clamp(1, 10) - 1);
         if (game.ticks as i64 + i64::from(pos[0])).rem_euclid(2) == 0 {
             let at = [f64::from(target[0]) + 0.5, f64::from(target[1]) + 0.5, f64::from(target[2]) + 0.5];
-            puff(game, at, Some(&name), 4);
+            spray(game, at, Some(&name), 4);
         }
         return;
     }
@@ -4359,7 +4402,7 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
     }
 }
 
-fn puff(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
+fn spray(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
     let options = match item {
         Some(i) => game.item_particle(&stack_of(i, 1)),
         None => horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke),
@@ -4390,8 +4433,9 @@ fn put_on(game: &mut Game<'_>, target: [i32; 3], item: &str, count: u32) -> bool
         game.native_block_entity_sync(target);
         return true;
     }
-    if depot_at(game, target).is_some() {
-        return depot_push_all(game, target, item, count);
+    if let Some(None) = depot_at(game, target) {
+        depot_set(game, target, Some((item.to_string(), count)));
+        return true;
     }
     false
 }
@@ -4407,8 +4451,13 @@ fn saw_eject(game: &mut Game<'_>, pos: [i32; 3], m: [i32; 3], item: &str, count:
         game.native_block_entity_sync(target);
         return true;
     }
-    if depot_at(game, target).is_some() {
-        return depot_push_all(game, target, item, count);
+    match depot_at(game, target) {
+        Some(None) => {
+            depot_set(game, target, Some((item.to_string(), count)));
+            return true;
+        }
+        Some(Some(_)) => return false,
+        None => {}
     }
     let at = [
         f64::from(pos[0]) + 0.5 + f64::from(m[0]) * 0.7,
@@ -4486,7 +4535,7 @@ fn saw_top(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, sp
             timer -= ((speed.abs() / 16.0) as i32).clamp(1, 512);
             if phase % 2 == 0 {
                 let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.05, f64::from(pos[2]) + 0.5];
-                puff(game, at, Some(&item), 3);
+                spray(game, at, Some(&item), 3);
                 let total = get_int(nbt, "sm", 1).max(1);
                 put_int(nbt, "sp", (100 * (total - timer.max(0)) / total).clamp(0, 100));
                 changed = true;
@@ -4690,7 +4739,7 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
                 if game.native_set_item_entity(&dim, e.id, gone) {
                     queue.push((name.clone(), e.stack.count, rec.time as f32));
                     changed = true;
-                    puff(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.8, f64::from(g[2]) + 0.5], Some(&name), 6);
+                    spray(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.8, f64::from(g[2]) + 0.5], Some(&name), 6);
                 }
             }
         }
@@ -4700,7 +4749,7 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
             let left = left - rate;
             if left > 0.0 {
                 if (game.ticks as i64).rem_euclid(3) == 0 {
-                    puff(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(&item), 3);
+                    spray(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(&item), 3);
                 }
                 keep.push((item, count, left));
                 continue;
@@ -4709,7 +4758,7 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
                 let outs = roll_outputs(game, g, &rec, count);
                 let at = [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.2, f64::from(g[2]) + 0.5];
                 for o in outs {
-                    puff(game, at, Some(&o.0), 6);
+                    spray(game, at, Some(&o.0), 6);
                     let n = o.1.min(99);
                     if !put_on(game, [g[0], g[1] - 1, g[2]], &o.0, n) {
                         game.spawn_item(stack_of(&o.0, n), at, [0.0, -0.1, 0.0], 10);
@@ -5588,18 +5637,18 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         *canceled = true;
         return;
     }
-    if name == BURNER_BLOCK && held_item.is_some() {
-        if fresh_click(game, pos) && burner_click(game, pos) {
-            *canceled = true;
-            return;
-        }
-    }
     if let Some(brass) = funnel_brass(&name) {
         if fresh_click(game, pos) {
             funnel_click(game, pos, brass, held_item.as_deref());
         }
         *canceled = true;
         return;
+    }
+    if name == BURNER_BLOCK && held_item.is_some() {
+        if fresh_click(game, pos) && burner_click(game, pos) {
+            *canceled = true;
+            return;
+        }
     }
     if name == "create:belt" && held_item.is_some() {
         if fresh_click(game, pos) {
@@ -5723,18 +5772,24 @@ pub fn submit(
         for (k, (item, count)) in list.iter().take(n).enumerate() {
             let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
             let [dx, dz] = depot_spot(n, k);
-            draw.push();
-            if flat_item(game, &stack) {
-                // A flat item lies on the depot as in Create.
-                draw.translate([0.5 + dx, 0.84, 0.5 + dz]);
-                draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            let flat = flat_item(game, &stack);
+            // a flat item lies on the depot as in Create; a solid item sits on its top (13 of 16)
+            let top = if flat {
+                0.84
             } else {
-                // A solid item sits on the top of the depot (13 of 16), whatever its size.
                 let (lo, _) = game.resolve_item(&stack, DisplayContext::Ground, None, 0).bounding_box();
-                draw.translate([0.5 + dx, 0.8125 - lo.y + 0.005, 0.5 + dz]);
+                0.8125 - lo.y + 0.005
+            };
+            for c in 0..stack_copies(*count) {
+                let o = copy_offset(c, !flat);
+                draw.push();
+                draw.translate([0.5 + dx + o[0], top + o[1], 0.5 + dz + o[2]]);
+                if flat {
+                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                }
+                game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32) ^ (c as i32));
+                draw.pop();
             }
-            game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
-            draw.pop();
         }
         return;
     }
@@ -6297,6 +6352,10 @@ pub fn nearest_looking(yaw: f32, pitch: f32) -> [i32; 3] {
 fn node_from_state(level: &GameLevel<'_>, state: BlockStateId) -> Option<Node> {
     let name = level.facts.get(state).name.to_string();
     let kind = kind_of(&name)?;
+    if kind == Kind::Mixer {
+        // the mixer has no facing: its cog turns about the vertical axis
+        return Some(Node::new(kind, 1, [0; 3]));
+    }
     let props = &level.registry.state(state)?.properties;
     if kind == Kind::Millstone {
         return Some(Node::new(kind, 1, [0; 3]));
@@ -6389,6 +6448,9 @@ pub fn placement(
         return;
     }
     let Some(kind) = kind_of(&name) else { return };
+    if kind == Kind::Mixer {
+        return;
+    }
     let at = context.pos;
     let look = nearest_looking(context.yaw, context.pitch);
     let mut feeding: Vec<[i32; 3]> = Vec::new();
@@ -6514,7 +6576,7 @@ pub fn placement(
             Kind::Motor => neg(look),
             Kind::Crank | Kind::Handle => neg(look),
             Kind::Drill => look,
-            Kind::Press | Kind::Mixer => {
+            Kind::Press => {
                 let mut h = look;
                 if h[1] != 0 {
                     h = [0, 0, 1];
@@ -7146,5 +7208,3 @@ mod tests {
         assert_eq!(nearest_looking(0.0, 90.0), [0, -1, 0]);
     }
 }
-
-
