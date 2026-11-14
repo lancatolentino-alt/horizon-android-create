@@ -1899,7 +1899,8 @@ fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
                         // one item at a time: the rest of the stack stays, the pressed item takes a slot
                         if list[i].1 > 1 {
                             list[i].1 -= 1;
-                            if list.len() < DEPOT_SLOTS {
+                            let joins = list.iter().any(|st| st.0 == r && st.1 < 64);
+                            if joins || list.len() < DEPOT_SLOTS {
                                 list.push((r.to_string(), 1));
                             } else {
                                 spill = Some(r.to_string());
@@ -1912,6 +1913,7 @@ fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
                     }
                 }
                 if hit {
+                    merge_same(&mut list);
                     depot_store(&mut e.nbt, &list);
                 }
                 (hit, spill)
@@ -1987,6 +1989,25 @@ fn press_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
 
 // Create draws a stack lying on a belt, depot or saw as several copies: one for a single item, then one
 // more for each doubling, up to five. Copy k sits a little apart from the first.
+// Slots holding the same item are joined, up to 64 in each.
+fn merge_same(list: &mut Vec<(String, u32)>) {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for (item, count) in list.drain(..) {
+        let mut left = count;
+        for e in out.iter_mut() {
+            if e.0 == item && e.1 < 64 && left > 0 {
+                let add = (64 - e.1).min(left);
+                e.1 += add;
+                left -= add;
+            }
+        }
+        if left > 0 {
+            out.push((item, left));
+        }
+    }
+    *list = out;
+}
+
 fn stack_copies(count: u32) -> u32 {
     if count <= 1 {
         1
@@ -3233,24 +3254,27 @@ fn pump_step(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
         }
     }
     // hand on to tanks and spouts at the front
+    // the fluid is shared out evenly between the tanks and spouts at the front, not poured into the first
     let mut give = rate.min(amt);
-    for c in outs.tanks.iter() {
+    let targets: Vec<[i32; 3]> = outs.tanks.iter().filter(|c| !in_cells.contains(*c)).copied().collect();
+    let mut targets_left = targets.len() as i32;
+    for c in targets.iter() {
         if give <= 0 {
             break;
         }
-        if in_cells.contains(c) {
-            continue;
-        }
         let pool = pool_of(game, *c);
         if pool.cells.iter().any(|x| in_cells.contains(x)) {
+            targets_left -= 1;
             continue;
         }
-        let put = pool_put(game, &pool, &fluid, give);
+        let share = ((give + targets_left - 1) / targets_left.max(1)).max(1);
+        let put = pool_put(game, &pool, &fluid, share);
         amt -= put;
         give -= put;
         if put > 0 {
             moved = true;
         }
+        targets_left -= 1;
     }
     // place a source block at an open end at the front once a bucket is ready
     if amt >= BUCKET && !fluid.is_empty() {
@@ -5960,9 +5984,10 @@ pub fn submit(
         let part = game.native_block_state_property(state, "part").map(|v| v.to_string()).unwrap_or_default();
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         if part == "start" || part == "middle" || part == "end" {
-            // The belt surface is one of eight pictures, each shifted a little further along the belt.
+            // The belt surface is one of sixteen pictures, each shifted a pixel further along the belt.
             let t = draw.game_time as f64 + f64::from(draw.partial);
-            let frame = ((-t * speed / 60.0).floor() as i64).rem_euclid(8).to_string();
+            let flip = f64::from(belt_flip(front));
+            let frame = ((-flip * t * speed / 30.0).floor() as i64).rem_euclid(16).to_string();
             game.native_draw_block(
                 draw,
                 "create:belt_part",
