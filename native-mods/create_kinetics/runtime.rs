@@ -4219,10 +4219,6 @@ fn mill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32)
                     }
                     let rate = ((speed.abs() / 16.0) as i32).clamp(1, 512);
                     timer -= rate;
-                    if timer > 0 && (game.ticks as i64 + i64::from(pos[0])).rem_euclid(3) == 0 {
-                        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
-                        spray(game, at, Some(&item), 3);
-                    }
                     if timer <= 0 {
                         let rolled = roll_outputs(game, pos, &rec, 1);
                         let mut outs = pair_list(nbt, "mo");
@@ -4372,10 +4368,6 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
     let id = drill_id(pos);
     if progress < 10 {
         game.destroy_block_progress(id, target, progress.clamp(1, 10) - 1);
-        if (game.ticks as i64 + i64::from(pos[0])).rem_euclid(2) == 0 {
-            let at = [f64::from(target[0]) + 0.5, f64::from(target[1]) + 0.5, f64::from(target[2]) + 0.5];
-            spray(game, at, Some(&name), 4);
-        }
         return;
     }
     put_int(nbt, "bp", 0);
@@ -4423,6 +4415,9 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
 }
 
 fn spray(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
+    if !game.native_window() {
+        return;
+    }
     let options = match item {
         Some(i) => game.item_particle(&stack_of(i, 1)),
         None => horizon_client::particles::ParticleOptions::simple(horizon_client::particles::ParticleType::Smoke),
@@ -4437,10 +4432,55 @@ fn spray(game: &mut Game<'_>, at: [f64; 3], item: Option<&str>, count: u32) {
         let e = f64::from(pseudo(game, cell, k * 7 + 5)) - 0.5;
         let pos = [at[0] + a * 0.5, at[1] + b * 0.2, at[2] + c * 0.5];
         let vel = [d * 0.12, 0.05 + e * 0.05, c * 0.12];
-        // always shown: the particle setting and the distance limiter do not drop these
         game.particles.add_with(&options, pos, vel, true, true);
     }
     game.particles.add_with(&smoke, at, [0.0, 0.03, 0.0], true, true);
+}
+
+// What the player sees of the millstone, the saw and the crushing wheels: item particles while they work and
+// the crack on the log the saw is cutting. It runs in the window game from what the server sends over, so the
+// machines show it whichever game does the work.
+fn client_fx(game: &mut Game<'_>, pos: [i32; 3], nbt: &Compound) {
+    let name = game.native_block(pos);
+    if name != "create:millstone" && name != "create:mechanical_saw" && name != "create:crushing_wheel" {
+        return;
+    }
+    let speed = get_f32(nbt, "speed");
+    if speed.abs() < 1.0 {
+        return;
+    }
+    let phase = (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(3);
+    let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+    if name == "create:millstone" {
+        if phase == 0 {
+            if let Some((item, _)) = pair_list(nbt, "mi").first() {
+                spray(game, [x + 0.5, y + 1.0, z + 0.5], Some(item), 3);
+            }
+        }
+    } else if name == "create:mechanical_saw" {
+        if phase == 0 {
+            if let Some((item, _)) = pair_list(nbt, "si").first() {
+                spray(game, [x + 0.5, y + 1.05, z + 0.5], Some(item), 3);
+            }
+        }
+        let bp = get_int(nbt, "bp", 0);
+        if bp > 0 {
+            let target = [get_int(nbt, "bx", pos[0]), get_int(nbt, "by", pos[1]), get_int(nbt, "bz", pos[2])];
+            game.destroy_block_progress(drill_id(pos), target, bp.clamp(1, 10) - 1);
+            if phase == 0 {
+                let log = game.native_block(target);
+                spray(game, [f64::from(target[0]) + 0.5, f64::from(target[1]) + 0.5, f64::from(target[2]) + 0.5], Some(&log), 4);
+            }
+        }
+    } else if phase == 0 {
+        if let Some((item, _, _)) = triple_list(nbt, "cq").first() {
+            if let Some(me) = node_at(game, pos) {
+                if let Some((g, _, _)) = crusher_gap(game, pos, &me) {
+                    spray(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(item), 3);
+                }
+            }
+        }
+    }
 }
 
 // Puts a stack on a belt piece (a free spot) or a free depot; false when there is neither.
@@ -4554,8 +4594,6 @@ fn saw_top(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, sp
             }
             timer -= ((speed.abs() / 16.0) as i32).clamp(1, 512);
             if phase % 2 == 0 {
-                let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.05, f64::from(pos[2]) + 0.5];
-                spray(game, at, Some(&item), 3);
                 let total = get_int(nbt, "sm", 1).max(1);
                 put_int(nbt, "sp", (100 * (total - timer.max(0)) / total).clamp(0, 100));
                 changed = true;
@@ -4594,8 +4632,9 @@ fn saw_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, s
         return false;
     }
     let target = [pos[0] + me.front[0], pos[1] + me.front[1], pos[2] + me.front[2]];
+    let before = get_int(nbt, "bp", 0);
     saw_tree(game, pos, nbt, target, speed);
-    false
+    get_int(nbt, "bp", 0) != before
 }
 
 // ---- the crushing wheels ----
@@ -4768,9 +4807,6 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
         for (item, count, left) in queue.drain(..) {
             let left = left - rate;
             if left > 0.0 {
-                if (game.ticks as i64).rem_euclid(3) == 0 {
-                    spray(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(&item), 3);
-                }
                 keep.push((item, count, left));
                 continue;
             }
@@ -5154,6 +5190,9 @@ pub fn ticks(block: &str, ticks: &mut bool) {
 }
 
 pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+    if game.native_window() {
+        client_fx(game, pos, &entity.nbt);
+    }
     if entity.id == FLUID_BE {
         fluid_tick(game, pos, entity);
         return;
@@ -5373,8 +5412,12 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         let bi = get_text(&entity.nbt, "bi");
         c.insert(JavaString::from("bi"), Tag::String(JavaString::from(bi.as_str())));
         put_int(&mut c, "sp", get_int(&entity.nbt, "sp", 0));
-        for key in ["cp", "cr", "ch", "cs"] {
+        for key in ["cp", "cr", "ch", "cs", "bp", "bx", "by", "bz"] {
             put_int(&mut c, key, get_int(&entity.nbt, key, 0));
+        }
+        for key in ["mi", "cq"] {
+            let text = get_text(&entity.nbt, key);
+            c.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
         }
         for key in ["ci", "si", "co"] {
             let text = get_text(&entity.nbt, key);
