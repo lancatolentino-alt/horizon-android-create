@@ -148,7 +148,7 @@ pub fn kind_of(block: &str) -> Option<Kind> {
 
 impl Kind {
     fn uses_facing(self) -> bool {
-        matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Drill | Kind::Press | Kind::Mixer | Kind::Belt | Kind::Pump | Kind::Handle | Kind::Hose | Kind::Saw | Kind::Crafter)
+        matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Drill | Kind::Press | Kind::Belt | Kind::Pump | Kind::Handle | Kind::Hose | Kind::Saw | Kind::Crafter)
     }
     fn is_source(self) -> bool {
         matches!(self, Kind::Motor | Kind::Crank | Kind::Wheel | Kind::Handle)
@@ -558,6 +558,10 @@ fn set_state(n: &mut Compound, speed: f32, hops: i32, parent: Option<[i32; 3]>) 
 
 fn node_at(game: &Game<'_>, p: [i32; 3]) -> Option<Node> {
     let kind = kind_of(&game.native_block(p))?;
+    if kind == Kind::Mixer {
+        // the mixer has no facing or axis property: its cog turns about the vertical axis
+        return Some(Node::new(kind, 1, [0; 3]));
+    }
     if kind == Kind::Millstone {
         return Some(Node::new(kind, 1, [0; 3]));
     }
@@ -1297,7 +1301,9 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         return false;
     }
     let attached = [pos[0] - facing[0], pos[1] - facing[1], pos[2] - facing[2]];
-    let mouth = [pos[0] + facing[0], pos[1] + facing[1], pos[2] + facing[2]];
+    let on_belt = game.native_block_property(pos, "on_belt").map(|v| v == "true").unwrap_or(false);
+    // a belt funnel works on the belt below it instead of the block in front
+    let mouth = if on_belt { [pos[0], pos[1] - 1, pos[2]] } else { [pos[0] + facing[0], pos[1] + facing[1], pos[2] + facing[2]] };
     // the brass funnel has a filter item and a count; the andesite one takes anything, one at a time
     let filter = if brass { get_text(nbt, "flt") } else { String::new() };
     let amount = if brass { get_int(nbt, "cnt", 16).clamp(1, 64) as u32 } else { 1 };
@@ -1437,10 +1443,40 @@ fn burner_submit(game: &Game<'_>, entity: &ModBlockEntity, draw: &mut BlockEntit
     };
     let t = draw.game_time as f64 + f64::from(draw.partial);
     let bob = (0.02 * (t * 0.08).sin()) as f32;
+    // the flame rods around the blaze: short while it idles, tall while it burns, white-hot when superheated
+    let rods = if fuel <= 0 {
+        "create:blaze_rods_small_part"
+    } else if get_int(&entity.nbt, "sup", 0) == 1 {
+        "create:blaze_rods_super_part"
+    } else if fuel > 2000 {
+        "create:blaze_rods_large_part"
+    } else {
+        "create:blaze_rods_small_part"
+    };
     draw.push();
     draw.translate([0.0, bob, 0.0]);
     game.native_draw_block(draw, part, &[]);
     draw.pop();
+    game.native_draw_block(draw, rods, &[]);
+}
+
+const EMPTY_BURNER: &str = "create:empty_blaze_burner";
+
+// A blaze spawn egg on an empty blaze burner puts a blaze in it (Create catches one with the burner; there is
+// no hook for using an item on a mob here). True when it was done.
+fn burner_fill(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    let Some(h) = game.held().cloned() else { return false };
+    if &*h.item != "minecraft:blaze_spawn_egg" || h.count == 0 {
+        return false;
+    }
+    let Some(state) = game.pack.assets.registry.default_state(BURNER_BLOCK) else { return false };
+    let dim = game.dim.id().to_string();
+    if !game.native_set_block(&dim, pos, state, 3) {
+        return false;
+    }
+    take_held(game, 1);
+    sfx(game, "minecraft:entity.blaze.ambient", pos, 0.8, 1.0);
+    true
 }
 
 // ---- the mixer: two blocks above a basin it mixes what lies in it ----
@@ -5707,6 +5743,17 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
         *canceled = true;
         return;
     }
+    if name == EMPTY_BURNER {
+        if fresh_click(game, pos) {
+            if burner_fill(game, pos) {
+                *canceled = true;
+                return;
+            }
+        } else {
+            *canceled = true;
+            return;
+        }
+    }
     if name == BURNER_BLOCK && held_item.is_some() {
         if fresh_click(game, pos) && burner_click(game, pos) {
             *canceled = true;
@@ -6505,7 +6552,14 @@ pub fn placement(
         let extracting = back_name == BASIN_BLOCK || back_name == DEPOT_BLOCK || back_name == "create:belt";
         if let Some(s1) = level.native_state_with_property(state, "facing", facing) {
             let s2 = if extracting { level.native_state_with_property(s1, "unloading", "true") } else { Some(s1) };
-            if let Some(s) = s2 {
+            // sideways above a belt: a belt funnel, working on the belt below
+            let below = BlockPos::new(context.pos.x, context.pos.y - 1, context.pos.z);
+            let below_name = level.facts.get(level.block_state(below)).name.to_string();
+            let s3 = match s2 {
+                Some(st) if normal[1] == 0 && below_name == "create:belt" => level.native_state_with_property(st, "on_belt", "true"),
+                other => other,
+            };
+            if let Some(s) = s3 {
                 *answer = Some(Some(s));
             }
         }
