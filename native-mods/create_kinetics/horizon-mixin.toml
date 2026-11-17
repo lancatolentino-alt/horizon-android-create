@@ -191,3 +191,26 @@ bindings = [
   { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
   { name = "button", ty = "i32", value = "button" },
 ]
+
+[[injection]]
+id = "client-tick"
+hook = "tick"
+hook_version = 1
+kind = "HEAD"
+helper = "client_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+[[injection]]
+id = "block-entity-bounds"
+hook = "block_entity_render_bounding_box"
+hook_version = 1
+kind = "HEAD"
+helper = "bounds.rs"
+bindings = [
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "block", ty = "&str", value = "block" },
+  { name = "entity", ty = "&horizon_client::containers::ModBlockEntity", value = "entity" },
+  { name = "bounds", ty = "&mut [f32; 6]", value = "&mut *bounds" },
+]
