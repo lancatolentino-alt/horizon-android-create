@@ -4678,6 +4678,29 @@ fn crusher_gap_view(game: &Game<'_>, pos: [i32; 3], axis: usize) -> Option<[i32;
     None
 }
 
+// Machines being drawn that are working, with the state the server sent: in single player the block entities
+// tick in the server game but are seen in the window game, so the drawing hands what to show over to the
+// window game's own tick (client_tick), which runs on the game that can show particles and cracks.
+static FX: Mutex<Vec<([i32; 3], Compound)>> = Mutex::new(Vec::new());
+
+fn fx_register(pos: [i32; 3], nbt: &Compound) {
+    if let Ok(mut g) = FX.lock() {
+        if g.len() < 96 && !g.iter().any(|e| e.0 == pos) {
+            g.push((pos, nbt.clone()));
+        }
+    }
+}
+
+fn fx_tick(game: &mut Game<'_>) {
+    let list = match FX.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => return,
+    };
+    for (pos, nbt) in list.iter() {
+        client_fx(game, *pos, nbt);
+    }
+}
+
 // What the player sees of the millstone, the saw and the crushing wheels: item particles while they work and
 // the crack on the log the saw is cutting. It runs in the window game from what the server sends over, so the
 // machines show it whichever game does the work.
@@ -4716,7 +4739,7 @@ fn client_fx(game: &mut Game<'_>, pos: [i32; 3], nbt: &Compound) {
     } else if phase == 0 {
         if let Some((item, _, _)) = triple_list(nbt, "cq").first() {
             if let Some(me) = node_at(game, pos) {
-                if let Some((g, _, _)) = crusher_gap(game, pos, &me) {
+                if let Some(g) = crusher_gap_view(game, pos, me.axis) {
                     spray(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(item), 3);
                 }
             }
@@ -7228,7 +7251,7 @@ fn actors_drive(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Nod
         let heard = [f64::from(target[0]) + 0.5, f64::from(target[1]) + 0.5, f64::from(target[2]) + 0.5];
         // the hit sound of the sound group of the block itself (volume 0.25, pitch 1, as Java)
         let hit = facts.sounds.hit.to_string();
-        let _ = game.native_play_sound(&hit, heard, 4, 0.25, 1.0);
+        let _ = game.native_play_local_sound(&hit, heard, 0.25, 1.0, 0);
         if actor.progress >= 10 {
             game.destroy_block_progress(id, target, -1);
             // a column of falling blocks above goes first
@@ -7293,6 +7316,7 @@ pub fn client_tick(game: &mut Game<'_>) {
     if !game.native_window() {
         return;
     }
+    fx_tick(game);
     let Some(p) = game.native_player() else { return };
     let mut kick = [0.0f32; 3];
     let mut any = false;
@@ -8449,6 +8473,7 @@ pub fn submit(
         game.native_draw_block(draw, "create:millstone_inner_part", &[]);
         draw.pop();
         if speed.abs() >= 1.0 {
+            fx_register(pos, &entity.nbt);
             if let Some((item, _)) = pair_list(&entity.nbt, "mi").first() {
                 crumbs(game, draw, item, [0.5, 1.0, 0.5], 7, pos[0] * 31 + pos[2]);
             }
@@ -8471,6 +8496,7 @@ pub fn submit(
         game.native_draw_block(draw, "create:crushing_wheel_part", &[("axis", value.as_str())]);
         draw.pop();
         if speed.abs() >= 1.0 {
+            fx_register(pos, &entity.nbt);
             if let Some((item, _, _)) = triple_list(&entity.nbt, "cq").first() {
                 if let Some(g) = crusher_gap_view(game, pos, axis) {
                     let at = [(g[0] - pos[0]) as f32 + 0.5, (g[1] - pos[1]) as f32 + 1.0, (g[2] - pos[2]) as f32 + 0.5];
@@ -8583,6 +8609,7 @@ pub fn submit(
             }
         }
         if speed.abs() >= 1.0 {
+            fx_register(pos, &entity.nbt);
             let seed = pos[0] * 31 + pos[2];
             if let Some((item, _)) = pair_list(&entity.nbt, "si").first() {
                 crumbs(game, draw, item, [0.5, BELT_TOP + 0.05, 0.5], 6, seed);
@@ -9954,7 +9981,8 @@ fn fan_tick(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], speed: f32) {
         fan_item(game, id, kind);
     }
     fan_entities(game, front, about, &cur, lo, hi, center);
-    fan_air_particles(game, front, about, &cur, center);
+    fan_air_particles(game, pos, front, &cur, center);
+    fan_steer_particles(game, pos, front, &cur, lo, hi, center);
     // depots and belts in the current, or under it when it blows sideways
     let limit = cur.reach.ceil() as i32;
     for i in 1..=limit {
@@ -9993,10 +10021,13 @@ fn haunt_set(id: u32, n: i32) {
 }
 
 // The damage type a fan hurts a player with: the Create one when the pack carries it, else the vanilla one.
+// Create fan_lava and fan_fire are fire damage that ignores armor, burning effects, no exhaustion, scaled by
+// difficulty only when a living non player causes it. The engine damage list comes from the vanilla game and cannot
+// take mod types, so the player is hurt with minecraft:on_fire, which has exactly those properties and tags
+// (is_fire and bypasses_armor). Only the death message text differs.
 fn fan_hurt_player(game: &mut Game<'_>, kind: u8, amount: f32) {
-    let (own, plain) = if kind == 2 { ("create:fan_lava", "minecraft:lava") } else { ("create:fan_fire", "minecraft:in_fire") };
-    let name = if game.motion.health.damage.id(own).is_some() { own } else { plain };
-    game.hurt_player_by(name, amount);
+    let _ = kind;
+    game.hurt_player_by("minecraft:on_fire", amount);
 }
 
 fn fan_plain(game: &mut Game<'_>, at: [f64; 3], sound: &str, volume: f32, pitch: f32) {
@@ -10018,7 +10049,7 @@ fn fan_mob_effect(game: &mut Game<'_>, i: usize, kind: u8) {
         }
         2 | 3 => {
             if !game.mobs[i].kind.flags.fire_immune {
-                let (seconds, amount, damage) = if kind == 2 { (10, 4.0, DamageKind::Lava) } else { (2, 2.0, DamageKind::InFire) };
+                let (seconds, amount, damage) = if kind == 2 { (10, 4.0, DamageKind::OnFire) } else { (2, 2.0, DamageKind::OnFire) };
                 game.mobs[i].ignite_for_ticks(seconds * 20);
                 game.mobs[i].damage(amount, Damage::of(damage));
             }
@@ -10200,61 +10231,109 @@ fn fan_mix(a: u32, b: u32, t: f32) -> [f32; 3] {
     [channel(16), channel(8), channel(0)]
 }
 
-// AirCurrent.tick and AirFlowParticle: half the ticks one air particle appears in the current (the particle
-// density setting is one half), jittered by a quarter block, moving along the flow by 0.125 * (reach - distance + 1)
-// * 0.5 a tick, coloured by the air at its distance (morphAirFlow): the base is 0xEEEEEE at a quarter alpha.
-// Create draws it with its own particle class that steers it every tick; here it is the pack sprite
-// create:air_flow sent with the speed it would have at that spot.
-fn fan_air_particles(game: &mut Game<'_>, front: [i32; 3], about: f32, cur: &FanCurrent, center: [f64; 3]) {
-    use horizon_client::particles::{ParticleOptions, ParticleType};
-    let _ = about;
+// The owner tag a fan gives its air particles (never zero), so that each fan steers only its own.
+fn fan_tag(pos: [i32; 3]) -> i64 {
+    let x = i64::from(pos[0]) & 0x1F_FFFF;
+    let y = i64::from(pos[1]) & 0x1F_FFFF;
+    let z = i64::from(pos[2]) & 0x1F_FFFF;
+    ((x << 42) ^ (z << 21) ^ y) | 1
+}
+
+// AirCurrent.tick: with the particle density chance (one half) an air particle appears at the fans face when it
+// blows, or at the far end of the current when it sucks, jittered a quarter block on every axis. The engine draws
+// it as the pack particle create:air_flow (the engine edit gives it the owner tag), and fan_steer_particles then
+// moves it every tick the way AirFlowParticle.tick does.
+fn fan_air_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &FanCurrent, center: [f64; 3]) {
+    use horizon_client::particles::ParticleOptions;
     if fan_rand() >= 0.5 || cur.reach <= 0.0 {
         return;
     }
-    let flow = if cur.pushing { front } else { neg(front) };
-    let d = fan_rand() * cur.reach;
+    let offset = if cur.pushing { 0.5 } else { f64::from(cur.reach) + 0.5 };
     let mut at = [0.0; 3];
     for k in 0..3 {
-        at[k] = center[k] + f64::from(front[k]) * (f64::from(d) + 0.5) + f64::from(fan_rand() - 0.5) * 0.5;
+        at[k] = center[k] + f64::from(front[k]) * offset + f64::from(fan_rand() * 2.0 - 1.0) * 0.25;
     }
-    let speed = 0.125 * f64::from(cur.reach - d + 1.0) * 0.5;
-    let v = [f64::from(flow[0]) * speed, f64::from(flow[1]) * speed, f64::from(flow[2]) * speed];
-    let kind = fan_type_at(cur, d);
-    let t = fan_rand();
-    let (rgb, alpha) = match kind {
-        1 => (fan_mix(4_495_871, 2_258_943, t), 1.0),
-        2 => (fan_mix(16_729_088, 16_746_581, t), 0.5),
-        3 => (fan_mix(0, 5_592_405, t), 1.0),
-        4 => (fan_mix(0, 1_205_608, t), 1.0),
-        _ => (fan_mix(15_658_734, 15_658_734, 0.0), 0.25),
-    };
     let mut air = ParticleOptions::named("create:air_flow");
-    air.color = [rgb[0], rgb[1], rgb[2], alpha];
-    game.particles.add(&air, at, v);
-    // spawnExtraParticle (a particle of the same speed along the flow, chance per tick of the air particle, which
-    // lives forty ticks)
-    let lava = || ParticleOptions::block(ParticleType::Block, String::from("block/lava_still"), 0x00FF_FFFF);
-    let extras: Vec<(ParticleOptions, f32, f64)> = match kind {
-        1 => vec![
-            (ParticleOptions::simple(ParticleType::Bubble), 0.03125, 0.125),
-            (ParticleOptions::simple(ParticleType::BubblePop), 0.03125, 0.125),
-        ],
-        2 => vec![(ParticleOptions::simple(ParticleType::Flame), 0.03125, 0.25), (lava(), 0.0625, 0.25)],
-        3 => vec![
-            (ParticleOptions::simple(ParticleType::Smoke), 0.03125, 0.125),
-            (ParticleOptions::simple(ParticleType::LargeSmoke), 0.03125, 0.125),
-        ],
-        4 => vec![
-            (ParticleOptions::simple(ParticleType::SoulFireFlame), 0.0078125, 0.125),
-            (ParticleOptions::simple(ParticleType::Smoke), 0.03125, 0.125),
-        ],
-        _ => Vec::new(),
-    };
-    for (options, chance, extra_speed) in extras {
-        if fan_rand() < chance * 40.0 {
-            let w = [f64::from(flow[0]) * extra_speed, f64::from(flow[1]) * extra_speed, f64::from(flow[2]) * extra_speed];
-            game.particles.add(&options, at, w);
+    air.color = [238.0 / 255.0, 238.0 / 255.0, 238.0 / 255.0, 0.25];
+    game.particles.add(&air, at, [0.0; 3]);
+    let tag = fan_tag(pos);
+    game.particles.steer_mod(&mut |p, _| {
+        if p.tag == -1 {
+            p.tag = tag;
         }
+    });
+}
+
+// AirFlowParticle.tick for every air particle of the fan at `pos`: it goes when it leaves the current (the bounds
+// grown a quarter block, or a distance outside -0.25 to the reach plus one), moves by the flow times 0.125 times
+// (reach - (distance - 1)) times one half, takes the colour and sprite of the air at its distance (morphAirFlow),
+// and may shed the extra particle of that air along its last motion.
+fn fan_steer_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &FanCurrent, lo: [f64; 3], hi: [f64; 3], center: [f64; 3]) {
+    use horizon_client::particles::{ParticleOptions, ParticleType};
+    let tag = fan_tag(pos);
+    let flow = if cur.pushing { front } else { neg(front) };
+    let reach = f64::from(cur.reach);
+    let mut extras: Vec<(ParticleOptions, [f64; 3], [f64; 3])> = Vec::new();
+    game.particles.steer_mod(&mut |p, sprites| {
+        if p.tag != tag {
+            return;
+        }
+        if !(0..3).all(|k| p.position[k] >= lo[k] - 0.25 && p.position[k] <= hi[k] + 0.25) {
+            p.kill();
+            return;
+        }
+        let dist = (0..3).map(|k| (p.position[k] - center[k]) * f64::from(front[k])).sum::<f64>().abs() - 0.5;
+        if dist > reach + 1.0 || dist < -0.25 {
+            p.kill();
+            return;
+        }
+        let speed = 0.125 * (reach - (dist - 1.0)) * 0.5;
+        let kind = fan_type_at(cur, dist as f32);
+        let t = fan_rand();
+        let (rgb, alpha) = match kind {
+            1 => (fan_mix(4_495_871, 2_258_943, t), 1.0),
+            2 => (fan_mix(16_729_088, 16_746_581, t), 0.5),
+            3 => (fan_mix(0, 5_592_405, t), 1.0),
+            4 => (fan_mix(0, 1_205_608, t), 1.0),
+            _ => (fan_mix(15_658_734, 15_658_734, 0.0), 0.25),
+        };
+        p.rgba = [rgb[0], rgb[1], rgb[2], alpha];
+        let pick = if kind == 0 {
+            (dist / reach * 8.0 + f64::from((fan_rand() * 4.0) as i32)).clamp(0.0, 7.0) as usize
+        } else {
+            (fan_rand() * 3.0) as usize
+        };
+        if !sprites.is_empty() {
+            p.show_sprite(sprites[pick * (sprites.len() - 1) / 7]);
+        }
+        // spawnExtraParticle: the particle position, the motion it had until now times the multiplier
+        let lava = || ParticleOptions::block(ParticleType::Block, String::from("block/lava_still"), 0x00FF_FFFF);
+        let list: Vec<(ParticleOptions, f32, f64)> = match kind {
+            1 => vec![
+                (ParticleOptions::simple(ParticleType::Bubble), 0.03125, 0.125),
+                (ParticleOptions::simple(ParticleType::BubblePop), 0.03125, 0.125),
+            ],
+            2 => vec![(ParticleOptions::simple(ParticleType::Flame), 0.03125, 0.25), (lava(), 0.0625, 0.25)],
+            3 => vec![
+                (ParticleOptions::simple(ParticleType::Smoke), 0.03125, 0.125),
+                (ParticleOptions::simple(ParticleType::LargeSmoke), 0.03125, 0.125),
+            ],
+            4 => vec![
+                (ParticleOptions::simple(ParticleType::SoulFireFlame), 0.0078125, 0.125),
+                (ParticleOptions::simple(ParticleType::Smoke), 0.03125, 0.125),
+            ],
+            _ => Vec::new(),
+        };
+        for (options, chance, multiplier) in list {
+            if fan_rand() < chance {
+                let w = [p.velocity[0] * multiplier, p.velocity[1] * multiplier, p.velocity[2] * multiplier];
+                extras.push((options, p.position, w));
+            }
+        }
+        p.velocity = [f64::from(flow[0]) * speed, f64::from(flow[1]) * speed, f64::from(flow[2]) * speed];
+    });
+    for (options, at, v) in extras {
+        game.particles.add(&options, at, v);
     }
 }
 
