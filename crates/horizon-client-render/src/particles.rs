@@ -1134,6 +1134,19 @@ impl ParticleEngine {
     /// `onResourceManagerReload`: sprite rects and sets come from the
     /// reloaded atlas and pack; a live particle keeps drawing its sprite by
     /// name or index.
+    /// A native mod changes every live and waiting particle once: tag, position, speed, colour, sprite, or removes it.
+    /// `sprites` are the sprites of the "create:air_flow" particle.
+    pub fn steer_mod(&mut self, f: &mut dyn FnMut(&mut Particle, &[u32])) {
+        let sprites: Vec<u32> = self
+            .mod_sets
+            .get("create:air_flow")
+            .and_then(|s| self.set_sprites.get(*s as usize))
+            .cloned()
+            .unwrap_or_default();
+        for p in self.particles.iter_mut().chain(self.pending.iter_mut()) {
+            f(p, &sprites);
+        }
+    }
     pub fn reload(
         &mut self,
         root: &Path,
