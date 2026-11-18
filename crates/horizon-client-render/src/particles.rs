@@ -368,6 +368,7 @@ pub struct Particle {
     sprite: Sprite,
     /// Age-driven sprite set (`setSpriteFromAge`).
     set: Option<u32>,
+    pub tag: i64,
     /// Sub-rectangle of the sprite (u0, v0, u1, v1) in 0..1.
     pub uv: [f32; 4],
     size_curve: Size,
@@ -671,6 +672,16 @@ pub fn along_axis(
 }
 
 impl Particle {
+    /// A native mod can remove a particle.
+    pub fn kill(&mut self) {
+        self.removed = true;
+    }
+    /// A native mod can pick the sprite a particle shows (it stops following its age).
+    pub fn show_sprite(&mut self, sprite: u32) {
+        self.sprite = Sprite::Index(sprite);
+        self.set = None;
+    }
+
     /// `Particle(level, x, y, z)` + `SingleQuadParticle` (no initial velocity).
     fn at(random: &mut LegacyRandom, ty: ParticleType, p: [f64; 3]) -> Self {
         let mut particle = Self::base_at(random, ty, p);
@@ -697,6 +708,7 @@ impl Particle {
             free_move: false,
             stopped_by_collision: false,
             removed: false,
+            tag: -1,
             age: 0,
             lifetime: 0,
             gravity: 0.0,
