@@ -10255,18 +10255,86 @@ fn fan_air_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &
     }
     let mut air = ParticleOptions::named("create:air_flow");
     air.color = [238.0 / 255.0, 238.0 / 255.0, 238.0 / 255.0, 0.25];
-    // this engine cannot steer particles from here, so each one is given the speed of the flow to drift on
-    let flow = if cur.pushing { front } else { neg(front) };
-    let drift = [f64::from(flow[0]) * 0.1, f64::from(flow[1]) * 0.1, f64::from(flow[2]) * 0.1];
-    game.particles.add(&air, at, drift);
+    game.particles.add(&air, at, [0.0; 3]);
+    let tag = fan_tag(pos);
+    game.particles.steer_mod(&mut |p, _| {
+        if p.tag == -1 {
+            p.tag = tag;
+        }
+    });
 }
 
 // AirFlowParticle.tick for every air particle of the fan at `pos`: it goes when it leaves the current (the bounds
 // grown a quarter block, or a distance outside -0.25 to the reach plus one), moves by the flow times 0.125 times
 // (reach - (distance - 1)) times one half, takes the colour and sprite of the air at its distance (morphAirFlow),
 // and may shed the extra particle of that air along its last motion.
-fn fan_steer_particles(_game: &mut Game<'_>, _pos: [i32; 3], _front: [i32; 3], _cur: &FanCurrent, _lo: [f64; 3], _hi: [f64; 3], _center: [f64; 3]) {
-    // needs the engine edit that lets a mod steer its particles; without it the particles just drift
+fn fan_steer_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &FanCurrent, lo: [f64; 3], hi: [f64; 3], center: [f64; 3]) {
+    use horizon_client::particles::{ParticleOptions, ParticleType};
+    let tag = fan_tag(pos);
+    let flow = if cur.pushing { front } else { neg(front) };
+    let reach = f64::from(cur.reach);
+    let mut extras: Vec<(ParticleOptions, [f64; 3], [f64; 3])> = Vec::new();
+    game.particles.steer_mod(&mut |p, sprites| {
+        if p.tag != tag {
+            return;
+        }
+        if !(0..3).all(|k| p.position[k] >= lo[k] - 0.25 && p.position[k] <= hi[k] + 0.25) {
+            p.kill();
+            return;
+        }
+        let dist = (0..3).map(|k| (p.position[k] - center[k]) * f64::from(front[k])).sum::<f64>().abs() - 0.5;
+        if dist > reach + 1.0 || dist < -0.25 {
+            p.kill();
+            return;
+        }
+        let speed = 0.125 * (reach - (dist - 1.0)) * 0.5;
+        let kind = fan_type_at(cur, dist as f32);
+        let t = fan_rand();
+        let (rgb, alpha) = match kind {
+            1 => (fan_mix(4_495_871, 2_258_943, t), 1.0),
+            2 => (fan_mix(16_729_088, 16_746_581, t), 0.5),
+            3 => (fan_mix(0, 5_592_405, t), 1.0),
+            4 => (fan_mix(0, 1_205_608, t), 1.0),
+            _ => (fan_mix(15_658_734, 15_658_734, 0.0), 0.25),
+        };
+        p.rgba = [rgb[0], rgb[1], rgb[2], alpha];
+        let pick = if kind == 0 {
+            (dist / reach * 8.0 + f64::from((fan_rand() * 4.0) as i32)).clamp(0.0, 7.0) as usize
+        } else {
+            (fan_rand() * 3.0) as usize
+        };
+        if !sprites.is_empty() {
+            p.show_sprite(sprites[pick * (sprites.len() - 1) / 7]);
+        }
+        // spawnExtraParticle: the particle position, the motion it had until now times the multiplier
+        let lava = || ParticleOptions::block(ParticleType::Block, String::from("block/lava_still"), 0x00FF_FFFF);
+        let list: Vec<(ParticleOptions, f32, f64)> = match kind {
+            1 => vec![
+                (ParticleOptions::simple(ParticleType::Bubble), 0.03125, 0.125),
+                (ParticleOptions::simple(ParticleType::BubblePop), 0.03125, 0.125),
+            ],
+            2 => vec![(ParticleOptions::simple(ParticleType::Flame), 0.03125, 0.25), (lava(), 0.0625, 0.25)],
+            3 => vec![
+                (ParticleOptions::simple(ParticleType::Smoke), 0.03125, 0.125),
+                (ParticleOptions::simple(ParticleType::LargeSmoke), 0.03125, 0.125),
+            ],
+            4 => vec![
+                (ParticleOptions::simple(ParticleType::SoulFireFlame), 0.0078125, 0.125),
+                (ParticleOptions::simple(ParticleType::Smoke), 0.03125, 0.125),
+            ],
+            _ => Vec::new(),
+        };
+        for (options, chance, multiplier) in list {
+            if fan_rand() < chance {
+                let w = [p.velocity[0] * multiplier, p.velocity[1] * multiplier, p.velocity[2] * multiplier];
+                extras.push((options, p.position, w));
+            }
+        }
+        p.velocity = [f64::from(flow[0]) * speed, f64::from(flow[1]) * speed, f64::from(flow[2]) * speed];
+    });
+    for (options, at, v) in extras {
+        game.particles.add(&options, at, v);
+    }
 }
 
 // spawnProcessingParticles for an item being processed at `at`: one tick in eight.
