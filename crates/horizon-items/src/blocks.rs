@@ -362,9 +362,11 @@ impl BlockFacts {
             let sound = &entry.sound;
             let prop = |k: &str| state.properties.get(k).map(String::as_str);
             let (fluid, fluid_level, fluid_falling) = match state.name.as_str() {
-                "minecraft:water" | "minecraft:lava" => {
+                name if horizon_world::fluid::is_water_block_name(name)
+                    || name == "minecraft:lava" =>
+                {
                     let level: u8 = prop("level").and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let kind = if state.name == "minecraft:water" {
+                    let kind = if state.name != "minecraft:lava" {
                         Fluid::Water
                     } else {
                         Fluid::Lava
