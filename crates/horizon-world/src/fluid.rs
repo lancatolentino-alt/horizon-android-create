@@ -6,6 +6,85 @@ use crate::{
     registry::{BlockRegistry, BlockStateId},
 };
 use std::io;
+use std::sync::RwLock;
+
+/// Blocks a loaded content mod declares as water-family fluids (`"fluid": "water"`): salt water,
+/// say. Empty unless such a mod is on, so a game without one never sees a variant. A variant
+/// flows, swims and renders as water; only its block, and so its tint and its texture, differ.
+static WATER_VARIANTS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Registers `name` as a water-family block and returns its variant number (1 and up; 0 is
+/// vanilla water). Registering a name twice returns the same number.
+pub fn register_water_variant(name: &str) -> u8 {
+    let mut names = WATER_VARIANTS.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = names.iter().position(|n| n == name) {
+        return i as u8 + 1;
+    }
+    assert!(names.len() < 254, "too many water variants");
+    names.push(name.to_string());
+    names.len() as u8
+}
+/// The filled bucket of each water variant, by variant number.
+static VARIANT_BUCKETS: RwLock<Vec<(u8, &'static str)>> = RwLock::new(Vec::new());
+
+/// Declares `item` as the bucket that holds water variant `variant`.
+pub fn register_variant_bucket(variant: u8, item: &str) {
+    let mut buckets = VARIANT_BUCKETS.write().unwrap_or_else(|e| e.into_inner());
+    buckets.retain(|(v, _)| *v != variant);
+    // A handful of names for the whole run: leaking them gives the `'static` the bucket code returns.
+    buckets.push((variant, Box::leak(item.to_string().into_boxed_str())));
+}
+/// The bucket item holding variant `variant`.
+pub fn variant_bucket(variant: u8) -> Option<&'static str> {
+    let buckets = VARIANT_BUCKETS.read().unwrap_or_else(|e| e.into_inner());
+    buckets.iter().find(|(v, _)| *v == variant).map(|(_, i)| *i)
+}
+/// The water variant a bucket item holds.
+pub fn bucket_variant(item: &str) -> Option<u8> {
+    let buckets = VARIANT_BUCKETS.read().unwrap_or_else(|e| e.into_inner());
+    buckets.iter().find(|(_, i)| *i == item).map(|(v, _)| *v)
+}
+/// Forgets every registered variant: a mod set changes only at start, and tests reset it.
+pub fn clear_water_variants() {
+    WATER_VARIANTS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    VARIANT_BUCKETS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+/// The variant number of a registered water-family block name.
+pub fn water_variant_of(name: &str) -> Option<u8> {
+    let names = WATER_VARIANTS.read().unwrap_or_else(|e| e.into_inner());
+    if names.is_empty() {
+        return None;
+    }
+    names.iter().position(|n| n == name).map(|i| i as u8 + 1)
+}
+/// The block name of variant `variant` (0 is `minecraft:water`).
+pub fn water_variant_name(variant: u8) -> Option<String> {
+    if variant == 0 {
+        return Some("minecraft:water".into());
+    }
+    WATER_VARIANTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(variant as usize - 1)
+        .cloned()
+}
+/// How many variants are registered.
+pub fn water_variant_count() -> usize {
+    WATER_VARIANTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+/// True for a liquid block that is water or a registered water-family variant.
+pub fn is_water_block_name(name: &str) -> bool {
+    name == "minecraft:water" || water_variant_of(name).is_some()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -54,12 +133,26 @@ impl FluidKind {
         1 << self as u8
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct FluidState {
     kind: FluidKind,
     amount: u8,
     falling: bool,
+    /// 0 is vanilla; a mod's water-family fluid has its registered number.
+    variant: u8,
+    /// `tfc_flow` ordinal of a river water's current; `NO_FLOW` for every other fluid.
+    flow: u8,
 }
+/// No river current.
+pub const NO_FLOW: u8 = 255;
+/// Two fluid states are equal when they hold the same amount of the same kind: a variant is the
+/// same fluid under another block, so every water check in the game still holds for it.
+impl PartialEq for FluidState {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.amount == other.amount && self.falling == other.falling
+    }
+}
+impl Eq for FluidState {}
 impl FluidState {
     /// Native fluid states require an object; properties decode leniently.
     pub fn from_json(json: &str) -> io::Result<Self> {
@@ -88,6 +181,8 @@ impl FluidState {
             kind,
             amount: if flowing { 1 } else { 8 },
             falling: true,
+            variant: 0,
+            flow: NO_FLOW,
         };
         if let Some(properties) = value
             .get("properties")
@@ -136,18 +231,49 @@ impl FluidState {
             kind,
             amount,
             falling,
+            variant: 0,
+            flow: NO_FLOW,
         }
     }
     pub const EMPTY: Self = Self {
         kind: FluidKind::Empty,
         amount: 0,
         falling: false,
+        variant: 0,
+        flow: NO_FLOW,
     };
     pub const WATER: Self = Self {
         kind: FluidKind::Water,
         amount: 8,
         falling: false,
+        variant: 0,
+        flow: NO_FLOW,
     };
+    /// The same fluid as a water-family variant (a no-op for lava and the empty fluid).
+    pub const fn with_variant(self, variant: u8) -> Self {
+        if matches!(
+            self.kind,
+            FluidKind::Empty | FluidKind::Lava | FluidKind::FlowingLava
+        ) {
+            return self;
+        }
+        Self { variant, ..self }
+    }
+    /// The same fluid with a river current (`tfc_flow` ordinal).
+    pub const fn with_flow(self, flow: u8) -> Self {
+        Self { flow, ..self }
+    }
+    /// The river current's `tfc_flow` ordinal, if this is a river water.
+    pub const fn river_flow(self) -> Option<u8> {
+        if self.flow == NO_FLOW {
+            None
+        } else {
+            Some(self.flow)
+        }
+    }
+    pub const fn variant(self) -> u8 {
+        self.variant
+    }
     pub const fn kind(self) -> FluidKind {
         self.kind
     }
@@ -195,7 +321,12 @@ impl FluidState {
         f32::from(self.amount) / 9.0
     }
     pub fn from_block(state: &BlockState) -> io::Result<Self> {
-        let water = state.name == "minecraft:water";
+        let variant = if state.name == "minecraft:water" {
+            Some(0)
+        } else {
+            water_variant_of(&state.name)
+        };
+        let water = variant.is_some();
         if water || state.name == "minecraft:lava" {
             let level = state
                 .properties
@@ -217,6 +348,13 @@ impl FluidState {
                     8 - level
                 },
                 falling: level >= 8,
+                variant: variant.unwrap_or(0),
+                flow: state
+                    .properties
+                    .get("flow")
+                    .and_then(|v| crate::worldgen::tfc_flow::NAMES.iter().position(|n| n == v))
+                    .filter(|i| *i < 16 && variant.is_some_and(|v| v > 0))
+                    .map_or(NO_FLOW, |i| i as u8),
             });
         }
         if matches!(
@@ -278,6 +416,9 @@ impl FluidStateTable {
 pub struct FluidBlockBindings {
     air: BlockStateId,
     water: [BlockStateId; 16],
+    /// Each registered variant's blocks by level (variant n is index n - 1); a variant whose block
+    /// is missing from the registry falls back to vanilla water.
+    variants: Vec<[BlockStateId; 16]>,
     lava: [BlockStateId; 16],
 }
 impl FluidBlockBindings {
@@ -296,11 +437,20 @@ impl FluidBlockBindings {
             }
             Ok(result)
         };
+        let water = levels("minecraft:water")?;
+        let variants = (1..=water_variant_count() as u8)
+            .map(|v| {
+                water_variant_name(v)
+                    .and_then(|name| levels(&name).ok())
+                    .unwrap_or(water)
+            })
+            .collect();
         Ok(Self {
             air: registry
                 .default_state("minecraft:air")
                 .ok_or_else(|| invalid("missing air block"))?,
-            water: levels("minecraft:water")?,
+            water,
+            variants,
             lava: levels("minecraft:lava")?,
         })
     }
@@ -314,9 +464,103 @@ impl FluidBlockBindings {
             8 - state.amount.min(8) + if state.falling { 8 } else { 0 }
         } as usize;
         if state.kind.same_family(FluidKind::Water) {
+            if state.variant > 0
+                && let Some(blocks) = self.variants.get(state.variant as usize - 1)
+            {
+                return blocks[level];
+            }
             self.water[level]
         } else {
             self.lava[level]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DATA_VERSION, nbt::Tag};
+
+    /// A registry of air, vanilla water and lava, and the mod liquid `name`, each with its 16 levels.
+    fn registry_with(name: &str) -> BlockRegistry {
+        let mut states = vec![Tag::String("minecraft:air".into())];
+        let mut defaults = vec![("minecraft:air".to_string(), 0)];
+        for block in ["minecraft:water", "minecraft:lava", name] {
+            defaults.push((block.to_string(), states.len() as i32));
+            for level in 0..16 {
+                states.push(Tag::compound([
+                    ("id", Tag::String(block.into())),
+                    (
+                        "properties",
+                        Tag::compound([("level", Tag::String(level.to_string().as_str().into()))]),
+                    ),
+                ]));
+            }
+        }
+        BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("states", Tag::List(states)),
+            (
+                "defaults",
+                Tag::compound(defaults.iter().map(|(n, i)| (n.as_str(), Tag::Int(*i)))),
+            ),
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_registered_water_block_reads_as_water_and_writes_itself_back() {
+        let name = "fluidtest:salt_water";
+        assert_eq!(water_variant_of(name), None);
+        let registry = registry_with(name);
+        // Unregistered, the mod block is no liquid at all.
+        let source = registry.default_state(name).unwrap();
+        assert!(!is_water_block_name(name));
+        assert_eq!(
+            FluidState::from_block(registry.state(source).unwrap()).unwrap_or(FluidState::EMPTY),
+            FluidState::EMPTY
+        );
+
+        let variant = register_water_variant(name);
+        assert!(variant > 0);
+        assert_eq!(
+            register_water_variant(name),
+            variant,
+            "registering twice is idempotent"
+        );
+        assert!(is_water_block_name(name));
+        let table = FluidStateTable::new(&registry).unwrap();
+        let salt = table.get(source).unwrap();
+        // The same fluid as vanilla water, under its variant.
+        assert_eq!(salt, FluidState::WATER);
+        assert_eq!(salt.variant(), variant);
+        let flowing = table
+            .get(BlockStateId(source.0 + 3))
+            .expect("a flowing level");
+        assert_eq!(flowing.kind(), FluidKind::FlowingWater);
+        assert_eq!(flowing.variant(), variant);
+
+        let bindings = FluidBlockBindings::new(&registry).unwrap();
+        // A variant converts back to its own block, level for level; vanilla water is unchanged.
+        assert_eq!(bindings.block(salt), source);
+        assert_eq!(bindings.block(flowing), BlockStateId(source.0 + 3));
+        assert_eq!(
+            bindings.block(FluidState::WATER),
+            registry.default_state("minecraft:water").unwrap()
+        );
+        // Lava has no variants.
+        assert_eq!(
+            FluidState::new(FluidKind::Lava, 8, false)
+                .with_variant(variant)
+                .variant(),
+            0
+        );
+        // A bucket of the variant round-trips between item and variant.
+        register_variant_bucket(variant, "fluidtest:salt_bucket");
+        assert_eq!(variant_bucket(variant), Some("fluidtest:salt_bucket"));
+        assert_eq!(bucket_variant("fluidtest:salt_bucket"), Some(variant));
+        assert_eq!(bucket_variant("minecraft:water_bucket"), None);
+        // No other test registers a variant: leave the registry as it was found.
+        clear_water_variants();
     }
 }

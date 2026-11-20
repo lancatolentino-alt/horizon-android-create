@@ -119,6 +119,7 @@ pub mod suffocation;
 pub mod swimming;
 pub mod synced_floats;
 pub mod teleport_consume;
+pub mod tfc_water_tint;
 pub mod tick_data;
 pub mod use_remainder;
 pub mod view_direction;

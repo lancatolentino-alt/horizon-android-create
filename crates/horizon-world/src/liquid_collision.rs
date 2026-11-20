@@ -24,7 +24,7 @@ pub struct LiquidCollision {
 }
 impl LiquidCollision {
     pub fn from_state(state: &BlockState) -> io::Result<Option<Self>> {
-        if !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+        if !(crate::fluid::is_water_block_name(&state.name) || state.name == "minecraft:lava") {
             return Ok(None);
         }
         Ok(Some(Self {

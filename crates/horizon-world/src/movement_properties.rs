@@ -123,7 +123,7 @@ impl<'r> MovementProperties<'r> {
                     fence: tags.fences.contains(name),
                     wall: tags.walls.contains(name),
                     suppresses_bounce: tags.suppresses_bounce.contains(name),
-                    water: name == "minecraft:water",
+                    water: crate::fluid::is_water_block_name(name),
                     bubble_column: name == "minecraft:bubble_column",
                 }
             })
