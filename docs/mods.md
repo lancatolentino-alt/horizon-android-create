@@ -151,6 +151,27 @@ chorus plant's (10 pixels across) unless it sets `"thickness"`, 2 to 14
 pixels: its outline and collision are then built as `PipeBlock` builds its
 own, a core and an arm to each joined side.
 
+A grass of the mod's own copies `minecraft:grass_block` and names its dirt with
+`"decays_to"` (`{ "template": "minecraft:grass_block", "decays_to": "mymod:soil" }`):
+it dies to that block when covered and spreads only over it, as vanilla grass does
+over dirt.
+
+A liquid of the mod's own, flowing and swimming as water, is a block with
+template `minecraft:water` and `"fluid": "water"`:
+
+```json
+{ "template": "minecraft:water", "fluid": "water", "item": false }
+```
+
+A bucket of it is an item copying `minecraft:water_bucket` with `"bucket_of": "mymod:brine"`
+(the fluid block's id): pouring it places that fluid, and an empty bucket scooping that fluid
+gives this item.
+
+The game treats it as water everywhere (flow, swimming, rendering, mobs) but a
+flow out of it places the same block back, so salt water stays salt water. It
+exists only while its mod is on. The `level` property and the water states come
+from the template.
+
 A mod's creative inventory tabs are `data/<id>/horizon/creative_tab/*.json`:
 a title, the item on the tab's button, and its items in order (items the game
 doesn't have are left out):
