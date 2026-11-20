@@ -611,9 +611,9 @@ impl<'a, 'w> Finder<'a, 'w> {
                 let mut start_y;
                 if m.can_float && m.in_water {
                     start_y = p.y.floor() as i32;
-                    while &*self.w.facts.get(self.w.world.block(bx, start_y, bz)).name
-                        == "minecraft:water"
-                    {
+                    while horizon_world::fluid::is_water_block_name(
+                        &self.w.facts.get(self.w.world.block(bx, start_y, bz)).name,
+                    ) {
                         start_y += 1;
                     }
                 } else {

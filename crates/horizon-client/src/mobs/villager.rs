@@ -732,7 +732,7 @@ fn golem_attempt<L: super::spawn_rules::SpawnLevel>(
         let above_name = &*l.facts().get(above).name;
         // BlockState.liquid(): a water or lava block (not a waterlogged one).
         let open = l.facts().is_air(above)
-            || above_name == "minecraft:water"
+            || horizon_world::fluid::is_water_block_name(above_name)
             || above_name == "minecraft:lava";
         let solid = l.mob_data().state(here).flags & super::data::SOLID != 0
             || name(y) == "minecraft:powder_snow";
@@ -752,7 +752,7 @@ fn golem_fits<L: super::spawn_rules::SpawnLevel>(l: &L, [x, y, z]: [i32; 3]) -> 
     let stands = floor.flags & super::data::STURDY_TOP != 0 && floor.top >= 1.0;
     // isValidEmptySpawnBlock with Fluids.EMPTY: open water is free too.
     let feet = is_valid_empty_spawn(Species::IronGolem, l, x, y, z)
-        || &*l.facts().get(l.state(x, y, z)).name == "minecraft:water";
+        || horizon_world::fluid::is_water_block_name(&l.facts().get(l.state(x, y, z)).name);
     stands
         && feet
         && is_valid_empty_spawn(Species::IronGolem, l, x, y + 1, z)

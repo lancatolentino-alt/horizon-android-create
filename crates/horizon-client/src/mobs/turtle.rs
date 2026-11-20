@@ -75,7 +75,7 @@ pub fn walk_target_value(m: &Mob, w: &MobWorld, p: [i32; 3], light: f32) -> f32 
 pub fn stable_destination(m: &Mob, w: &MobWorld, p: [i32; 3]) -> Option<bool> {
     m.extra
         .point
-        .map(|_| w.block_name(p[0], p[1], p[2]) == "minecraft:water")
+        .map(|_| horizon_world::fluid::is_water_block_name(&w.block_name(p[0], p[1], p[2])))
 }
 /// `Turtle.hasEgg`.
 pub fn has_egg(m: &Mob) -> bool {
@@ -335,7 +335,7 @@ impl Goal for GoHome {
 struct GoToWater(MoveToBlock);
 impl GoToWater {
     fn valid(w: &MobWorld, p: [i32; 3]) -> bool {
-        w.block_name(p[0], p[1], p[2]) == "minecraft:water"
+        horizon_world::fluid::is_water_block_name(&w.block_name(p[0], p[1], p[2]))
     }
 }
 impl Goal for GoToWater {

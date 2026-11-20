@@ -2522,7 +2522,7 @@ fn axolotl_action(m: &mut Mob, cx: &mut Bx, action: AxolotlAction, until: &mut i
                     continue;
                 }
                 let name = cx.w.block_name(q[0], q[1], q[2]);
-                if name != "minecraft:water" {
+                if !horizon_world::fluid::is_water_block_name(&name) {
                     continue;
                 }
                 if cx.w.block_name(q[0], q[1] + 1, q[2]).ends_with("air") {

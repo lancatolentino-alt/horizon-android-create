@@ -279,7 +279,7 @@ fn spread_resin(
                 let facts = b.w.facts.get(neighbour);
                 if b.w.facts.is_air(neighbour) {
                     neighbour = b.w.registry.default_state("minecraft:resin_clump")?;
-                } else if &*facts.name == "minecraft:water"
+                } else if horizon_world::fluid::is_water_block_name(&facts.name)
                     && facts.fluid_level == 8
                     && !facts.fluid_falling
                 {

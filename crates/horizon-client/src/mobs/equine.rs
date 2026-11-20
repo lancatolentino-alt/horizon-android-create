@@ -489,10 +489,10 @@ pub fn play_step(
     state: horizon_world::registry::BlockStateId,
     events: &mut Vec<MobEvent>,
 ) {
-    if matches!(
-        &*w.facts.get(state).name,
-        "minecraft:water" | "minecraft:lava" | "minecraft:bubble_column"
-    ) {
+    let liquid_name = &*w.facts.get(state).name;
+    if horizon_world::fluid::is_water_block_name(liquid_name)
+        || matches!(liquid_name, "minecraft:lava" | "minecraft:bubble_column")
+    {
         return;
     }
     let above = w.world.block(pos[0], pos[1] + 1, pos[2]);
