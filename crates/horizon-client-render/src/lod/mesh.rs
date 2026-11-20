@@ -96,7 +96,8 @@ impl Mesher {
                     .state(span.state)
                     .map_or("", |s| s.name.as_str());
                 let fluid = match name {
-                    "minecraft:water" | "minecraft:bubble_column" => 1,
+                    n if horizon_world::fluid::is_water_block_name(n) => 1,
+                    "minecraft:bubble_column" => 1,
                     "minecraft:lava" => 2,
                     _ => 0,
                 };
@@ -200,7 +201,8 @@ impl Mesher {
                         }
                         Tint::Foliage => biome.foliage,
                         Tint::Dry => biome.dry_foliage,
-                        Tint::Water => biome.water,
+                        Tint::Water => horizon_world::tfc_water_tint::water_color(at[0], at[1])
+                            .unwrap_or(biome.water),
                         Tint::Constant(color) => color,
                     };
                     let channel = |shift: u32| (((rgb >> shift) & 255u32) as f32 * shade) as u32;
