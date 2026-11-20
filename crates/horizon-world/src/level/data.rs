@@ -1091,6 +1091,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         );
     }
 
+    apply_block_links(&table, &mut blocks);
     let potted_by_content = potted_by_content(&blocks, &table);
     let liquid_blocks = FluidBlockBindings::new(registry)?;
     let mut dynamic = HashMap::new();
@@ -1104,6 +1105,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
             }
         }
     }
+    tag_water_variants(registry, &mut facts);
     Ok(Behaviours {
         table,
         props,
@@ -1207,5 +1209,59 @@ impl GameplayStateSource for Value {
             .and_then(|s| s.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("")
+    }
+}
+
+/// Marks the states of every registered water-family block (a mod's salt water, say) with their
+/// variant, so a flow that reads their fluid writes the same block back. Nothing happens
+/// while no mod has registered one.
+pub(crate) fn tag_water_variants(registry: &BlockRegistry, facts: &mut [StateFacts]) {
+    if crate::fluid::water_variant_count() == 0 {
+        return;
+    }
+    for (id, fact) in facts.iter_mut().enumerate() {
+        let Some(state) = registry.state(BlockStateId(id as u32)) else {
+            continue;
+        };
+        if let Some(variant) = crate::fluid::water_variant_of(&state.name) {
+            fact.fluid = fact.fluid.with_variant(variant);
+            if let Some(index) = state
+                .properties
+                .get("flow")
+                .and_then(|v| crate::worldgen::tfc_flow::NAMES.iter().position(|n| n == v))
+                .filter(|i| *i < 16)
+            {
+                fact.fluid = fact.fluid.with_flow(index as u8);
+            }
+        }
+    }
+}
+
+/// `(block, its base block)` pairs a content mod declares: the dirt a grass of its own turns to
+/// when it dies and spreads over. Empty unless such a mod is on.
+static BLOCK_LINKS: std::sync::RwLock<Vec<(String, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Declares that `block` (a spreading grass) dies to and spreads over `base`.
+pub fn register_block_link(block: &str, base: &str) {
+    let mut links = BLOCK_LINKS.write().unwrap_or_else(|e| e.into_inner());
+    links.retain(|(b, _)| b != block);
+    links.push((block.to_string(), base.to_string()));
+}
+
+pub fn clear_block_links() {
+    BLOCK_LINKS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Points each declared block at its base block.
+pub(crate) fn apply_block_links(table: &StateTable, blocks: &mut [BlockData]) {
+    for (block, base) in BLOCK_LINKS.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        if let (Some(block), Some(base)) = (table.block_by_name(block), table.block_by_name(base))
+            && let Some(data) = blocks.get_mut(block.0 as usize)
+        {
+            data.link = Some(base);
+        }
     }
 }

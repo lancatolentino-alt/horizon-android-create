@@ -17,6 +17,8 @@ use std::sync::Arc;
 pub enum BucketContent {
     /// Water or lava (mob buckets hold water).
     Fluid(FluidKind),
+    /// A content mod's water-family fluid (salt water), by variant number.
+    Variant(u8),
     /// `SolidBucketItem`: the block placed into an empty space (powder snow).
     Powder,
     /// `MobBucketItem` holding water: its empty sound posts no `FLUID_PLACE`.
@@ -30,7 +32,10 @@ impl BucketContent {
     /// counts too): the only content a bucket pours inside a liquid
     /// container, and the only one `canBeReplaced(Fluid)` sees as water.
     pub fn is_water(self) -> bool {
-        matches!(self, Self::Fluid(FluidKind::Water) | Self::MobWater)
+        matches!(
+            self,
+            Self::Fluid(FluidKind::Water) | Self::Variant(_) | Self::MobWater
+        )
     }
 }
 
@@ -43,7 +48,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let state = self.state(pos);
         let item = if b.instance_of(state, Class::Liquid) {
             match b.fluid(state).kind() {
-                FluidKind::Water | FluidKind::FlowingWater => "minecraft:water_bucket",
+                FluidKind::Water | FluidKind::FlowingWater => {
+                    crate::fluid::variant_bucket(b.fluid(state).variant())
+                        .unwrap_or("minecraft:water_bucket")
+                }
                 FluidKind::Lava | FluidKind::FlowingLava => "minecraft:lava_bucket",
                 FluidKind::Empty => return None,
             }
@@ -91,8 +99,12 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 self.sound(pos, &sound, 1.0, 1.0);
                 return true;
             }
-            BucketContent::MobWater => FluidKind::Water,
+            BucketContent::MobWater | BucketContent::Variant(_) => FluidKind::Water,
             BucketContent::Fluid(fluid) => fluid,
+        };
+        let variant = match content {
+            BucketContent::Variant(v) => v,
+            _ => 0,
         };
         let mob = content == BucketContent::MobWater;
         let state = self.state(pos);
@@ -126,7 +138,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.place_liquid(
                 pos,
                 state,
-                FluidState::new(FluidKind::Water, 8, false),
+                FluidState::new(FluidKind::Water, 8, false).with_variant(variant),
                 creative,
             );
             self.empty_sound(pos, sound, mob);
@@ -143,7 +155,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             },
             8,
             false,
-        );
+        )
+        .with_variant(variant);
         let legacy: BlockStateId = b.legacy_block(source);
         if !self.set_block(pos, legacy, super::flags::UPDATE_ALL_IMMEDIATE)
             && !self.fluid_at(pos).is_source()

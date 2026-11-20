@@ -351,6 +351,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let b = self.b;
         let mut highest = 0;
         let mut sources = 0;
+        // The variant of the fullest neighbour it flows from, so salt water stays salt water.
+        let mut variant = 0;
         for direction in HORIZONTAL {
             let neighbour = self.rel_state(pos, direction);
             let fluid = b.fluid(neighbour);
@@ -360,13 +362,16 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 if fluid.is_source() {
                     sources += 1;
                 }
+                if i32::from(fluid.amount()) > highest || variant == 0 {
+                    variant = fluid.variant();
+                }
                 highest = highest.max(i32::from(fluid.amount()));
             }
         }
         if sources >= 2 && self.can_convert_to_source(kind) {
             let below_state = self.below_state(pos);
             if b.is_solid(below_state) || self.is_source_of(kind, b.fluid(below_state)) {
-                return FluidState::new(source_of(kind), 8, false);
+                return FluidState::new(source_of(kind), 8, false).with_variant(variant);
             }
         }
         let above_state = self.above_state(pos);
@@ -375,13 +380,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             && above_fluid.kind().same_family(kind)
             && self.can_pass_through_wall(Direction::Up, state, above_state)
         {
-            return FluidState::new(flowing_of(kind), 8, true);
+            return FluidState::new(flowing_of(kind), 8, true).with_variant(above_fluid.variant());
         }
         let amount = highest - self.drop_off(kind);
         if amount <= 0 {
             FluidState::EMPTY
         } else {
-            FluidState::new(flowing_of(kind), amount as u8, false)
+            FluidState::new(flowing_of(kind), amount as u8, false).with_variant(variant)
         }
     }
     fn is_water_hole(&self, kind: FluidKind, top: BlockStateId, bottom: BlockStateId) -> bool {
@@ -578,6 +583,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             for (direction, new_fluid) in self.spread_targets(kind, pos, state) {
                 let neighbour_pos = rel(pos, direction);
                 let neighbour_state = self.state(neighbour_pos);
+                let new_fluid = new_fluid.with_variant(fluid.variant());
                 self.spread_to(kind, neighbour_pos, neighbour_state, direction, new_fluid);
             }
         }
@@ -591,7 +597,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let below_state = self.state(below_pos);
         let below_fluid = self.b.fluid(below_state);
         if self.can_maybe_pass_through(kind, state, Direction::Down, below_state, below_fluid) {
-            let new_below = self.new_liquid(kind, below_pos, below_state);
+            let new_below = self
+                .new_liquid(kind, below_pos, below_state)
+                .with_variant(fluid.variant());
             if self.can_be_replaced_with(below_fluid, below_pos, new_below.kind(), Direction::Down)
                 && self.can_hold_specific_fluid(below_state, new_below.kind())
             {
