@@ -142,6 +142,13 @@ struct BlockFile {
     connects_to: Option<String>,
     #[serde(default)]
     thickness: Option<f32>,
+    /// `"water"`: the block is a liquid that flows, swims and renders as water (template
+    /// `minecraft:water`), under its own id.
+    #[serde(default)]
+    fluid: Option<String>,
+    /// For a block copying `minecraft:grass_block`: the block it dies to and spreads over.
+    #[serde(default)]
+    decays_to: Option<String>,
     #[serde(default = "yes")]
     item: bool,
     #[serde(default)]
@@ -176,6 +183,11 @@ pub struct Block {
     /// A connecting block's width in pixels (2 to 14): its shapes, the
     /// chorus plant's (10) when unset.
     pub thickness: Option<f32>,
+    /// `Some("water")`: a water-family liquid of the mod's own (salt water). Needs template
+    /// `minecraft:water`.
+    pub fluid: Option<String>,
+    /// A grass's own dirt: it dies to it and spreads over it (template `minecraft:grass_block`).
+    pub decays_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +228,9 @@ struct ItemFile {
     #[serde(default)]
     components: BTreeMap<String, serde_json::Value>,
     crafting_remainder: Option<String>,
+    /// For a bucket copying `minecraft:water_bucket`: the mod's water fluid block it holds.
+    #[serde(default)]
+    bucket_of: Option<String>,
 }
 
 /// An item the mod adds: a vanilla template item's components under a new
@@ -232,6 +247,9 @@ pub struct Item {
     /// What it leaves in the crafting grid (`Item.Properties.craftRemainder`):
     /// a vanilla item or one of the mod's own.
     pub crafting_remainder: Option<String>,
+    /// A bucket of a mod's water-family fluid (that block's id): pouring it places that fluid and
+    /// an empty bucket scooping that fluid gives this item. Needs template `minecraft:water_bucket`.
+    pub bucket_of: Option<String>,
 }
 
 /// `MobEffectCategory`.
@@ -531,6 +549,8 @@ impl Content {
                     .connects_to
                     .map(|t| t.trim_start_matches('#').to_owned()),
                 thickness: file.thickness,
+                fluid: file.fluid,
+                decays_to: file.decays_to,
             });
         }
         let mut remainders = Vec::new();
@@ -551,6 +571,11 @@ impl Content {
             if !ids.insert(item.clone()) {
                 return Err(format!("{name}: {item} is also a block's item"));
             }
+            if file.bucket_of.is_some() && file.template != "minecraft:water_bucket" {
+                return Err(format!(
+                    "{name}: bucket_of needs template minecraft:water_bucket"
+                ));
+            }
             if let Some(rest) = &file.crafting_remainder {
                 remainders.push((name, rest.clone()));
             }
@@ -561,6 +586,7 @@ impl Content {
                 rarity: file.rarity,
                 components: file.components,
                 crafting_remainder: file.crafting_remainder,
+                bucket_of: file.bucket_of,
             });
         }
         for (effect, name) in effects {
@@ -689,6 +715,22 @@ fn check_block(file: &BlockFile) -> Result<(), String> {
             "template {:?} is not a vanilla block (minecraft:...)",
             file.template
         ));
+    }
+    if let Some(fluid) = &file.fluid {
+        if fluid != "water" {
+            return Err(format!("fluid {fluid:?} is not \"water\""));
+        }
+        if file.template != "minecraft:water" {
+            return Err("a water fluid needs template minecraft:water".into());
+        }
+    }
+    if let Some(base) = &file.decays_to {
+        if file.template != "minecraft:grass_block" {
+            return Err("decays_to needs template minecraft:grass_block".into());
+        }
+        if !base.contains(':') || base.contains(char::is_whitespace) {
+            return Err(format!("decays_to {base:?} is not a block id"));
+        }
     }
     if let Some(shapes) = &file.shapes {
         if shapes.property.is_empty() || shapes.values.is_empty() {
@@ -894,12 +936,45 @@ capabilities = ["registries"]
                 components: BTreeMap::new(),
                 connects_to: None,
                 thickness: None,
+                fluid: None,
+                decays_to: None,
             }]
         );
         assert_eq!(content.items[0].id, "ruby:ruby");
         assert_eq!(content.items[0].rarity, Some(Rarity::Uncommon));
         assert!(content.items[0].components.is_empty());
         assert_eq!(content.items[0].crafting_remainder, None);
+    }
+
+    #[test]
+    fn a_water_fluid_block_needs_the_water_template() {
+        let load = |json: &'static [u8]| {
+            hmod(
+                "fluid",
+                MANIFEST_TEXT,
+                &[("data/ruby/horizon/block/brine.json", json)],
+            )
+        };
+        let ok = load(br#"{"template":"minecraft:water","fluid":"water","item":false}"#).unwrap();
+        assert_eq!(ok.blocks[0].fluid.as_deref(), Some("water"));
+        let wrong_template = load(br#"{"template":"minecraft:stone","fluid":"water"}"#);
+        assert!(wrong_template.unwrap_err().to_string().contains("template"));
+        let unknown = load(br#"{"template":"minecraft:water","fluid":"lava"}"#);
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn a_grass_names_its_own_dirt() {
+        let load = |json: &'static [u8]| {
+            hmod(
+                "grass",
+                MANIFEST_TEXT,
+                &[("data/ruby/horizon/block/turf.json", json)],
+            )
+        };
+        let ok = load(br#"{"template":"minecraft:grass_block","decays_to":"ruby:soil"}"#).unwrap();
+        assert_eq!(ok.blocks[0].decays_to.as_deref(), Some("ruby:soil"));
+        assert!(load(br#"{"template":"minecraft:stone","decays_to":"ruby:soil"}"#).is_err());
     }
 
     #[test]
