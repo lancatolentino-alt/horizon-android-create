@@ -130,7 +130,7 @@ impl FlatTerrain {
                 continue;
             }
             let height = shape.min_y + i as i32 + 1;
-            if matches!(name, "minecraft:water" | "minecraft:lava") {
+            if horizon_world::fluid::is_water_block_name(name) || name == "minecraft:lava" {
                 water.get_or_insert((height, state));
             } else {
                 surface = Some(crate::lod::Surface {

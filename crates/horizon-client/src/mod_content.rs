@@ -680,6 +680,13 @@ impl<'a> Plan<'a> {
                 let states = range(&decl.template).ok_or_else(|| {
                     format!("{}: template {} is not a block", decl.id, decl.template)
                 })?;
+                // A water-family liquid exists in the engine only while its mod is on.
+                if decl.fluid.is_some() {
+                    horizon_world::fluid::register_water_variant(&decl.id);
+                }
+                if let Some(base) = &decl.decays_to {
+                    horizon_world::level::register_block_link(&decl.id, base);
+                }
                 let shapes = if let Some(spec) = &decl.shapes {
                     let Some(J::Arr(rows)) = facts.get("states") else {
                         unreachable!()
@@ -889,6 +896,14 @@ impl<'a> Plan<'a> {
         }
         for m in &sorted {
             for i in &m.content.items {
+                // A mod's bucket of its own water fluid: the variant was registered with the block.
+                if let Some(variant) = i
+                    .bucket_of
+                    .as_deref()
+                    .and_then(horizon_world::fluid::water_variant_of)
+                {
+                    horizon_world::fluid::register_variant_bucket(variant, &i.id);
+                }
                 items.push(NewItem {
                     rename: Rename::new(&i.template, &i.id),
                     max_stack_size: i.max_stack_size,
@@ -903,6 +918,43 @@ impl<'a> Plan<'a> {
         items.sort_by(|a, b| a.rename.to.cmp(&b.rename.to));
         let mut tabs = Vec::new();
         let mut lang = BTreeMap::new();
+        // A mod's climate water colour map (TFC's `water.png`) tints water by temperature and
+        // groundwater in a TFC world.
+        for m in &sorted {
+            for ns in &m.content.namespaces {
+                for (file, fog) in [("water", false), ("water_fog", true)] {
+                    let Ok(bytes) = m
+                        .content
+                        .file(&format!("assets/{ns}/textures/colormap/{file}.png"))
+                    else {
+                        continue;
+                    };
+                    let mut reader =
+                        match png::Decoder::new(std::io::Cursor::new(bytes)).read_info() {
+                            Ok(reader) => reader,
+                            Err(_) => continue,
+                        };
+                    let mut buffer = vec![0; reader.output_buffer_size().unwrap_or(0)];
+                    let Ok(info) = reader.next_frame(&mut buffer) else {
+                        continue;
+                    };
+                    let channels = match info.color_type {
+                        png::ColorType::Rgb => 3,
+                        png::ColorType::Rgba => 4,
+                        _ => continue,
+                    };
+                    let colors: Vec<u32> = buffer[..info.buffer_size()]
+                        .chunks_exact(channels)
+                        .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
+                        .collect();
+                    if fog {
+                        horizon_world::tfc_water_tint::set_fog_colormap(colors);
+                    } else {
+                        horizon_world::tfc_water_tint::set_colormap(colors);
+                    }
+                }
+            }
+        }
         for m in &sorted {
             tabs.extend(m.content.creative_tabs.iter());
             for ns in &m.content.namespaces {
@@ -1507,14 +1559,19 @@ const BIOME_TAGS: &str = "worldgen/biome_tags.json";
 /// worldgen loader reads each from (id → the file's text): what structure
 /// mods hold. Biomes, noise and density functions change the terrain and
 /// are not read from mods.
-const WORLDGEN_BUNDLES: [(&str, &str); 6] = [
+const WORLDGEN_BUNDLES: [(&str, &str); 7] = [
     ("structure", "worldgen/structures.json"),
     ("structure_set", "worldgen/structure_sets.json"),
     ("template_pool", "worldgen/template_pools.json"),
     ("processor_list", "worldgen/processor_lists.json"),
     ("configured_feature", "worldgen/features.json"),
     ("placed_feature", "worldgen/placed_features.json"),
+    // TFC's biomes as decoration plans: `{ "features": [step, ...] }` per biome, for the
+    // native TerraFirmaCraft generator (the biomes themselves stay vanilla's).
+    ("tfc_biome", TFC_BIOMES),
 ];
+/// The bundle of TFC's per-biome feature lists; a mod makes it, the base has none.
+const TFC_BIOMES: &str = "worldgen/tfc_biomes.json";
 
 /// The registry of `command-registries.json` that each bundle's ids join,
 /// for the commands that suggest them (`/locate`, `/place`).
@@ -2122,6 +2179,32 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
         overlay.write(BIOME_TAGS, &serde_json::to_vec(&doc)?)?;
         biome_tag_doc = Some(doc);
     }
+    // Placed feature tags, merged into the worldgen loader's bundle likewise.
+    let feature_tag_files: Vec<(String, &TagMerge)> = tags
+        .iter()
+        .filter_map(|(file, merge)| {
+            let (ns, path) = file
+                .strip_prefix("data/")?
+                .split_once("/tags/worldgen/placed_feature/")?;
+            Some((format!("{ns}:{}", path.strip_suffix(".json")?), merge))
+        })
+        .collect();
+    if !feature_tag_files.is_empty() {
+        let mut doc = if base.join(FEATURE_TAGS).exists() {
+            read_json(&base.join(FEATURE_TAGS))?
+        } else {
+            J::Obj(Default::default())
+        };
+        for (id, merge) in feature_tag_files {
+            let text = match doc.get(&id) {
+                Some(J::Str(t)) if !merge.replaced => Some(t.clone()),
+                _ => None,
+            };
+            let merged = merge_tag(text.as_deref(), &merge.values, FEATURE_TAGS)?;
+            doc.set(&id, J::Str(merged));
+        }
+        overlay.write(FEATURE_TAGS, &serde_json::to_vec(&doc)?)?;
+    }
     // Structures and the pools, sets, processors and features they use, then
     // what mods add to sets, pools and lists, by priority, then in mod and
     // file order.
@@ -2130,10 +2213,14 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
     }
     let mut placed_doc = None;
     for (bundle, entries) in &worldgen {
-        if !base.join(bundle).exists() {
+        if !base.join(bundle).exists() && *bundle != TFC_BIOMES {
             continue;
         }
-        let mut doc = read_json(&base.join(bundle))?;
+        let mut doc = if base.join(bundle).exists() {
+            read_json(&base.join(bundle))?
+        } else {
+            J::Obj(Default::default())
+        };
         for (id, text) in entries {
             doc.set(id, J::Str(text.clone()));
         }

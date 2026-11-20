@@ -4521,10 +4521,8 @@ fn decode_lod_surfaces(
                     });
                     Some(state.map(|state| {
                         let properties = assets.properties.heightmap_state(state);
-                        let fluid = matches!(
-                            descriptor.name.as_str(),
-                            "minecraft:water" | "minecraft:lava"
-                        );
+                        let fluid = horizon_world::fluid::is_water_block_name(&descriptor.name)
+                            || descriptor.name == "minecraft:lava";
                         // Chorus is thin and non-solid but still far-End detail.
                         let chorus = matches!(
                             descriptor.name.as_str(),
