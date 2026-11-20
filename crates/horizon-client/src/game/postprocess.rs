@@ -44,7 +44,8 @@ impl Game<'_> {
                     let facts = level.facts.get(state);
                     let (fluid, liquid_block) = (
                         facts.fluid != Fluid::None,
-                        matches!(&*facts.name, "minecraft:water" | "minecraft:lava"),
+                        horizon_world::fluid::is_water_block_name(&facts.name)
+                            || &*facts.name == "minecraft:lava",
                     );
                     if fluid {
                         b.scheduled_fluid_tick(level, ticks, pos);

@@ -81,7 +81,9 @@ impl Game<'_> {
                     (at, count, 0.5, self.block_shape_top(at), true)
                 }
             }
-            None if &*facts.get(state).name == "minecraft:water" => (p, count * 3, 3.0, 1.0, false),
+            None if horizon_world::fluid::is_water_block_name(&facts.get(state).name) => {
+                (p, count * 3, 3.0, 1.0, false)
+            }
             // A mod block the level answered bone meal for: the port knows no
             // `BonemealableBlock.Type` for it, and vanilla's `GROWER` is the
             // one a block growing itself has, so the sparks stay inside it

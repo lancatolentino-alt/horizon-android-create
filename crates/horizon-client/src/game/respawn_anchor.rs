@@ -477,7 +477,9 @@ impl Game<'_> {
         name.ends_with("_banner")
             || name.ends_with("_sign")
             || name.ends_with("_pressure_plate")
-            || !(f.legacy_solid || matches!(name, "minecraft:water" | "minecraft:lava"))
+            || !(f.legacy_solid
+                || horizon_world::fluid::is_water_block_name(name)
+                || name == "minecraft:lava")
     }
     /// `RespawnAnchorBlock.findStandUpPosition`: a safe spot around the
     /// anchor, else any spot.

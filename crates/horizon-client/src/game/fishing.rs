@@ -467,7 +467,7 @@ impl Game<'_> {
             (fish[1] - 1.0).floor() as i32,
             fish[2].floor() as i32,
         );
-        &*self.res.facts().get(state).name == "minecraft:water"
+        horizon_world::fluid::is_water_block_name(&self.res.facts().get(state).name)
     }
     /// `ServerLevel.sendParticles` of a simple particle.
     fn send_particles(

@@ -1258,7 +1258,9 @@ impl Game<'_> {
         if self.dim == super::Dim::Nether
             && matches!(
                 content,
-                BucketContent::Fluid(FluidKind::Water) | BucketContent::MobWater
+                BucketContent::Fluid(FluidKind::Water)
+                    | BucketContent::Variant(_)
+                    | BucketContent::MobWater
             )
         {
             self.evaporation_smoke([target.0, target.1, target.2]);
