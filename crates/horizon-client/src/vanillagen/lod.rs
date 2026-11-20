@@ -294,13 +294,13 @@ fn columns(chunk: &ProtoChunk, biome_map: &[u16], dimension: &str) -> Arc<[Colum
             // where the sky showed through (white dots across the sea).
             if !properties.blocks_motion_in_heightmap()
                 && properties.has_fluid()
-                && !matches!(name, "minecraft:water" | "minecraft:lava")
+                && !(horizon_world::fluid::is_water_block_name(name) || name == "minecraft:lava")
                 && let Some(water) = water
             {
                 state = water;
                 name = "minecraft:water";
             }
-            let fluid = matches!(name, "minecraft:water" | "minecraft:lava");
+            let fluid = horizon_world::fluid::is_water_block_name(name) || name == "minecraft:lava";
             let biome = biome_map
                 .get(chunk.biome_id_at(x, y, z).0 as usize)
                 .copied()
