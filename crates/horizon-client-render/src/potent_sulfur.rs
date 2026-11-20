@@ -15,7 +15,9 @@ const ALLOWED_WATER_BLOCKS_ABOVE: i32 = 4;
 /// with no collision shape.
 pub fn is_geyser_passable_block(level: &ParticleLevel, pos: [i32; 3]) -> bool {
     let state = level.world.block(pos[0], pos[1], pos[2]);
-    if level.facts.is_air(state) || &*level.facts.get(state).name == "minecraft:water" {
+    if level.facts.is_air(state)
+        || horizon_world::fluid::is_water_block_name(&level.facts.get(state).name)
+    {
         return true;
     }
     let mut scene = SceneCollisions {
@@ -44,7 +46,8 @@ pub fn find_noxious_gas_source_block(level: &ParticleLevel, origin: [i32; 3]) ->
     let mut pos = [origin[0], origin[1] + 1, origin[2]];
     while pos[1] <= max_y {
         let state = level.world.block(pos[0], pos[1], pos[2]);
-        let is_water_block = &*level.facts.get(state).name == "minecraft:water";
+        let is_water_block =
+            horizon_world::fluid::is_water_block_name(&level.facts.get(state).name);
         if !is_water_source(level, pos)
             || (!is_water_block && !is_geyser_passable_block(level, pos))
         {

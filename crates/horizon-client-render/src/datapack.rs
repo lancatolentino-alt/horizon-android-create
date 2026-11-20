@@ -855,6 +855,8 @@ pub fn worldgen_overrides(
     biomes: impl Fn(&str) -> bool,
 ) -> (WorldgenOverrides, Vec<String>) {
     let mut out = WorldgenOverrides::default();
+    // TerraFirmaCraft terrain, climate and rock layers: the lowest layer, so packs still win.
+    horizon_world::worldgen::tfc::apply(&mut out);
     let mut not_read: BTreeMap<String, usize> = BTreeMap::new();
     let mut warnings = Vec::new();
     for pack in packs {

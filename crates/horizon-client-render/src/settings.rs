@@ -349,6 +349,10 @@ impl Settings {
             .parent()
             .map(crate::mod_list::ModList::load)
             .unwrap_or_default();
+        // The TFC worldgen places the `tfc` mod's blocks, so it follows that mod's switch.
+        horizon_world::worldgen::tfc::set_mod_enabled(
+            mods.enabled.contains("tfc") && !mods.disabled.contains("tfc"),
+        );
         let keypad = crate::keypad::Settings::load(&path.with_file_name("horizon-keypad.json"));
         let touch = crate::touch::Settings::load_from(&path.with_file_name("horizon-touch.json"));
         let settings = match fs::read(path) {
@@ -830,9 +834,6 @@ pub enum Opt {
     TouchInventoryControls,
     TouchMouseSensitivity,
     TouchCrosshairGestures,
-    TouchControlHub,
-    TouchUiVibration,
-    TouchGameVibration,
     TouchAttackButtonLook,
     TouchDynamicJoystick,
     TouchDynamicAreaX,
