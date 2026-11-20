@@ -148,6 +148,18 @@ impl<'r> FeatureBlockBindings<'r> {
                 .or_default()
                 .insert(id);
         }
+        // A mod's water-family blocks (salt water) answer to `minecraft:water` in predicates, as
+        // their fluid is water; nothing is added while no mod registers one.
+        for variant in 1..=crate::fluid::water_variant_count() as u8 {
+            if let Some(extra) = crate::fluid::water_variant_name(variant)
+                .and_then(|name| blocks.get(&name).cloned())
+            {
+                blocks
+                    .entry("minecraft:water".into())
+                    .or_default()
+                    .extend(extra);
+            }
+        }
         let mut bound_tags = BTreeMap::new();
         for (name, entries) in tags {
             let mut states = BTreeSet::new();
@@ -237,6 +249,40 @@ impl super::block_predicate::PredicateBlockResolver for FeatureBlockBindings<'_>
         json: &str,
     ) -> Result<super::fluid_predicate::BoundFluidSet, DecodeError> {
         self.fluids.resolve(json)
+    }
+    fn predicate_tfc_set(&self, kind: &str) -> Result<Arc<BTreeSet<BlockStateId>>, DecodeError> {
+        use super::tfc_tree::single_block_replaceable;
+        // `FluidHelpers.isAirOrEmptyFluid`: air, or the block of a fluid.
+        let fluidish = |n: &str| {
+            matches!(
+                n,
+                "minecraft:air"
+                    | "minecraft:cave_air"
+                    | "minecraft:void_air"
+                    | "minecraft:water"
+                    | "minecraft:lava"
+            ) || crate::fluid::is_water_block_name(n)
+        };
+        let air = |n: &str| {
+            matches!(
+                n,
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            )
+        };
+        let mut states = BTreeSet::new();
+        for (name, set) in self.blocks.iter() {
+            let hit = match kind {
+                "tfc:air_or_empty_fluid" => fluidish(name),
+                "tfc:replaceable" => fluidish(name) || single_block_replaceable(name),
+                // `isWorldgenReplaceable` and no fluid there.
+                "tfc:dry_replaceable" => air(name) || single_block_replaceable(name),
+                _ => return Err(DecodeError::Field("tfc block predicate")),
+            };
+            if hit {
+                states.extend(set.iter().copied());
+            }
+        }
+        Ok(Arc::new(states))
     }
     fn predicate_block_set(&self, json: &str) -> Result<Arc<BTreeSet<BlockStateId>>, DecodeError> {
         if let Ok(name) = serde_json::from_str::<String>(json) {
@@ -410,4 +456,110 @@ pub(crate) fn decode_targets(
             ))
         })
         .collect::<Result<_, DecodeError>>()
+}
+
+#[cfg(test)]
+mod tfc_predicate_tests {
+    use super::*;
+    use crate::{
+        registry::BlockRegistry,
+        worldgen::{block_predicate::BlockPredicate, tfc_tide_pool::tests::Flat},
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    struct Ctx(Flat);
+    impl crate::worldgen::placement::PlacementContext for Ctx {
+        fn generation(&self) -> crate::worldgen::anchor::WorldGenerationContext {
+            self.0.generation()
+        }
+        fn min_y(&mut self) -> Result<i32, crate::worldgen::placement::PlacementQueryError> {
+            self.0.min_y()
+        }
+        fn max_y(&mut self) -> Result<i32, crate::worldgen::placement::PlacementQueryError> {
+            self.0.max_y()
+        }
+        fn height(
+            &mut self,
+            kind: crate::heightmap::HeightmapType,
+            x: i32,
+            z: i32,
+        ) -> Result<i32, crate::worldgen::placement::PlacementQueryError> {
+            self.0.height(kind, x, z)
+        }
+        fn world_seed(&mut self) -> Result<i64, crate::worldgen::placement::PlacementQueryError> {
+            self.0.world_seed()
+        }
+        fn block_state(
+            &mut self,
+            pos: [i32; 3],
+        ) -> Result<BlockStateId, crate::worldgen::placement::PlacementQueryError> {
+            Ok(*self.0.blocks.get(&pos).unwrap())
+        }
+    }
+
+    #[test]
+    fn tfc_replaceable_predicates_follow_fluid_and_plant_rules() {
+        let names = [
+            "minecraft:air",
+            "minecraft:cave_air",
+            "minecraft:void_air",
+            "minecraft:water",
+            "minecraft:lava",
+            "minecraft:stone",
+            "minecraft:dandelion",
+            "tfc:groundcover/humus",
+        ];
+        let rows: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let props = if n.ends_with("water") || n.ends_with("lava") { json!({"level": "0"}) } else { json!({}) };
+                json!([n, n.ends_with("air"), n.ends_with("water") || n.ends_with("lava"), "", {"id": n, "properties": props}])
+            })
+            .collect();
+        let defaults: std::collections::BTreeMap<_, _> =
+            names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        let facts = json!({"states": rows, "defaults": defaults});
+        let registry: &'static BlockRegistry = Box::leak(Box::new(
+            BlockRegistry::from_facts_json(facts.to_string().as_bytes()).unwrap(),
+        ));
+        let bindings = FeatureBlockBindings::new(registry, BTreeSet::new()).unwrap();
+        let id = |n: &str| registry.default_state(n).unwrap();
+        let mut blocks = HashMap::new();
+        for (i, n) in names.iter().enumerate() {
+            blocks.insert([i as i32, 10, 0], id(n));
+        }
+        let mut world = Ctx(Flat {
+            blocks,
+            surface: 0,
+            rock: id("minecraft:stone"),
+            air: id("minecraft:air"),
+        });
+        let mut verdicts = |kind: &str| -> Vec<bool> {
+            let p = BlockPredicate::from_json_with_blocks(
+                &json!({"type": kind}).to_string(),
+                &bindings,
+            )
+            .unwrap();
+            (0..names.len() as i32)
+                .map(|i| {
+                    p.test(&mut world, [i, 10, 0])
+                        .unwrap_or_else(|e| panic!("{kind} {i}: {e:?} {p:?}"))
+                })
+                .collect()
+        };
+        // air x3, water, lava, stone, dandelion, humus
+        assert_eq!(
+            verdicts("tfc:air_or_empty_fluid"),
+            [true, true, true, true, true, false, false, false]
+        );
+        assert_eq!(
+            verdicts("tfc:replaceable"),
+            [true, true, true, true, true, false, true, true]
+        );
+        assert_eq!(
+            verdicts("tfc:dry_replaceable"),
+            [true, true, true, false, false, false, true, true]
+        );
+    }
 }

@@ -11,7 +11,8 @@ use super::{
 };
 pub use canyon::{CanyonCarver, CanyonShape};
 pub use generation::{
-    CarverCatalog, MaskGenerationError, WorldCarver, generate_carving_mask, large_feature_random,
+    CarverCatalog, MaskGenerationError, WorldCarver, generate_carving_mask,
+    generate_positional_carving_mask, large_feature_random,
 };
 use horizon_core::{
     carving::{CarveError, CarverOutput, can_reach, carve_ellipsoid_with_budget},

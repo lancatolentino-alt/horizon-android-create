@@ -228,6 +228,41 @@ impl FeatureCatalog {
             required(&object, "type")?.get(),
         )?)?;
         match kind.as_str() {
+            "tfc:forest" => {
+                let entries =
+                    match serde_json::from_str::<String>(required(&object, "entries")?.get()) {
+                        Ok(name) => match name.strip_prefix('#') {
+                            Some(tag) => {
+                                self.tags.get(&identifier(tag)?).cloned().ok_or_else(|| {
+                                    DecodeError::Registry(format!("unknown tag {tag}"))
+                                })?
+                            }
+                            None => vec![name],
+                        },
+                        Err(_) => serde_json::from_str::<Vec<String>>(
+                            required(&object, "entries")?.get(),
+                        )?,
+                    };
+                let expanded = entries
+                    .iter()
+                    .map(|name| self.named(name, false, depth, work).and_then(raw))
+                    .collect::<Result<Vec<_>, _>>()?;
+                object.insert("entries".into(), raw(serde_json::to_string(&expanded)?)?);
+            }
+            "tfc:forest_entry" => {
+                for key in [
+                    "normal_tree",
+                    "dead_tree",
+                    "old_growth_tree",
+                    "krummholz",
+                    "soil_disc",
+                ] {
+                    if let Some(value) = super::optional(&object, key) {
+                        let expanded = self.expand_feature(value, depth + 1, work)?;
+                        object.insert(key.into(), raw(expanded)?);
+                    }
+                }
+            }
             "minecraft:single_block_pillar" => {
                 if let Some(value) = super::optional(&object, "cap_feature") {
                     let expanded = self.expand_placed(value, depth + 1, work)?;
@@ -239,7 +274,11 @@ impl FeatureCatalog {
                     self.expand_placed(required(&object, "vegetation_feature")?, depth + 1, work)?;
                 object.insert("vegetation_feature".into(), raw(expanded)?);
             }
-            "minecraft:coral_tree" | "minecraft:coral_claw" | "minecraft:root_system" => {
+            "minecraft:coral_tree"
+            | "minecraft:coral_claw"
+            | "minecraft:root_system"
+            | "tfc:random_patch"
+            | "tfc:dynamic_random_patch" => {
                 let expanded =
                     self.expand_placed(required(&object, "feature")?, depth + 1, work)?;
                 object.insert("feature".into(), raw(expanded)?);
@@ -266,9 +305,31 @@ impl FeatureCatalog {
                     object.insert(super::tree::GROUND_FEATURE_KEY.into(), raw(expanded)?);
                 }
             }
-            "minecraft:sequence" | "minecraft:overlay" | "minecraft:simple_random_selector" => {
+            // `BlockWithFluidFeature`: a simple block whose fluid is the fluid already there. The
+            // mod's plants have no fluid property, so it is a simple block placement.
+            "tfc:block_with_fluid" => {
+                object.insert("type".into(), raw("\"minecraft:simple_block\"".to_owned())?);
+            }
+            "minecraft:sequence"
+            | "minecraft:overlay"
+            | "minecraft:simple_random_selector"
+            | "tfc:multiple"
+            | "tfc:noisy_multiple" => {
                 let expanded = self.expand_set(required(&object, "features")?, depth + 1, work)?;
                 object.insert("features".into(), raw(expanded)?);
+                if kind == "tfc:multiple" {
+                    // `MultipleFeature` places every feature and keeps any success.
+                    object.insert("type".into(), raw("\"minecraft:overlay\"".to_owned())?);
+                }
+            }
+            "tfc:if_then" => {
+                // `IfThenFeature`: place `if`, and only then `then`.
+                let first = self.expand_placed(required(&object, "if")?, depth + 1, work)?;
+                let second = self.expand_placed(required(&object, "then")?, depth + 1, work)?;
+                object.remove("if");
+                object.remove("then");
+                object.insert("type".into(), raw("\"minecraft:sequence\"".to_owned())?);
+                object.insert("features".into(), raw(format!("[{first},{second}]"))?);
             }
             "minecraft:random_boolean_selector" => {
                 for name in ["feature_true", "feature_false"] {
@@ -300,5 +361,49 @@ impl FeatureCatalog {
             _ => {}
         }
         Ok(serde_json::to_string(&object)?)
+    }
+}
+
+#[cfg(test)]
+mod tfc_composite_tests {
+    use super::*;
+
+    fn catalog() -> FeatureCatalog {
+        let features: BTreeMap<String, String> = [
+            ("tfc:noop", r#"{"type":"minecraft:no_op"}"#),
+            (
+                "tfc:pair",
+                r#"{"type":"tfc:if_then","if":"tfc:p","then":"tfc:q"}"#,
+            ),
+            (
+                "tfc:many",
+                r#"{"type":"tfc:multiple","features":["tfc:p","tfc:q"]}"#,
+            ),
+            (
+                "tfc:noisy",
+                r#"{"type":"tfc:noisy_multiple","features":["tfc:p","tfc:q"]}"#,
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let placed: BTreeMap<String, String> = [
+            ("tfc:p", r#"{"feature":"tfc:noop","placement":[]}"#),
+            ("tfc:q", r#"{"feature":"tfc:noop","placement":[]}"#),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        FeatureCatalog::from_resources(&features, &placed, &TagDefinitions::default()).unwrap()
+    }
+
+    #[test]
+    fn tfc_composites_decode() {
+        let catalog = catalog();
+        for name in ["tfc:pair", "tfc:many", "tfc:noisy"] {
+            catalog
+                .feature(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 }

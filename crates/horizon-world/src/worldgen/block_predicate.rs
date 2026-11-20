@@ -51,6 +51,10 @@ pub trait PredicateBlockResolver {
         Err(DecodeError::Field("predicate fluid registry"))
     }
     fn predicate_block_set(&self, json: &str) -> Result<Arc<BTreeSet<BlockStateId>>, DecodeError>;
+    /// TFC's name-based predicates: `air_or_empty_fluid`, `replaceable`, `dry_replaceable`.
+    fn predicate_tfc_set(&self, _kind: &str) -> Result<Arc<BTreeSet<BlockStateId>>, DecodeError> {
+        Err(DecodeError::Field("predicate block registry"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +132,8 @@ impl BlockPredicate {
             required(&object, "type")?.get(),
         )?)?;
         match kind.as_str() {
-            "minecraft:would_survive" => Ok(Self::WouldSurvive {
+            // `WouldSurviveWithFluidPredicate` is checked as a plain would-survive here.
+            "minecraft:would_survive" | "tfc:would_survive_with_fluid" => Ok(Self::WouldSurvive {
                 state: blocks
                     .ok_or(DecodeError::Field("predicate block state registry"))?
                     .predicate_state(required(&object, "state")?.get())?,
@@ -170,6 +175,17 @@ impl BlockPredicate {
                     .transpose()?
                     .unwrap_or([0; 3]),
             }),
+            "tfc:air_or_empty_fluid" | "tfc:replaceable" | "tfc:dry_replaceable" => {
+                Ok(Self::MatchingBlocks {
+                    states: blocks
+                        .ok_or(DecodeError::Field("predicate block registry"))?
+                        .predicate_tfc_set(&kind)?,
+                    offset: optional(&object, "offset")
+                        .map(offset)
+                        .transpose()?
+                        .unwrap_or([0; 3]),
+                })
+            }
             "minecraft:unobstructed" => {
                 if let Some(raw) = optional(&object, "offset") {
                     vector(raw)?;

@@ -54,10 +54,185 @@ pub enum PlacementModifier {
     Offset([IntProvider; 3]),
     HeightRange(HeightProvider),
     Rarity(i32),
+    /// Passes only where the TFC biome at the position is one of these (`tfc_biome` ids).
+    TfcBiome(Vec<i32>),
+    /// TFC's `tfc:flat_enough`: moves down until a `(2r+1)^2` square of non-air, non-fluid blocks
+    /// holds more than `flatness` of its cells.
+    FlatEnough {
+        flatness: f32,
+        radius: i32,
+        max_depth: i32,
+        solid: BlockPredicate,
+    },
+    /// TFC's `tfc:no_solid_neighbors`: passes if any horizontal neighbour is not replaceable.
+    TfcNoSolidNeighbors(BlockPredicate),
+    /// TFC's `tfc:near_fluid`: passes if a fluid matching `fluids` is within `radius` at or below.
+    TfcNearFluid {
+        radius: i32,
+        fluid: BlockPredicate,
+    },
+    /// TFC's `tfc:underground`: passes below the `WORLD_SURFACE_WG` height.
+    TfcUnderground,
+    /// TFC's `tfc:on_top`: passes where the predicate holds one block below.
+    TfcOnTop(BlockPredicate),
+    /// TFC's `tfc:shallow_water`: passes above 1 to `max_depth` blocks of water, thinning with depth.
+    TfcShallowWater {
+        min_depth: i32,
+        max_depth: i32,
+        water: BlockPredicate,
+    },
+    /// TFC's `tfc:intertidal`.
+    TfcIntertidal {
+        min: i32,
+        max: i32,
+    },
+    /// TFC's `tfc:climate`: passes where the column's climate is inside every range.
+    TfcClimate(Box<TfcClimate>),
+    /// TFC's `tfc:volcano`, `tfc:tuff_ring`, `tfc:tuya`, `tfc:atoll` and `tfc:stratovolcano`.
+    TfcCentered(Box<super::tfc_volcano_placement::CenterPlacement>),
+    /// TFC's `tfc:carving_mask`: every cell of the chunk's carving mask between two heights.
+    TfcCarvingMask {
+        min_y: super::anchor::VerticalAnchor,
+        max_y: super::anchor::VerticalAnchor,
+        air: bool,
+    },
+    /// TFC's `tfc:ocean_ridge`.
+    TfcOceanRidge {
+        min: i32,
+        max: i32,
+    },
     RandomChance(f32),
     Fixed(Vec<[i32; 3]>),
     RandomlySelected(Vec<Self>),
 }
+/// `ClimatePlacement`.
+#[derive(Clone, Debug)]
+pub struct TfcClimate {
+    min_temperature: f32,
+    max_temperature: f32,
+    min_groundwater: f32,
+    max_groundwater: f32,
+    min_rain_variance: f32,
+    max_rain_variance: f32,
+    rain_variance_absolute: bool,
+    min_forest: i32,
+    max_forest: i32,
+    forest_types: Vec<String>,
+    min_elevation: i32,
+    max_elevation: i32,
+    fuzzy: bool,
+    ignore_rivers: bool,
+}
+
+impl TfcClimate {
+    fn decode(object: &Object) -> Result<Self, DecodeError> {
+        let float = |name: &'static str, default: f32| -> Result<f32, DecodeError> {
+            optional(object, name)
+                .map(|v| {
+                    number_text(v)
+                        .and_then(|t| t.parse().map_err(|_| DecodeError::Field("climate")))
+                })
+                .transpose()
+                .map(|v| v.unwrap_or(default))
+        };
+        let int = |name: &'static str, default: i32| -> Result<i32, DecodeError> {
+            Ok(optional(object, name)
+                .map(integer)
+                .transpose()?
+                .unwrap_or(default))
+        };
+        let flag = |name: &'static str| -> Result<bool, DecodeError> {
+            Ok(optional(object, name)
+                .map(|v| serde_json::from_str::<bool>(v.get()))
+                .transpose()?
+                .unwrap_or(false))
+        };
+        Ok(Self {
+            min_temperature: float("min_temperature", f32::NEG_INFINITY)?,
+            max_temperature: float("max_temperature", f32::INFINITY)?,
+            min_groundwater: float("min_groundwater", f32::NEG_INFINITY)?,
+            max_groundwater: float("max_groundwater", f32::INFINITY)?,
+            min_rain_variance: float("min_rain_variance", -1.0)?,
+            max_rain_variance: float("max_rain_variance", 1.0)?,
+            rain_variance_absolute: flag("rain_variance_absolute")?,
+            min_forest: int("min_forest", 0)?,
+            max_forest: int("max_forest", 4)?,
+            forest_types: optional(object, "forest_types")
+                .map(|v| serde_json::from_str::<Vec<String>>(v.get()))
+                .transpose()?
+                .unwrap_or_default(),
+            min_elevation: int("min_elevation", -64)?,
+            max_elevation: int("max_elevation", 320)?,
+            fuzzy: flag("fuzzy")?,
+            ignore_rivers: flag("ignore_rivers")?,
+        })
+    }
+
+    /// `ClimatePlacement.isValid`.
+    fn is_valid<R: RandomSource>(
+        &self,
+        terrain: &super::tfc_terrain::TfcTerrain,
+        random: &mut R,
+        [x, y, z]: [i32; 3],
+    ) -> Result<bool, InvalidBound> {
+        let sample = terrain.climate_at(x, z);
+        // `SolarCalculator.getInNorthernHemisphere`: southern hemispheres flip the rain variance.
+        let scale = terrain.hemisphere_scale();
+        let north = if scale == 0.0 {
+            true
+        } else {
+            let adjusted = z.wrapping_sub((scale / 2.0) as i32);
+            let pole_to_pole = (scale * 2.0) as i32;
+            adjusted.rem_euclid(pole_to_pole * 2) > pole_to_pole
+        };
+        let rain_variance = if self.rain_variance_absolute {
+            sample.rain_variance.abs()
+        } else {
+            sample.rain_variance * if north { 1.0 } else { -1.0 }
+        };
+        // `EnvironmentHelpers.adjustAvgTempForElev`.
+        let temperature = if y > 63 {
+            sample.sea_level_temperature - ((y - 63) as f32 * 0.16225).clamp(0.0, 17.822)
+        } else {
+            sample.sea_level_temperature
+        };
+        let groundwater = if self.ignore_rivers {
+            sample.rainfall
+        } else {
+            sample.groundwater
+        };
+        let density = sample.forest.data().density;
+        if !(y >= self.min_elevation
+            && y <= self.max_elevation
+            && self.min_temperature <= temperature
+            && temperature <= self.max_temperature
+            && self.min_groundwater <= groundwater
+            && groundwater <= self.max_groundwater
+            && self.min_rain_variance <= rain_variance
+            && self.max_rain_variance >= rain_variance
+            && self.min_forest <= density
+            && density <= self.max_forest
+            && (self.forest_types.is_empty()
+                || self.forest_types.iter().any(|t| t == sample.forest.name())))
+        {
+            return Ok(false);
+        }
+        if self.fuzzy {
+            let target_t = (self.min_temperature + self.max_temperature) / 2.0;
+            let target_g = (self.min_groundwater + self.max_groundwater) / 2.0;
+            let target_r = (self.min_rain_variance + self.max_rain_variance) / 2.0;
+            let dt = (temperature - target_t).abs() / (self.max_temperature - self.min_temperature);
+            let dg = (groundwater - target_g).abs() / (self.max_groundwater - self.min_groundwater);
+            let dr = (rain_variance - target_r).abs()
+                / (self.max_rain_variance - self.min_rain_variance);
+            let a = random.next_float();
+            let b = random.next_float();
+            return Ok(a * b > dt.max(dg.max(dr)));
+        }
+        Ok(true)
+    }
+}
+
 #[derive(Debug)]
 pub enum PlacementError<E> {
     Random(InvalidBound),
@@ -225,6 +400,196 @@ impl PlacementModifier {
             "minecraft:height_range" => Ok(Self::HeightRange(HeightProvider::from_json(
                 required(&object, "height")?.get(),
             )?)),
+            "tfc:biome" => {
+                let names: Vec<String> = serde_json::from_str(required(&object, "biomes")?.get())?;
+                let mut ids = Vec::with_capacity(names.len());
+                for name in &names {
+                    let id = super::tfc_biome::BIOME_NAMES
+                        .iter()
+                        .position(|n| n == name)
+                        .ok_or(DecodeError::Field("tfc biome name"))?;
+                    ids.push(id as i32);
+                }
+                Ok(Self::TfcBiome(ids))
+            }
+            "tfc:no_solid_neighbors" => Ok(Self::TfcNoSolidNeighbors(
+                BlockPredicate::decode_with_blocks(
+                    r#"{"type":"minecraft:replaceable"}"#,
+                    0,
+                    &mut 4096,
+                    blocks,
+                )?,
+            )),
+            "tfc:near_fluid" => {
+                let radius = optional(&object, "radius")
+                    .map(integer)
+                    .transpose()?
+                    .unwrap_or(2);
+                if radius < 0 {
+                    return Err(DecodeError::Field("near fluid radius"));
+                }
+                let json = match optional(&object, "fluids") {
+                    Some(fluids) => format!(
+                        r#"{{"type":"minecraft:matching_fluids","fluids":{}}}"#,
+                        fluids.get()
+                    ),
+                    None => r#"{"type":"minecraft:not","predicate":{"type":"minecraft:matching_fluids","fluids":"minecraft:empty"}}"#
+                        .to_owned(),
+                };
+                Ok(Self::TfcNearFluid {
+                    radius,
+                    fluid: BlockPredicate::decode_with_blocks(&json, 0, &mut 4096, blocks)?,
+                })
+            }
+            "tfc:underground" => Ok(Self::TfcUnderground),
+            "tfc:on_top" => Ok(Self::TfcOnTop(BlockPredicate::decode_with_blocks(
+                required(&object, "predicate")?.get(),
+                depth + 1,
+                remaining,
+                blocks,
+            )?)),
+            "tfc:shallow_water" => {
+                let depth_of = |name: &'static str, default: i32| -> Result<i32, DecodeError> {
+                    Ok(optional(&object, name)
+                        .map(integer)
+                        .transpose()?
+                        .unwrap_or(default))
+                };
+                let (min_depth, max_depth) = (depth_of("min_depth", 0)?, depth_of("max_depth", 5)?);
+                if min_depth < 0 || max_depth < 0 {
+                    return Err(DecodeError::Field("shallow water depth"));
+                }
+                Ok(Self::TfcShallowWater {
+                    min_depth,
+                    max_depth,
+                    // `#tfc:any_infinite_water`: fresh and salt water, both `minecraft:water` here.
+                    water: BlockPredicate::decode_with_blocks(
+                        r#"{"type":"minecraft:matching_fluids","fluids":["minecraft:water"]}"#,
+                        0,
+                        &mut 4096,
+                        blocks,
+                    )?,
+                })
+            }
+            "tfc:intertidal" => Ok(Self::TfcIntertidal {
+                min: optional(&object, "min_elevation")
+                    .map(integer)
+                    .transpose()?
+                    .unwrap_or(-64),
+                max: optional(&object, "max_elevation")
+                    .map(integer)
+                    .transpose()?
+                    .unwrap_or(320),
+            }),
+            "tfc:climate" => Ok(Self::TfcClimate(Box::new(TfcClimate::decode(&object)?))),
+            "tfc:volcano" | "tfc:tuff_ring" | "tfc:tuya" | "tfc:atoll" | "tfc:stratovolcano" => {
+                use super::tfc_volcano::CenterKind;
+                let float = |name: &'static str, default: f32| -> Result<f32, DecodeError> {
+                    optional(&object, name)
+                        .map(|v| {
+                            number_text(v).and_then(|t| {
+                                t.parse()
+                                    .map_err(|_| DecodeError::Field("centered feature"))
+                            })
+                        })
+                        .transpose()
+                        .map(|v| v.unwrap_or(default))
+                };
+                let flag = |name: &'static str| -> Result<bool, DecodeError> {
+                    Ok(optional(&object, name)
+                        .map(|v| serde_json::from_str::<bool>(v.get()))
+                        .transpose()?
+                        .unwrap_or(false))
+                };
+                let variant = optional(&object, "variant")
+                    .map(|v| serde_json::from_str::<String>(v.get()))
+                    .transpose()?
+                    .filter(|v| v != "all");
+                Ok(Self::TfcCentered(Box::new(
+                    super::tfc_volcano_placement::CenterPlacement {
+                        kind: match kind.as_str() {
+                            "tfc:volcano" => CenterKind::Cinder,
+                            "tfc:tuff_ring" => CenterKind::TuffRing,
+                            "tfc:tuya" => CenterKind::Tuya,
+                            "tfc:atoll" => CenterKind::Atoll,
+                            _ => CenterKind::Stratovolcano,
+                        },
+                        center: flag("center")?,
+                        use_offset_center: flag("use_offset_center")?,
+                        variant,
+                        min_easing: float("min_easing", 0.0)?,
+                        max_easing: float("max_easing", 1.0)?,
+                        hash_min: float("hash_min", 0.0)?,
+                        hash_max: float("hash_max", 1.0)?,
+                    },
+                )))
+            }
+            "tfc:carving_mask" => {
+                let anchor =
+                    |name: &'static str,
+                     default: super::anchor::VerticalAnchor|
+                     -> Result<super::anchor::VerticalAnchor, DecodeError> {
+                        optional(&object, name)
+                            .map(|v| super::anchor::VerticalAnchor::from_json(v.get()))
+                            .transpose()
+                            .map(|v| v.unwrap_or(default))
+                    };
+                let step: String = serde_json::from_str(required(&object, "step")?.get())?;
+                Ok(Self::TfcCarvingMask {
+                    min_y: anchor("min_y", super::anchor::VerticalAnchor::BOTTOM)?,
+                    max_y: anchor("max_y", super::anchor::VerticalAnchor::TOP)?,
+                    air: match step.as_str() {
+                        "air" => true,
+                        "liquid" => false,
+                        _ => return Err(DecodeError::Field("carving step")),
+                    },
+                })
+            }
+            "tfc:ocean_ridge" => Ok(Self::TfcOceanRidge {
+                min: optional(&object, "min_distance")
+                    .map(integer)
+                    .transpose()?
+                    .unwrap_or(0),
+                max: optional(&object, "max_distance")
+                    .map(integer)
+                    .transpose()?
+                    .unwrap_or(i32::MAX),
+            }),
+            "tfc:flat_enough" => {
+                let flatness: f32 = optional(&object, "flatness")
+                    .map(|v| {
+                        number_text(v)
+                            .and_then(|t| t.parse().map_err(|_| DecodeError::Field("flatness")))
+                    })
+                    .transpose()?
+                    .unwrap_or(0.5);
+                if !(0. ..=1.).contains(&flatness) {
+                    return Err(DecodeError::Field("flatness"));
+                }
+                // `!stateAt.isAir() && stateAt.getFluidState().getType() == Fluids.EMPTY`
+                let solid = BlockPredicate::decode_with_blocks(
+                    r#"{"type":"minecraft:all_of","predicates":[
+                    {"type":"minecraft:not","predicate":{"type":"minecraft:matching_blocks","blocks":["minecraft:air","minecraft:cave_air","minecraft:void_air"]}},
+                    {"type":"minecraft:matching_fluids","fluids":"minecraft:empty"}]}"#,
+                    0,
+                    &mut 4096,
+                    blocks,
+                )?;
+                Ok(Self::FlatEnough {
+                    flatness,
+                    radius: optional(&object, "radius")
+                        .map(integer)
+                        .transpose()?
+                        .unwrap_or(2)
+                        .max(1),
+                    max_depth: optional(&object, "max_depth")
+                        .map(integer)
+                        .transpose()?
+                        .unwrap_or(4)
+                        .max(1),
+                    solid,
+                })
+            }
             "minecraft:rarity_filter" => Ok(Self::Rarity(int_range(
                 required(&object, "chance")?,
                 "chance",
@@ -472,6 +837,128 @@ impl PlacementModifier {
                 let y = height.sample(random, context.generation())?;
                 emit(random, [x, y, z]).map_err(PlacementError::Output)?;
             }
+            Self::TfcBiome(ids) => {
+                let seed = context.world_seed()?;
+                if let Some(terrain) = super::tfc_terrain::active_for(seed)
+                    && ids.contains(&terrain.biome_at_quart(x >> 2, z >> 2))
+                {
+                    emit(random, position).map_err(PlacementError::Output)?;
+                }
+            }
+            Self::TfcNoSolidNeighbors(replaceable) => {
+                for [dx, dz] in [[0, -1], [0, 1], [-1, 0], [1, 0]] {
+                    if !replaceable.test_inner(context, [x + dx, y, z + dz], 0, remaining)? {
+                        return emit(random, position).map_err(PlacementError::Output);
+                    }
+                }
+            }
+            Self::TfcNearFluid { radius, fluid } => {
+                for dx in -*radius..=*radius {
+                    for dz in -*radius..=*radius {
+                        for dy in -*radius..=0 {
+                            if fluid.test_inner(context, [x + dx, y + dy, z + dz], 0, remaining)? {
+                                return emit(random, position).map_err(PlacementError::Output);
+                            }
+                        }
+                    }
+                }
+            }
+            Self::TfcUnderground => {
+                if y < context.height(HeightmapType::WorldSurfaceWg, x, z)? {
+                    emit(random, position).map_err(PlacementError::Output)?;
+                }
+            }
+            Self::TfcOnTop(predicate) => {
+                if predicate.test_inner(context, [x, y - 1, z], 0, remaining)? {
+                    emit(random, position).map_err(PlacementError::Output)?;
+                }
+            }
+            Self::TfcShallowWater {
+                min_depth,
+                max_depth,
+                water,
+            } => {
+                for i in 0..*max_depth {
+                    if !water.test_inner(context, [x, y - 1 - i, z], 0, remaining)? {
+                        if i < *min_depth {
+                            return Ok(());
+                        }
+                        if f64::from(random.next_float()) > f64::from(i) / f64::from(*max_depth) {
+                            emit(random, position).map_err(PlacementError::Output)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            Self::TfcIntertidal { min, max } => {
+                let seed = context.world_seed()?;
+                if let Some(terrain) = super::tfc_terrain::active_for(seed) {
+                    let diff = (f64::from(y) - terrain.tide_level(x, z)) as i32;
+                    if *min <= diff && diff <= *max {
+                        emit(random, position).map_err(PlacementError::Output)?;
+                    }
+                }
+            }
+            Self::TfcCentered(placement) => {
+                let seed = context.world_seed()?;
+                if let Some(terrain) = super::tfc_terrain::active_for(seed)
+                    && let Some(found) = placement.position(&terrain, position)
+                {
+                    emit(random, found).map_err(PlacementError::Output)?;
+                }
+            }
+            Self::TfcCarvingMask { min_y, max_y, air } => {
+                // Only the air mask is ever marked; the liquid one stays empty.
+                if *air {
+                    let seed = context.world_seed()?;
+                    if let Some(terrain) = super::tfc_terrain::active_for(seed) {
+                        let generation = context.predicate_generation()?;
+                        let (low, high) = (min_y.resolve(generation), max_y.resolve(generation));
+                        for cell in terrain.air_carving_cells(x >> 4, z >> 4).iter() {
+                            if cell[1] >= low && cell[1] <= high {
+                                emit(random, *cell).map_err(PlacementError::Output)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Self::TfcOceanRidge { min, max } => {
+                let seed = context.world_seed()?;
+                let distance = super::tfc_biome_noise::ocean_ridge_distance_at(seed, x, z);
+                if f64::from(*min) <= distance && distance <= f64::from(*max) {
+                    emit(random, position).map_err(PlacementError::Output)?;
+                }
+            }
+            Self::TfcClimate(climate) => {
+                let seed = context.world_seed()?;
+                if let Some(terrain) = super::tfc_terrain::active_for(seed)
+                    && climate.is_valid(&terrain, random, position)?
+                {
+                    emit(random, position).map_err(PlacementError::Output)?;
+                }
+            }
+            Self::FlatEnough {
+                flatness,
+                radius,
+                max_depth,
+                solid,
+            } => {
+                let side = 1.0f32 + 2.0 * *radius as f32;
+                for down in 0..*max_depth {
+                    let mut flat = 0;
+                    for dx in -*radius..=*radius {
+                        for dz in -*radius..=*radius {
+                            let at = [x + dx, y - down, z + dz];
+                            if solid.test_inner(context, at, 0, remaining)? {
+                                flat += 1;
+                            }
+                        }
+                    }
+                    if flat as f32 / (side * side) > *flatness {
+                        return emit(random, [x, y - down, z]).map_err(PlacementError::Output);
+                    }
+                }
+            }
             Self::Rarity(chance) => {
                 if random.next_float() < 1. / *chance as f32 {
                     emit(random, position).map_err(PlacementError::Output)?;
@@ -501,5 +988,190 @@ impl PlacementModifier {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tfc_climate_tests {
+    use super::*;
+    use horizon_core::random::XoroshiroRandom;
+
+    #[test]
+    fn climate_filter_follows_the_chunk_data_ranges() {
+        let terrain = super::super::tfc_terrain::TfcTerrain::new(12345);
+        let (x, z) = (200, -340);
+        let s = terrain.climate_at(x, z);
+        let near = |lo: f32, hi: f32| {
+            format!(
+                r#"{{"type":"tfc:climate","min_temperature":{},"max_temperature":{},"min_groundwater":{},"max_groundwater":{}}}"#,
+                s.sea_level_temperature + lo,
+                s.sea_level_temperature + hi,
+                s.groundwater - 1.0,
+                s.groundwater + 1.0
+            )
+        };
+        let decode = |json: String| {
+            let object: Object = serde_json::from_str(&json).unwrap();
+            TfcClimate::decode(&object).unwrap()
+        };
+        let mut random = XoroshiroRandom::new(1);
+        // At sea level the temperature is the layer's value, so a window around it passes...
+        assert!(
+            decode(near(-1.0, 1.0))
+                .is_valid(&terrain, &mut random, [x, 63, z])
+                .unwrap()
+        );
+        // ...a window above it does not...
+        assert!(
+            !decode(near(1.0, 2.0))
+                .is_valid(&terrain, &mut random, [x, 63, z])
+                .unwrap()
+        );
+        // ...and climbing 100 blocks cools the column by 16.225 degrees.
+        assert!(
+            !decode(near(-1.0, 1.0))
+                .is_valid(&terrain, &mut random, [x, 163, z])
+                .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tfc_surface_placement_tests {
+    use super::*;
+    use crate::{
+        registry::{BlockRegistry, BlockStateId},
+        worldgen::block_feature::FeatureBlockBindings,
+        worldgen::tfc_tide_pool::tests::Flat,
+    };
+    use horizon_core::random::XoroshiroRandom;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    struct Ctx(Flat);
+    impl PlacementContext for Ctx {
+        fn generation(&self) -> WorldGenerationContext {
+            self.0.generation()
+        }
+        fn min_y(&mut self) -> Result<i32, PlacementQueryError> {
+            self.0.min_y()
+        }
+        fn max_y(&mut self) -> Result<i32, PlacementQueryError> {
+            self.0.max_y()
+        }
+        fn height(
+            &mut self,
+            kind: HeightmapType,
+            x: i32,
+            z: i32,
+        ) -> Result<i32, PlacementQueryError> {
+            self.0.height(kind, x, z)
+        }
+        fn block_state(&mut self, pos: [i32; 3]) -> Result<BlockStateId, PlacementQueryError> {
+            Ok(*self.0.blocks.get(&pos).unwrap_or(&self.0.air))
+        }
+    }
+
+    fn registry() -> &'static BlockRegistry {
+        let names = [
+            "minecraft:air",
+            "minecraft:cave_air",
+            "minecraft:void_air",
+            "minecraft:water",
+            "minecraft:lava",
+            "minecraft:stone",
+            "minecraft:sand",
+        ];
+        let rows: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let liquid = n.ends_with("water") || n.ends_with("lava");
+                let props = if liquid {
+                    json!({"level": "0"})
+                } else {
+                    json!({})
+                };
+                json!([n, n.ends_with("air"), liquid, "", {"id": n, "properties": props}])
+            })
+            .collect();
+        let defaults: BTreeMap<_, _> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        let facts = json!({"states": rows, "defaults": defaults});
+        Box::leak(Box::new(
+            BlockRegistry::from_facts_json(facts.to_string().as_bytes()).unwrap(),
+        ))
+    }
+
+    fn run(json: serde_json::Value, world: &mut Ctx, seed: i64, at: [i32; 3]) -> Vec<[i32; 3]> {
+        let bindings = FeatureBlockBindings::new(registry(), BTreeSet::new()).unwrap();
+        let modifier =
+            PlacementModifier::from_json_with_blocks(&json.to_string(), &bindings).unwrap();
+        let mut found = Vec::new();
+        modifier
+            .modify_in(world, &mut XoroshiroRandom::new(seed), at, |_, p| {
+                found.push(p);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        found
+    }
+
+    fn world(surface: i32) -> Ctx {
+        let r = registry();
+        let id = |n: &str| r.default_state(n).unwrap();
+        Ctx(Flat {
+            blocks: HashMap::new(),
+            surface,
+            rock: id("minecraft:stone"),
+            air: id("minecraft:air"),
+        })
+    }
+
+    #[test]
+    fn underground_passes_only_below_the_surface() {
+        let mut w = world(64);
+        let m = json!({"type": "tfc:underground"});
+        assert_eq!(run(m.clone(), &mut w, 1, [3, 40, 5]), vec![[3, 40, 5]]);
+        assert!(run(m.clone(), &mut w, 1, [3, 64, 5]).is_empty());
+        assert!(run(m, &mut w, 1, [3, 90, 5]).is_empty());
+    }
+
+    #[test]
+    fn on_top_checks_the_block_below() {
+        let r = registry();
+        let mut w = world(0);
+        w.0.blocks
+            .insert([0, 9, 0], r.default_state("minecraft:sand").unwrap());
+        w.0.blocks
+            .insert([1, 9, 0], r.default_state("minecraft:stone").unwrap());
+        let m = json!({"type": "tfc:on_top", "predicate": {
+            "type": "minecraft:matching_blocks", "blocks": "minecraft:sand"}});
+        assert_eq!(run(m.clone(), &mut w, 1, [0, 10, 0]), vec![[0, 10, 0]]);
+        assert!(run(m.clone(), &mut w, 1, [1, 10, 0]).is_empty());
+        // The block at the position itself does not matter.
+        assert!(run(m, &mut w, 1, [0, 9, 0]).is_empty());
+    }
+
+    #[test]
+    fn shallow_water_needs_water_and_thins_with_depth() {
+        let r = registry();
+        let water = r.default_state("minecraft:water").unwrap();
+        let mut w = world(0);
+        // Two blocks of water below y=10, then air.
+        for y in [8, 9] {
+            w.0.blocks.insert([0, y, 0], water);
+        }
+        let m = json!({"type": "tfc:shallow_water", "min_depth": 1, "max_depth": 5});
+        // Depth 2: passes where nextFloat > 2/5, so about 60% of seeds.
+        let passed = (0..400)
+            .filter(|seed| !run(m.clone(), &mut w, *seed, [0, 10, 0]).is_empty())
+            .count();
+        assert!((200..280).contains(&passed), "{passed} of 400");
+        // No water directly below: fewer than min_depth blocks, never passes.
+        assert!(run(m.clone(), &mut w, 3, [5, 10, 0]).is_empty());
+        // Deeper than max_depth: never passes.
+        for y in 4..10 {
+            w.0.blocks.insert([2, y, 0], water);
+        }
+        assert!(run(m, &mut w, 3, [2, 10, 0]).is_empty());
     }
 }

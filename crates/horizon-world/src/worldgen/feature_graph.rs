@@ -48,6 +48,26 @@ pub enum FeatureDefinition {
     BlockPile(super::block_pile::BlockPileFeature),
     Disk(super::disk::DiskFeature),
     Spring(super::spring::SpringFeature),
+    TfcVein(Box<super::tfc_vein::TfcVeinFeature>),
+    TfcBoulder(Box<super::tfc_boulder::TfcBoulderFeature>),
+    TfcPatch(Box<super::tfc_patch::TfcPatchFeature>),
+    TfcColumn(Box<super::tfc_column::TfcColumnFeature>),
+    TfcPlant(Box<super::tfc_plant::TfcPlantFeature>),
+    TfcLake(Box<super::tfc_lake::TfcLakeFeature>),
+    TfcFissure(Box<super::tfc_fissure::TfcFissureFeature>),
+    TfcSpike(Box<super::tfc_spike::TfcSpikeFeature>),
+    TfcHotSpring(Box<super::tfc_hot_spring::TfcHotSpringFeature>),
+    TfcTidePool(Box<super::tfc_tide_pool::TfcTidePoolFeature>),
+    TfcCoral(Box<super::tfc_coral::TfcCoralFeature>),
+    TfcSeaStacks(Box<super::tfc_sea_stacks::TfcSeaStacksFeature>),
+    TfcPowderSnow(Box<super::tfc_powder_snow::TfcPowderSnowFeature>),
+    TfcErosion(Box<super::tfc_erosion::TfcErosionFeature>),
+    TfcTallPlants(Box<super::tfc_tall_plants::TfcTallPlantsFeature>),
+    TfcKelp(Box<super::tfc_kelp::TfcKelpFeature>),
+    TfcSmallPlants(Box<super::tfc_small_plants::TfcSmallPlantsFeature>),
+    TfcCactus(Box<super::tfc_cactus::TfcCactusFeature>),
+    TfcCave(Box<super::tfc_cave::TfcCaveFeature>),
+    TfcTree(Box<super::tfc_tree::TfcTreeFeature>),
     Vines(super::vines::VinesFeature),
     SnowAndFreeze(super::snow_freeze::SnowAndFreezeFeature),
     Delta(super::delta::DeltaFeature),
@@ -90,6 +110,8 @@ pub enum FeatureDefinition {
     Fossil(Box<super::structure::features::FossilFeature>),
     WeightedChoice(OptionalWeightedList<PlacedFeatureDefinition>),
     Sequence(Vec<PlacedFeatureDefinition>),
+    /// `tfc:noisy_multiple`: the list rotated by the sea-level temperature, two successes at most.
+    NoisyOverlay(Vec<PlacedFeatureDefinition>),
     Overlay(Vec<PlacedFeatureDefinition>),
     BooleanChoice(Box<[PlacedFeatureDefinition; 2]>),
     RandomChoice(Vec<PlacedFeatureDefinition>),
@@ -394,11 +416,140 @@ impl FeatureDefinition {
                 blocks.ok_or(DecodeError::Field("vine feature bindings"))?,
             )
             .map(Self::Vines),
-            "minecraft:spring_feature" => super::spring::SpringFeature::from_json(
+            "minecraft:spring_feature" | "tfc:spring" => super::spring::SpringFeature::from_json(
                 json,
                 blocks.ok_or(DecodeError::Field("spring bindings"))?,
             )
             .map(Self::Spring),
+            "tfc:cluster_vein" | "tfc:disc_vein" | "tfc:kaolin_disc_vein" | "tfc:pipe_vein" => {
+                super::tfc_vein::TfcVeinFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc vein bindings"))?,
+                )
+                .map(|f| Self::TfcVein(Box::new(f)))
+            }
+            "tfc:random_patch" | "tfc:dynamic_random_patch" => {
+                let nested = |json: &str, depth: usize, remaining: &mut usize| {
+                    PlacedFeatureDefinition::decode(json, depth, remaining, empty_tags, blocks)
+                };
+                super::tfc_patch::TfcPatchFeature::decode(json, depth, remaining, &nested)
+                    .map(|f| Self::TfcPatch(Box::new(f)))
+            }
+            "tfc:tall_plant" | "tfc:weeping_vines" | "tfc:twisting_vines" => {
+                super::tfc_column::TfcColumnFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc column bindings"))?,
+                )
+                .map(|f| Self::TfcColumn(Box::new(f)))
+            }
+            "tfc:cave_vegetation" | "tfc:rivulet" | "tfc:thin_spike" => {
+                super::tfc_cave::TfcCaveFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc cave bindings"))?,
+                )
+                .map(|f| Self::TfcCave(Box::new(f)))
+            }
+            "tfc:flood_fill_lake" => super::tfc_lake::TfcLakeFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc lake bindings"))?,
+            )
+            .map(|f| Self::TfcLake(Box::new(f))),
+            "tfc:cave_spike" | "tfc:large_cave_spike" | "tfc:cave_column" => {
+                super::tfc_spike::TfcSpikeFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc spike bindings"))?,
+                )
+                .map(|f| Self::TfcSpike(Box::new(f)))
+            }
+            "tfc:hot_spring" => super::tfc_hot_spring::TfcHotSpringFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc hot spring bindings"))?,
+            )
+            .map(|f| Self::TfcHotSpring(Box::new(f))),
+            "tfc:coral_tree" | "tfc:coral_claw" | "tfc:coral_mushroom" => {
+                super::tfc_coral::TfcCoralFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc coral bindings"))?,
+                )
+                .map(|f| Self::TfcCoral(Box::new(f)))
+            }
+            "tfc:sea_stacks" => super::tfc_sea_stacks::TfcSeaStacksFeature::decode(
+                blocks.ok_or(DecodeError::Field("tfc sea stacks bindings"))?,
+            )
+            .map(|f| Self::TfcSeaStacks(Box::new(f))),
+            // `IceAndSnowFeature.place` is a `todo` that returns true.
+            "tfc:tall_wild_crop" | "tfc:emergent_plant" | "tfc:submerged_tall_plant" => {
+                super::tfc_tall_plants::TfcTallPlantsFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc tall plant bindings"))?,
+                )
+                .map(|f| Self::TfcTallPlants(Box::new(f)))
+            }
+            "tfc:epiphyte_plant" | "tfc:spreading_crop" | "tfc:loose_rock" => {
+                super::tfc_small_plants::TfcSmallPlantsFeature::decode(
+                    json,
+                    blocks.ok_or(DecodeError::Field("tfc small plant bindings"))?,
+                )
+                .map(|f| Self::TfcSmallPlants(Box::new(f)))
+            }
+            "tfc:kelp_tree" => super::tfc_kelp::TfcKelpFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc kelp bindings"))?,
+            )
+            .map(|f| Self::TfcKelp(Box::new(f))),
+            "tfc:branching_cactus" => super::tfc_cactus::TfcCactusFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc cactus bindings"))?,
+            )
+            .map(|f| Self::TfcCactus(Box::new(f))),
+            "tfc:erosion" => super::tfc_erosion::TfcErosionFeature::decode(
+                blocks.ok_or(DecodeError::Field("tfc erosion bindings"))?,
+            )
+            .map(|f| Self::TfcErosion(Box::new(f))),
+            "tfc:ice_and_snow" => Ok(Self::NoOp),
+            "tfc:powder_snow" => super::tfc_powder_snow::TfcPowderSnowFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc powder snow bindings"))?,
+            )
+            .map(|f| Self::TfcPowderSnow(Box::new(f))),
+            "tfc:tide_pool" => super::tfc_tide_pool::TfcTidePoolFeature::decode(
+                blocks.ok_or(DecodeError::Field("tfc tide pool bindings"))?,
+            )
+            .map(|f| Self::TfcTidePool(Box::new(f))),
+            "tfc:fissure" => super::tfc_fissure::TfcFissureFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc fissure bindings"))?,
+            )
+            .map(|f| Self::TfcFissure(Box::new(f))),
+            "tfc:fruit_trees"
+            | "tfc:bananas"
+            | "tfc:bamboo"
+            | "tfc:vines"
+            | "tfc:kelp"
+            | "tfc:spreading_bush"
+            | "tfc:creeping_ocean_plant"
+            | "tfc:creeping_plant"
+            | "tfc:rotatable_water_plant" => super::tfc_plant::TfcPlantFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc plant bindings"))?,
+            )
+            .map(|f| Self::TfcPlant(Box::new(f))),
+            "tfc:random_tree"
+            | "tfc:overlay_tree"
+            | "tfc:stacked_tree"
+            | "tfc:krummholz"
+            | "tfc:forest"
+            | "tfc:soil_disc"
+            | "tfc:soil_forest_area" => super::tfc_tree::TfcTreeFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc tree bindings"))?,
+            )
+            .map(|f| Self::TfcTree(Box::new(f))),
+            "tfc:boulder" | "tfc:baby_boulder" => super::tfc_boulder::TfcBoulderFeature::decode(
+                json,
+                blocks.ok_or(DecodeError::Field("tfc boulder bindings"))?,
+            )
+            .map(|f| Self::TfcBoulder(Box::new(f))),
             "minecraft:block_blob" => super::block_blob::BlockBlobFeature::decode(
                 json,
                 blocks.ok_or(DecodeError::Field("block blob bindings"))?,
@@ -716,7 +867,10 @@ impl FeatureDefinition {
                     )
                 })?,
             )),
-            "minecraft:sequence" | "minecraft:overlay" | "minecraft:simple_random_selector" => {
+            "minecraft:sequence"
+            | "minecraft:overlay"
+            | "minecraft:simple_random_selector"
+            | "tfc:noisy_multiple" => {
                 let raw = required(&object, "features")?;
                 let name = serde_json::from_str::<String>(raw.get()).ok();
                 let named_empty = name
@@ -729,6 +883,7 @@ impl FeatureDefinition {
                     return Ok(match kind.as_str() {
                         "minecraft:sequence" => Self::Sequence(vec![]),
                         "minecraft:overlay" => Self::Overlay(vec![]),
+                        "tfc:noisy_multiple" => Self::NoisyOverlay(vec![]),
                         _ => Self::RandomChoice(vec![]),
                     });
                 }
@@ -755,6 +910,7 @@ impl FeatureDefinition {
                 Ok(match kind.as_str() {
                     "minecraft:sequence" => Self::Sequence(features),
                     "minecraft:overlay" => Self::Overlay(features),
+                    "tfc:noisy_multiple" => Self::NoisyOverlay(features),
                     _ => Self::RandomChoice(features),
                 })
             }
@@ -904,6 +1060,28 @@ impl FeatureDefinition {
             Self::Spring(feature) => feature.place(world, origin).map_err(|e| match e {
                 BlockFeatureError::World(e) => FeatureExecutionError::Basic(FeatureError::World(e)),
                 BlockFeatureError::Query(e) => FeatureExecutionError::Query(e),
+            }),
+            Self::TfcVein(feature) => feature.place(world, random, origin),
+            Self::TfcBoulder(feature) => feature.place(world, random, origin),
+            Self::TfcColumn(feature) => feature.place(world, random, origin),
+            Self::TfcPlant(feature) => feature.place(world, random, origin),
+            Self::TfcLake(feature) => feature.place(world, random, origin),
+            Self::TfcFissure(feature) => feature.place(world, random, origin),
+            Self::TfcSpike(feature) => feature.place(world, random, origin),
+            Self::TfcHotSpring(feature) => feature.place(world, random, origin),
+            Self::TfcTidePool(feature) => feature.place(world, random, origin),
+            Self::TfcCoral(feature) => feature.place(world, random, origin),
+            Self::TfcSeaStacks(feature) => feature.place(world, random, origin),
+            Self::TfcPowderSnow(feature) => feature.place(world, random, origin),
+            Self::TfcErosion(feature) => feature.place(world, random, origin),
+            Self::TfcTallPlants(feature) => feature.place(world, random, origin),
+            Self::TfcKelp(feature) => feature.place(world, random, origin),
+            Self::TfcSmallPlants(feature) => feature.place(world, random, origin),
+            Self::TfcCactus(feature) => feature.place(world, random, origin),
+            Self::TfcCave(feature) => feature.place(world, random, origin),
+            Self::TfcTree(feature) => feature.place(world, random, origin),
+            Self::TfcPatch(feature) => feature.place(world, random, origin, &mut |f, w, r, p| {
+                f.place_in(&mut placer, w, r, p, run)
             }),
             Self::BlockBlob(feature) => feature
                 .place(world, random, origin)
@@ -1084,6 +1262,28 @@ impl FeatureDefinition {
                     any |= feature.place_in(&mut placer, world, random, origin, run)?;
                 }
                 Ok(any)
+            }
+            Self::NoisyOverlay(features) => {
+                let seed = world.world_seed().map_err(FeatureExecutionError::Query)?;
+                let temperature = super::tfc_terrain::active_for(seed).map_or(0.0, |t| {
+                    t.climate_at(origin[0], origin[2]).sea_level_temperature
+                });
+                // `Collections.rotate(features, ceil(temp * 10 * size))`.
+                let n = features.len() as i64;
+                let distance = f64::from(temperature * 10.0 * n as f32).ceil() as i64;
+                let shift = distance.rem_euclid(n.max(1)) as usize;
+                let mut placed = 0;
+                for i in 0..features.len() {
+                    // Element `j` of the rotated list is `features[(j - shift) mod n]`.
+                    let feature = &features[(i + features.len() - shift) % features.len()];
+                    if feature.place_in(&mut placer, world, random, origin, run)? {
+                        placed += 1;
+                        if placed > 1 {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(placed > 0)
             }
             Self::BooleanChoice(features) => {
                 let index = if random.next_boolean() { 0 } else { 1 };

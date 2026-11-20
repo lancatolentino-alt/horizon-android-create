@@ -505,6 +505,34 @@ impl GeneratorData {
             biome_carvers.push(carvers.decode_set(&value["carvers"].to_string())?);
             biome_json.push(json.clone());
         }
+        // TFC's per-biome feature lists: one extra biome per TFC biome, cloned from a
+        // temperate stand-in with TFC's `features`. Only decoration reads them.
+        if let Some(lists) = read_optional_bundle(dir, ov, "tfc_biomes")? {
+            for (index, name) in super::tfc_biome::BIOME_NAMES.iter().enumerate() {
+                let Some(list) = lists.get(&format!("tfc:{name}")) else {
+                    continue;
+                };
+                let stand_in = super::tfc_terrain::vanilla_biome(index as i32, 10.0, 250.0);
+                let Some(base) = biomes
+                    .get(stand_in)
+                    .or_else(|| biomes.get("minecraft:plains"))
+                else {
+                    continue;
+                };
+                let mut value: Value = serde_json::from_str(base)?;
+                let list: Value = serde_json::from_str(list)?;
+                value["features"] = list["features"].clone();
+                let json = value.to_string();
+                biome_ids.insert(
+                    format!("tfc:decor/{name}"),
+                    BiomeId(biome_names.len() as u32),
+                );
+                biome_names.push(Arc::<str>::from(format!("tfc:decor/{name}")));
+                temperatures.push(BiomeTemperatureSettings::from_json(&json)?);
+                biome_carvers.push(carvers.decode_set(&value["carvers"].to_string())?);
+                biome_json.push(json);
+            }
+        }
         let carving_blocks = CarvingBlocks::from_registry(
             registry,
             &tag_set("minecraft:uncarvable")?
@@ -918,6 +946,8 @@ struct Pipeline<R: RandomSource> {
     spawn_position: std::sync::OnceLock<[i32; 2]>,
     /// A superflat world: its layers stand where the noise terrain would.
     flat: Option<FlatLayers>,
+    /// The native TerraFirmaCraft overworld, when the `tfc` mod is on.
+    tfc: Option<Arc<super::tfc_terrain::TfcTerrain>>,
 }
 /// `FlatLevelGeneratorSettings.getLayers` as `FlatLevelSource` reads them: the states from the
 /// level's minimum Y up, with the layers `adjustGenerationSettings` replaced by `null`
@@ -1196,6 +1226,7 @@ where
             debug_density,
             spawn_position: std::sync::OnceLock::new(),
             flat: None,
+            tfc: None,
         };
         pipeline.decoration = pipeline
             .data
@@ -1244,6 +1275,223 @@ where
             None => super::blending::Blender::empty(),
         })
     }
+    /// Fills a chunk's biomes with the vanilla stand-ins of TFC's biomes and climate.
+    fn tfc_biomes(
+        &self,
+        tfc: &super::tfc_terrain::TfcTerrain,
+        pos: ChunkPos,
+        mut chunk: BiomeChunk<BiomeId>,
+    ) -> Result<BiomeChunk<BiomeId>, GeneratorError> {
+        let (biomes, climate) = tfc.biomes(pos.x, pos.z);
+        let (min, height) = (self.settings.level_min_y, self.settings.level_height);
+        let fallback = self.data.biome_id("minecraft:plains").unwrap_or(BiomeId(0));
+        chunk
+            .fill(min, min + height - 1, |quart| -> Result<BiomeId, String> {
+                let tfc_id = biomes[(quart[0] & 3) as usize | ((quart[2] & 3) as usize) << 2];
+                let name = super::tfc_terrain::vanilla_biome(
+                    tfc_id,
+                    climate.temperature.get_value(0.5, 0.5),
+                    climate.rainfall.get_value(0.5, 0.5),
+                );
+                Ok(self.data.biome_id(name).unwrap_or(fallback))
+            })
+            .map_err(stage("biomes"))?;
+        Ok(chunk)
+    }
+    /// The blocks of a TFC chunk: bedrock, TFC rock in its layers, soil, and water to sea level.
+    /// TFC's cave, deep cave and canyon carvers over the finished terrain.
+    fn tfc_carve(
+        &self,
+        tfc: &super::tfc_terrain::TfcTerrain,
+        chunk: &mut TerrainChunk<'static, GenBlockStates>,
+        pos: ChunkPos,
+    ) -> Result<(), GeneratorError> {
+        let registry = self.data.registry;
+        let state = |name: &str| registry.default_state(name);
+        let (Some(air), Some(water), Some(lava), Some(bedrock)) = (
+            state("minecraft:cave_air"),
+            state("minecraft:water"),
+            state("minecraft:lava"),
+            state("minecraft:bedrock"),
+        ) else {
+            return Ok(());
+        };
+        let ids = super::tfc_carve::Ids {
+            air,
+            water,
+            lava,
+            bedrock,
+            unreplaceable: super::tfc_carve::UNREPLACEABLE
+                .iter()
+                .filter_map(|name| state(name))
+                .collect(),
+            salt_water: state("tfc:salt_water"),
+        };
+        let generation = self.generation();
+        let plan = tfc.plan(pos.x, pos.z);
+        let cells = std::cell::RefCell::new(chunk);
+        super::tfc_carve::carve(
+            self.seed,
+            pos,
+            generation,
+            self.settings.level_min_y,
+            &ids,
+            |x, z| plan.salty[((x & 15) | (z & 15) << 4) as usize],
+            &mut tfc.aquifer(pos.x, pos.z),
+            |x, y, z| cells.borrow().block(x, y, z),
+            |x, y, z, id| cells.borrow_mut().set_block_raw(x, y, z, id).map(drop),
+        )
+        .map_err(stage("tfc carvers"))?;
+        Ok(())
+    }
+    fn tfc_terrain(
+        &self,
+        tfc: &super::tfc_terrain::TfcTerrain,
+        chunk: &mut TerrainChunk<'static, GenBlockStates>,
+        pos: ChunkPos,
+    ) -> Result<(), GeneratorError> {
+        let registry = self.data.registry;
+        let state = |name: &str| registry.default_state(name);
+        let stone = state("minecraft:stone").ok_or_else(|| resource("missing block stone"))?;
+        let water = state("minecraft:water");
+        // Salt water exists only while a content mod registers it.
+        let salt_water = state("tfc:salt_water");
+        // River water likewise: one state per `Flow` while a mod registers `tfc:river_water`.
+        let river_water: Option<Vec<BlockStateId>> = state("tfc:river_water").map(|_| {
+            super::tfc_flow::NAMES[..16]
+                .iter()
+                .filter_map(|flow| {
+                    let mut descriptor = crate::chunk::BlockState {
+                        name: "tfc:river_water".to_owned(),
+                        properties: Default::default(),
+                    };
+                    descriptor
+                        .properties
+                        .insert("flow".to_owned(), (*flow).to_owned());
+                    registry.resolve(&descriptor).ok()
+                })
+                .collect()
+        });
+        let lava = state("minecraft:lava");
+        let bedrock = state("minecraft:bedrock");
+        let plan = tfc.plan(pos.x, pos.z);
+        let mut cache = super::tfc_terrain::TfcTerrain::rock_cache(pos.x, pos.z);
+        let mut rocks: HashMap<&'static str, BlockStateId> = HashMap::new();
+        let min_y = self.settings.level_min_y;
+        let (x0, z0) = (pos.x.wrapping_shl(4), pos.z.wrapping_shl(4));
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let (x, z) = (x0 + lx, z0 + lz);
+                let height = plan.heights[(lx | lz << 4) as usize];
+                let tfc_id = plan.biomes[((lx >> 2) | (lz >> 2) << 2) as usize];
+                let (top, filler, depth) = super::tfc_terrain::soil(
+                    tfc_id,
+                    plan.climate.temperature.get_value(0.5, 0.5),
+                    plan.climate.rainfall.get_value(0.5, 0.5),
+                    height,
+                );
+                let top = state(top);
+                let filler = state(filler);
+                // TFC's own layering where the biome's builder is ported.
+                let builder = super::tfc_terrain::TfcTerrain::surface_builder(
+                    plan.column_biomes[(lx | lz << 4) as usize],
+                );
+                let exact = {
+                    let mut rock = |y: i32| tfc.rock(x, y, z, height, &mut cache);
+                    tfc.build_surface(
+                        &plan,
+                        (lx | lz << 4) as usize,
+                        [x, z],
+                        min_y,
+                        builder.as_ref(),
+                        &mut rock,
+                    )
+                };
+                let shape = &plan.cells[(lx | lz << 4) as usize];
+                let surface = shape
+                    .iter()
+                    .rposition(|&c| c == 1)
+                    .map_or(height, |i| i as i32 + super::tfc_terrain::MIN_Y);
+                for (index, &code) in shape.iter().enumerate() {
+                    let y = index as i32 + super::tfc_terrain::MIN_Y;
+                    if y < min_y {
+                        continue;
+                    }
+                    // Blocks a builder put into air or water: sea ice and icebergs.
+                    let placed_fluid = if code == 0 || code == 2 {
+                        exact
+                            .as_ref()
+                            .and_then(|cells| cells.get((y - min_y) as usize))
+                            .and_then(|cell| cell.as_deref())
+                            .and_then(&state)
+                    } else {
+                        None
+                    };
+                    let id = if y == min_y {
+                        bedrock.unwrap_or(stone)
+                    } else if let Some(placed) = placed_fluid {
+                        placed
+                    } else if code == 0 {
+                        continue;
+                    } else if code == 3 {
+                        match lava {
+                            Some(lava) => lava,
+                            None => continue,
+                        }
+                    } else if code == 2 {
+                        let flow = plan.river_flow[(lx | lz << 4) as usize];
+                        let river = river_water
+                            .as_ref()
+                            .filter(|ids| {
+                                ids.len() == 16
+                                    && flow != super::tfc_flow::NONE
+                                    && !plan.salty[(lx | lz << 4) as usize]
+                                    && y >= (super::tfc_height::SEA_LEVEL - 4).min(height)
+                            })
+                            .map(|ids| ids[flow as usize]);
+                        let fluid = if river.is_some() {
+                            river
+                        } else if plan.salty[(lx | lz << 4) as usize] {
+                            salt_water.or(water)
+                        } else {
+                            water
+                        };
+                        match fluid {
+                            Some(water) => water,
+                            None => continue,
+                        }
+                    } else if let Some(placed) = exact
+                        .as_ref()
+                        .and_then(|cells| cells.get((y - min_y) as usize))
+                        .and_then(|cell| cell.as_deref())
+                        .and_then(&state)
+                    {
+                        placed
+                    } else if exact.is_some() {
+                        let name = tfc.rock(x, y, z, height, &mut cache);
+                        *rocks
+                            .entry(name)
+                            .or_insert_with(|| state(&format!("tfc:raw_{name}")).unwrap_or(stone))
+                    } else if y == surface
+                        && let Some(top) = top
+                    {
+                        top
+                    } else if y > surface - depth
+                        && let Some(filler) = filler
+                    {
+                        filler
+                    } else {
+                        let name = tfc.rock(x, y, z, height, &mut cache);
+                        *rocks
+                            .entry(name)
+                            .or_insert_with(|| state(&format!("tfc:raw_{name}")).unwrap_or(stone))
+                    };
+                    chunk.set_block_raw(x, y, z, id).map_err(stage("tfc"))?;
+                }
+            }
+        }
+        Ok(())
+    }
     fn biome_chunk(
         &self,
         worker: &mut WorkerState,
@@ -1286,6 +1534,14 @@ where
         }
         let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).map_err(stage("biomes"))?;
+        if let Some(tfc) = &self.tfc {
+            let chunk = Arc::new(self.tfc_biomes(tfc, pos, chunk)?);
+            self.biome_cache
+                .lock()
+                .unwrap()
+                .insert((pos.x, pos.z), chunk.clone());
+            return Ok(Some(chunk));
+        }
         let mut resolver = self.source.resolver(
             &self.climate,
             self.router.get(RouterField::Erosion).as_ref(),
@@ -1427,6 +1683,41 @@ where
         pos: ChunkPos,
         context: &mut SamplerContext,
     ) -> Result<ProtoChunk, GeneratorError> {
+        if let Some(tfc) = &self.tfc {
+            let data = &self.data;
+            let center = (*self.biome_chunk(worker, pos)?).clone();
+            let mut chunk = TerrainChunk::new(
+                pos,
+                self.settings.level_min_y,
+                self.settings.level_height,
+                data.registry,
+                data.states.clone(),
+            )
+            .map_err(stage("tfc"))?;
+            self.tfc_terrain(tfc, &mut chunk, pos)?;
+            self.tfc_carve(tfc, &mut chunk, pos)?;
+            chunk
+                .prime_heightmaps(&[
+                    HeightmapType::WorldSurfaceWg,
+                    HeightmapType::OceanFloorWg,
+                    HeightmapType::MotionBlocking,
+                    HeightmapType::MotionBlockingNoLeaves,
+                    HeightmapType::OceanFloor,
+                    HeightmapType::WorldSurface,
+                ])
+                .map_err(stage("heightmaps"))?;
+            chunk.set_generation_stage(PreLightChunkStage::Terrain);
+            return Ok(ProtoChunk {
+                terrain: chunk,
+                biomes: center,
+                data: data.clone(),
+                decorated: false,
+                block_entities: Vec::new(),
+                structure_starts: Vec::new(),
+                own_starts: Starts::default(),
+                entities: Vec::new(),
+            });
+        }
         let data = &self.data;
         let (min, height, sea) = (
             self.settings.noise_min_y,
@@ -2415,7 +2706,7 @@ where
         match &self.decoration {
             Some(decoration) => {
                 let mut random = self.region_random_at(region[4].position());
-                decoration.decorate(
+                let stats = decoration.decorate(
                     &self.data,
                     self.seed,
                     self.generation(),
@@ -2423,7 +2714,11 @@ where
                     region,
                     &mut random,
                     self.structures.as_ref(),
-                )
+                )?;
+                if self.tfc.is_some() {
+                    tfc_snowy_grass(&mut region[4]);
+                }
+                Ok(stats)
             }
             None => Err(resource("decoration resources were not loaded")),
         }
@@ -2533,7 +2828,9 @@ where
             return Ok(*position);
         }
         // ChunkGenerator.getOrigin is 0 0 without a spawn target.
-        let position = if self.spawn_target.is_empty() {
+        let position = if let Some(tfc) = &self.tfc {
+            tfc.find_spawn()
+        } else if self.spawn_target.is_empty() {
             [0, 0]
         } else {
             find_spawn_position(&self.spawn_target, &mut SamplerContext::cached())
@@ -3369,29 +3666,38 @@ impl OverworldGenerator {
                 noise_clamped = Some((noise, clamped));
             }
         }
+        let tfc_on = dimension == "minecraft:overworld" && super::tfc::active();
         let pipeline: Arc<dyn SeededPipeline> = if settings_json["legacy_random_source"]
             .as_bool()
             .unwrap_or(false)
         {
-            Arc::new(Pipeline::new(
+            let mut pipeline = Pipeline::new(
                 data,
                 seed,
                 LegacyRandom::new(seed),
                 &generator,
                 &settings_json,
-                with_structures,
+                with_structures && !tfc_on,
                 level,
-            )?)
+            )?;
+            if tfc_on {
+                pipeline.tfc = Some(super::tfc_terrain::TfcTerrain::shared(seed));
+            }
+            Arc::new(pipeline)
         } else {
-            Arc::new(Pipeline::new(
+            let mut pipeline = Pipeline::new(
                 data,
                 seed,
                 XoroshiroRandom::new(seed),
                 &generator,
                 &settings_json,
-                with_structures,
+                with_structures && !tfc_on,
                 level,
-            )?)
+            )?;
+            if tfc_on {
+                pipeline.tfc = Some(super::tfc_terrain::TfcTerrain::shared(seed));
+            }
+            Arc::new(pipeline)
         };
         Ok(Self {
             pipeline,
@@ -3645,9 +3951,87 @@ impl GeneratorWorker {
     }
 }
 
+/// TFC marks the grass its surface builders place for post-processing (`SoilSurfaceState
+/// .NeedsPostProcessing`): once the features have run, each is updated from its neighbours, so
+/// grass under snow turns snowy as vanilla's `SnowyDirtBlock.updateShape` does.
+fn tfc_snowy_grass(chunk: &mut ProtoChunk) {
+    let registry = chunk.data.registry;
+    let (x0, z0) = (chunk.position().x << 4, chunk.position().z << 4);
+    for z in z0..z0 + 16 {
+        for x in x0..x0 + 16 {
+            let top = chunk.surface_height(x, z);
+            for y in (top - 3).max(chunk.terrain.min_y())..top {
+                let here = chunk.block(x, y, z);
+                let Some(state) = registry.state(here) else {
+                    continue;
+                };
+                let above = chunk.block_name(x, y + 1, z);
+                let Some(snowy) = snowy_grass(state, above) else {
+                    continue;
+                };
+                if let Some(id) = registry.id(&snowy) {
+                    let _ = chunk.terrain.set_block_raw(x, y, z, id);
+                }
+            }
+        }
+    }
+}
+
+/// The snowy twin of a TFC grass under snow, `None` for anything else.
+fn snowy_grass(state: &crate::chunk::BlockState, above: &str) -> Option<crate::chunk::BlockState> {
+    if !state.name.starts_with("tfc:grass/") || !state.properties.contains_key("snowy") {
+        return None;
+    }
+    if !matches!(
+        above,
+        "minecraft:snow" | "minecraft:snow_block" | "minecraft:powder_snow"
+    ) {
+        return None;
+    }
+    let mut snowy = state.clone();
+    snowy.properties.insert("snowy".into(), "true".into());
+    Some(snowy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grass(name: &str, snowy: &str) -> crate::chunk::BlockState {
+        let mut state = crate::chunk::BlockState {
+            name: name.to_owned(),
+            properties: Default::default(),
+        };
+        state.properties.insert("snowy".into(), snowy.into());
+        state
+    }
+
+    #[test]
+    fn tfc_grass_under_snow_turns_snowy() {
+        let grass = grass("tfc:grass/loam", "false");
+        for above in [
+            "minecraft:snow",
+            "minecraft:snow_block",
+            "minecraft:powder_snow",
+        ] {
+            let snowy = snowy_grass(&grass, above).unwrap();
+            assert_eq!(snowy.properties["snowy"], "true");
+            assert_eq!(snowy.name, "tfc:grass/loam");
+        }
+        assert!(snowy_grass(&grass, "minecraft:air").is_none());
+        assert!(snowy_grass(&grass, "minecraft:stone").is_none());
+    }
+
+    #[test]
+    fn only_tfc_grass_with_a_snowy_property_changes() {
+        assert!(snowy_grass(&grass("minecraft:grass_block", "false"), "minecraft:snow").is_none());
+        let plain = crate::chunk::BlockState {
+            name: "tfc:grass/loam".to_owned(),
+            properties: Default::default(),
+        };
+        assert!(snowy_grass(&plain, "minecraft:snow").is_none());
+    }
+
     #[test]
     fn pack_tags_join_the_prepared_ones_and_broken_ones_are_dropped() {
         let raw = Bundle::from([(

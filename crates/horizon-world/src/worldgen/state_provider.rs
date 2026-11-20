@@ -400,6 +400,38 @@ impl BlockStateProvider {
             "minecraft:random_block" => {
                 Node::RandomBlock(bindings.block_set(required(&object, "blocks")?)?)
             }
+            // `RandomPropertyStateProvider`: the state with one of the property's values, uniformly.
+            // A property the mod's block lacks leaves the state as it is, with no draw.
+            "tfc:random_property" => {
+                let state_json = required(&object, "state")?.get();
+                let base = bindings.state(state_json, false)?;
+                let property: String = serde_json::from_str(required(&object, "property")?.get())?;
+                let registry = bindings.registry();
+                let template = registry
+                    .state(base)
+                    .ok_or(DecodeError::Field("provider state"))?
+                    .clone();
+                let values: Vec<String> = registry
+                    .property_values(&template.name, &property)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                if values.is_empty() {
+                    Node::Simple(base)
+                } else {
+                    let mut states = Vec::with_capacity(values.len());
+                    for value in values {
+                        let mut state = template.clone();
+                        state.properties.insert(property.clone(), value);
+                        states.push(
+                            registry
+                                .id(&state)
+                                .ok_or(DecodeError::Field("provider state"))?,
+                        );
+                    }
+                    Node::RandomBlock(Arc::new(states))
+                }
+            }
             "minecraft:rotated" => {
                 let direction = optional(&object, "direction")
                     .map(|v| {

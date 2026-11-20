@@ -195,9 +195,16 @@ impl Decoration {
         };
         let mut biome_features = vec![BTreeSet::new(); data.biome_names().len()];
         let mut plan = Vec::new();
-        for name in possible_biomes(source) {
+        let mut biome_list = possible_biomes(source);
+        biome_list.extend(
+            data.biome_names()
+                .iter()
+                .filter(|n| n.starts_with("tfc:decor/"))
+                .map(|n| n.to_string()),
+        );
+        for name in &biome_list {
             let id = data
-                .biome_id(&name)
+                .biome_id(name)
                 .ok_or_else(|| resource(format!("unknown biome {name}")))?;
             let json: Value = serde_json::from_str(data.biome_json(id))?;
             let mut steps = Vec::new();
@@ -370,6 +377,28 @@ impl Decoration {
             .map_err(|e| resource(e.to_string()))?;
             chunks.push(std::mem::replace(&mut chunk.terrain, empty));
             biomes.push(chunk.biomes().clone());
+        }
+        // TFC worlds decorate by TFC's own biomes, so each biome's feature list applies.
+        if let Some(tfc) = super::tfc_terrain::active_for(seed) {
+            for (chunk, grid) in region.iter().zip(biomes.iter_mut()) {
+                let pos = chunk.position();
+                let (ids, _) = tfc.biomes(pos.x, pos.z);
+                let mut mapped = Vec::with_capacity(16);
+                for id in ids {
+                    let name = format!("tfc:decor/{}", super::tfc_biome::BIOME_NAMES[id as usize]);
+                    mapped.push(data.biome_id(&name));
+                }
+                if mapped.iter().all(Option::is_some) {
+                    let _ = grid.fill(
+                        min_y,
+                        min_y + height - 1,
+                        |quart| -> Result<BiomeId, String> {
+                            let i = (quart[0] & 3) as usize | ((quart[2] & 3) as usize) << 2;
+                            Ok(mapped[i].unwrap())
+                        },
+                    );
+                }
+            }
         }
         let terrain = TerrainRegion::new(chunks, generation)
             .and_then(|region| region.with_block_bindings(&self.bindings))

@@ -443,7 +443,7 @@ impl<B: TerrainBlockStates> PlacementContext for TerrainRegion<'_, B> {
             .name;
         Ok(
             if chunk.block_properties(state).is_air()
-                || name == "minecraft:water"
+                || crate::fluid::is_water_block_name(name)
                 || name == "minecraft:lava"
             {
                 LayerBlock::Empty
