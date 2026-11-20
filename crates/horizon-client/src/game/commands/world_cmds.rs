@@ -1571,7 +1571,7 @@ impl Game<'_> {
         let y = self.spread_spawn_y(p, max_y) - 1;
         let (x, z) = (p[0].floor() as i32, p[1].floor() as i32);
         let name = self.res.facts().get(self.world.block(x, y, z)).name.clone();
-        let liquid = matches!(&*name, "minecraft:water" | "minecraft:lava");
+        let liquid = horizon_world::fluid::is_water_block_name(&name) || &*name == "minecraft:lava";
         let teleportable = self
             .res
             .items()
