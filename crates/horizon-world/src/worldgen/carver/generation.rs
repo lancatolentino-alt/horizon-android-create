@@ -127,7 +127,36 @@ pub fn generate_carving_mask<'a, E>(
     target: ChunkPos,
     context: WorldGenerationContext,
     upgrading: bool,
+    carvers: impl FnMut(ChunkPos) -> Result<&'a [Arc<WorldCarver>], E>,
+) -> Result<CarvingMask, MaskGenerationError<E>> {
+    mask_with(target, context, upgrading, carvers, |index, origin| {
+        large_feature_random(world_seed.wrapping_add(index as i64), origin)
+    })
+}
+/// TerraFirmaCraft's `applyCarvers` stream: `new XoroshiroRandomSource(seed).forkPositional()`
+/// read at `(chunk x, carver index counted from 1, chunk z)`, in place of the legacy stream.
+pub fn generate_positional_carving_mask<'a, E>(
+    world_seed: i64,
+    target: ChunkPos,
+    context: WorldGenerationContext,
+    upgrading: bool,
+    carvers: impl FnMut(ChunkPos) -> Result<&'a [Arc<WorldCarver>], E>,
+) -> Result<CarvingMask, MaskGenerationError<E>> {
+    use horizon_core::{
+        position::BlockPos,
+        random::{PositionalRandom, XoroshiroRandom},
+    };
+    let fork = XoroshiroRandom::new(world_seed).fork_positional();
+    mask_with(target, context, upgrading, carvers, |index, origin| {
+        fork.at(BlockPos::new(origin.x, index as i32 + 1, origin.z))
+    })
+}
+fn mask_with<'a, E, R: RandomSource>(
+    target: ChunkPos,
+    context: WorldGenerationContext,
+    upgrading: bool,
     mut carvers: impl FnMut(ChunkPos) -> Result<&'a [Arc<WorldCarver>], E>,
+    mut random_for: impl FnMut(usize, ChunkPos) -> R,
 ) -> Result<CarvingMask, MaskGenerationError<E>> {
     let min = context.min_y.wrapping_add(1);
     let max = context
@@ -144,8 +173,7 @@ pub fn generate_carving_mask<'a, E>(
                 return Err(MaskGenerationError::TooManyCarvers);
             }
             for (index, carver) in selected.iter().enumerate() {
-                let mut random =
-                    large_feature_random(world_seed.wrapping_add(index as i64), origin);
+                let mut random = random_for(index, origin);
                 if carver.is_start_chunk(&mut random) {
                     carver
                         .carve(context, &mut random, target, origin, &mut mask)
