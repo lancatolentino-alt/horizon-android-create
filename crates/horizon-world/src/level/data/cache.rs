@@ -681,7 +681,11 @@ impl Snapshot {
                 }
             }
         }
+        let mut blocks = blocks;
+        super::apply_block_links(&table, &mut blocks);
         let potted_by_content = super::potted_by_content(&blocks, &table);
+        let mut facts = facts;
+        super::tag_water_variants(registry, &mut facts);
         Ok(Behaviours {
             table,
             props,
