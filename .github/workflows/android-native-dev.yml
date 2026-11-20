@@ -3,9 +3,10 @@ run-name: Android native-mod dev · ${{ github.sha }}
 
 on:
   push:
-    branches: [android-native]
+    branches: [android-native, android-native2]
     paths:
       - 'native-mods/**'
+      - 'crates/**'
       - 'tools/apply_native_mods.py'
       - '.github/workflows/android-native-dev.yml'
   workflow_dispatch:
@@ -24,7 +25,7 @@ concurrency:
 jobs:
   build:
     # Never expose a signing secret to pull requests or arbitrary dispatch refs.
-    if: github.ref == 'refs/heads/android-native'
+    if: github.ref == 'refs/heads/android-native' || github.ref == 'refs/heads/android-native2'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
