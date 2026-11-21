@@ -1220,7 +1220,8 @@ fn tunnel_click(game: &mut Game<'_>, pos: [i32; 3], held: Option<&str>, clear: b
             .native_with_mod_block_entity(pos, |e| {
                 let next = (get_int(&e.nbt, "mode", 0) + 1) % 6;
                 put_int(&mut e.nbt, "mode", next);
-                put_int(&mut e.nbt, "mv", get_int(&e.nbt, "mv", 0) + 1);
+                let mv = get_int(&e.nbt, "mv", 0) + 1;
+                put_int(&mut e.nbt, "mv", mv);
                 next
             })
             .unwrap_or(0);
@@ -1297,7 +1298,8 @@ fn tunnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
     }
     let mut changed = false;
     if amount_commit_in(pos, nbt, "mode", 0, 5) {
-        put_int(nbt, "mv", get_int(nbt, "mv", 0) + 1);
+        let mv = get_int(nbt, "mv", 0) + 1;
+        put_int(nbt, "mv", mv);
         changed = true;
     }
     let (lo, hi) = tunnel_group(game, pos, axis);
@@ -1341,7 +1343,8 @@ fn tunnel_flap(game: &mut Game<'_>, pos: [i32; 3], end: usize, inward: bool) {
             if e.id != TUNNEL_BE {
                 return false;
             }
-            put_int(&mut e.nbt, &fa, (get_int(&e.nbt, &fa, 0) + 1) % 1000000);
+            let next = (get_int(&e.nbt, &fa, 0) + 1) % 1000000;
+            put_int(&mut e.nbt, &fa, next);
             put_int(&mut e.nbt, &fd, if inward { -1 } else { 1 });
             true
         })
@@ -1937,6 +1940,10 @@ fn burner_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.9, f64::from(pos[2]) + 0.5];
         game.native_flame_particle(at, false);
     }
+    // the fire of the burner crackles with the flames
+    if fuel % 30 == 0 {
+        sfx(game, "minecraft:block.fire.ambient", pos, 0.35, 0.9 + 0.2 * fan_rand());
+    }
     if fuel == 1 {
         put_int(nbt, "sup", 0);
         return true;
@@ -2133,6 +2140,10 @@ fn mixer_submit(
     game.native_draw_block(draw, "create:mixer_cog_part", &[("axis", "y")]);
     draw.pop();
     let mp = f64::from(get_f32(&entity.nbt, "mp"));
+    // splash and the mixing sound are made in the window game (client_fx) from this state
+    if speed.abs() >= 1.0 && mp > 0.0 {
+        fx_register(pos, &entity.nbt);
+    }
     // down in the first fifth of the run, hold, up in the last fifth
     let lift = (mp.min(MIX_UNITS as f64 - mp) / 20.0).clamp(0.0, 1.0);
     let eased = lift * lift * (3.0 - 2.0 * lift);
@@ -2487,8 +2498,43 @@ fn press_one(game: &mut Game<'_>, p: [i32; 3]) -> bool {
 
 // The head hits the bottom: press one item, the first it finds (belt or depot one block down, then two,
 // then something lying on the ground), and nothing more.
-fn press_now(game: &mut Game<'_>, pos: [i32; 3]) {
-    sfx(game, "minecraft:block.anvil.place", pos, 0.35, 1.7);
+// What the head would press: the first pressable item under it, how far down it lies, and whether it is on a belt.
+fn press_target(game: &mut Game<'_>, pos: [i32; 3]) -> Option<(String, i32, bool)> {
+    for below in [1, 2] {
+        let p = [pos[0], pos[1] - below, pos[2]];
+        if game.native_block(p) == DEPOT_BLOCK {
+            let hit = game
+                .native_with_mod_block_entity(p, |e| depot_list(&e.nbt).iter().find(|st| pressing(&st.0).is_some()).map(|st| st.0.clone()))
+                .unwrap_or(None);
+            if let Some(item) = hit {
+                return Some((item, below, false));
+            }
+        }
+        if let Some(items) = belt_items_at(game, p) {
+            if let Some(b) = items.iter().find(|b| pressing(&b.item).is_some() && (b.p - 0.5).abs() < 0.12) {
+                return Some((b.item.clone(), below, true));
+            }
+        }
+    }
+    let dim = game.dim.id().to_string();
+    let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+    let found = game.native_item_entities(&dim, [x, y - 2.0, z], [x + 1.0, y, z + 1.0]);
+    found.iter().find(|e| pressing(&e.stack.item).is_some()).map(|e| (e.stack.item.to_string(), 2, false))
+}
+
+fn press_now(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
+    // the head hits: the belt sound on a belt, the heavy one otherwise (also on an empty strike); the window game
+    // shows the item particles from the counter "ph" and the item "pi" (client_fx)
+    let target = press_target(game, pos);
+    match &target {
+        Some((_, _, true)) => sfx(game, "create:mechanical_press_activation_belt", pos, 0.6, 1.0),
+        _ => sfx(game, "create:mechanical_press_activation", pos, 0.5, 1.0),
+    }
+    if let Some((item, depth, _)) = target {
+        put_int(nbt, "ph", get_int(nbt, "ph", 0).wrapping_add(1));
+        put_int(nbt, "pd", depth);
+        put_text(nbt, "pi", &item);
+    }
     for below in [1, 2] {
         if press_one(game, [pos[0], pos[1] - below, pos[2]]) {
             return;
@@ -2532,7 +2578,7 @@ fn press_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
     let units = (1.0 + (rpm / 512.0).clamp(0.0, 1.0) * 59.0).floor();
     let mut next = phase + units * 1.5;
     if phase < 180.0 && next >= 180.0 {
-        press_now(game, pos);
+        press_now(game, pos, nbt);
     }
     if next >= 360.0 {
         next = 0.0;
@@ -2939,6 +2985,91 @@ fn belt_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node, 
     changed || items.len() != before
 }
 
+const DYES: [&str; 16] = [
+    "black", "blue", "brown", "cyan", "gray", "green", "light_blue", "light_gray", "lime", "magenta", "orange", "pink", "purple", "red", "white", "yellow",
+];
+
+// The colour of a dye item, as a belt takes it.
+fn dye_color(item: &str) -> Option<&'static str> {
+    let name = item.strip_prefix("minecraft:")?.strip_suffix("_dye")?;
+    DYES.iter().copied().find(|c| *c == name)
+}
+
+// Every piece of the belt through `at`.
+fn belt_chain(game: &mut Game<'_>, at: [i32; 3]) -> Vec<[i32; 3]> {
+    let Some(me) = node_at(game, at) else { return Vec::new() };
+    if me.kind != Kind::Belt {
+        return Vec::new();
+    }
+    let line = axis_of(me.front);
+    let mut pieces = vec![at];
+    for sgn in [-1, 1] {
+        let mut p = at;
+        for _ in 0..40 {
+            p[line] += sgn;
+            match node_at(game, p) {
+                Some(n) if n.kind == Kind::Belt && n.front == me.front => pieces.push(p),
+                _ => break,
+            }
+        }
+    }
+    pieces
+}
+
+// A dye on a belt colours the whole belt.
+fn belt_dye(game: &mut Game<'_>, pos: [i32; 3], color: &'static str) -> bool {
+    let same = game.native_with_mod_block_entity(pos, |e| get_text(&e.nbt, "bc") == color).unwrap_or(true);
+    if same {
+        return false;
+    }
+    for p in belt_chain(game, pos) {
+        let _ = game.native_with_mod_block_entity(p, move |e| {
+            e.nbt.insert(JavaString::from("bc"), Tag::String(JavaString::from(color)));
+        });
+        game.native_block_entity_sync(p);
+    }
+    sfx(game, "minecraft:item.dye.use", pos, 0.8, 1.0);
+    true
+}
+
+// A casing on a belt piece covers it; a wrench takes the cover off again.
+fn belt_cover_click(game: &mut Game<'_>, pos: [i32; 3], held: &str) -> bool {
+    let kind = match held {
+        "create:andesite_casing" => "andesite",
+        "create:brass_casing" => "brass",
+        _ => return false,
+    };
+    let had = game.native_with_mod_block_entity(pos, |e| get_text(&e.nbt, "bv")).unwrap_or_default();
+    if had == kind {
+        return false;
+    }
+    let _ = game.native_with_mod_block_entity(pos, move |e| {
+        e.nbt.insert(JavaString::from("bv"), Tag::String(JavaString::from(kind)));
+    });
+    if !had.is_empty() {
+        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+        game.spawn_item(stack_of(&format!("create:{}_casing", had), 1), at, [0.0, 0.1, 0.0], 10);
+    }
+    game.native_block_entity_sync(pos);
+    sfx(game, "minecraft:block.stone.place", pos, 0.8, 1.0);
+    true
+}
+
+fn belt_uncover(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
+    let had = game.native_with_mod_block_entity(pos, |e| get_text(&e.nbt, "bv")).unwrap_or_default();
+    if had.is_empty() {
+        return false;
+    }
+    let _ = game.native_with_mod_block_entity(pos, |e| {
+        e.nbt.remove(&JavaString::from("bv"));
+    });
+    let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
+    game.spawn_item(stack_of(&format!("create:{}_casing", had), 1), at, [0.0, 0.1, 0.0], 10);
+    game.native_block_entity_sync(pos);
+    sfx(game, "minecraft:block.stone.break", pos, 0.8, 1.2);
+    true
+}
+
 // A broken or taken-apart piece drops what it carried.
 fn belt_spill(game: &mut Game<'_>, p: [i32; 3]) {
     let Some(items) = belt_items_at(game, p) else { return };
@@ -2946,8 +3077,13 @@ fn belt_spill(game: &mut Game<'_>, p: [i32; 3]) {
     for b in items {
         game.spawn_item(stack_of(&b.item, b.count), at, [0.0, 0.1, 0.0], 10);
     }
+    let cover = game.native_with_mod_block_entity(p, |e| get_text(&e.nbt, "bv")).unwrap_or_default();
+    if !cover.is_empty() {
+        game.spawn_item(stack_of(&format!("create:{}_casing", cover), 1), at, [0.0, 0.1, 0.0], 10);
+    }
     let _ = game.native_with_mod_block_entity(p, |e| {
         e.nbt.remove(&JavaString::from("bi"));
+        e.nbt.remove(&JavaString::from("bv"));
     });
 }
 
@@ -3270,15 +3406,24 @@ fn drill_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
     let break_speed = (speed.abs() / 100.0).clamp(1.0 / 128.0, 16.0);
     let mut wait = get_int(nbt, "bt", 0) - 1;
     let mut progress = get_int(nbt, "bp", 0);
+    let mut stepped = false;
     if wait <= 0 {
         let step = ((break_speed / hardness) as i32).clamp(1, (10 - progress).max(1));
         progress += step;
         wait = ((hardness / break_speed) as i32).max(2);
+        stepped = true;
     }
     put_int(nbt, "bt", wait);
     put_int(nbt, "bp", progress);
     let id = drill_id(pos);
+    // each crack stage makes the hit sound of the block (volume 0.25, as Java), the last one the break sound
+    if stepped {
+        let hit = facts.sounds.hit.to_string();
+        block_sfx(game, &hit, target, 0.25, 1.0);
+    }
     if progress >= 10 {
+        let brk = facts.sounds.break_sound.to_string();
+        block_sfx(game, &brk, target, 1.0, 0.8);
         put_int(nbt, "bp", 0);
         put_int(nbt, "bt", 0);
         game.destroy_block_progress(id, target, -1);
@@ -3893,6 +4038,15 @@ fn place_fluid(game: &mut Game<'_>, p: [i32; 3], fluid: &str) -> bool {
 fn sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
     let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
     let _ = game.native_play_local_sound(sound, at, volume, pitch, 0);
+}
+
+// The hit / break sound of the sound group of a block (the sound of a crack stage and of the block going).
+fn block_sfx(game: &mut Game<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch: f32) {
+    if sound.is_empty() {
+        return;
+    }
+    let name = if sound.contains(':') { sound.to_string() } else { String::from("minecraft:") + sound };
+    sfx(game, &name, pos, volume, pitch);
 }
 
 fn bucket_sfx(game: &mut Game<'_>, fluid: &str, fill: bool, pos: [i32; 3]) {
@@ -5153,18 +5307,28 @@ fn saw_tree(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target: [i32
     let break_speed = (speed.abs() / 100.0).clamp(1.0 / 128.0, 16.0);
     let mut wait = get_int(nbt, "bt", 0) - 1;
     let mut progress = get_int(nbt, "bp", 0);
+    let mut stepped = false;
     if wait <= 0 {
         let step = ((break_speed / hardness) as i32).clamp(1, (10 - progress).max(1));
         progress += step;
         wait = ((hardness / break_speed) as i32).max(2);
+        stepped = true;
     }
     put_int(nbt, "bt", wait);
     put_int(nbt, "bp", progress);
     let id = drill_id(pos);
+    if stepped {
+        // the wood hit sound with every crack stage, and the saw's own cutting sound
+        let hit = facts.sounds.hit.to_string();
+        block_sfx(game, &hit, target, 0.25, 1.0);
+        sfx(game, "create:saw_activate_wood", target, 0.2, 1.1);
+    }
     if progress < 10 {
         game.destroy_block_progress(id, target, progress.clamp(1, 10) - 1);
         return;
     }
+    let brk = facts.sounds.break_sound.to_string();
+    block_sfx(game, &brk, target, 1.0, 0.8);
     put_int(nbt, "bp", 0);
     put_int(nbt, "bt", 0);
     game.destroy_block_progress(id, target, -1);
@@ -5282,6 +5446,8 @@ fn crusher_gap_view(game: &Game<'_>, pos: [i32; 3], axis: usize) -> Option<[i32;
 // tick in the server game but are seen in the window game, so the drawing hands what to show over to the
 // window game's own tick (client_tick), which runs on the game that can show particles and cracks.
 static FX: Mutex<Vec<([i32; 3], Compound)>> = Mutex::new(Vec::new());
+// The last strike counter of each press the window game has seen (so a strike shows its particles once).
+static PRESS_SEEN: Mutex<Vec<([i32; 3], i32)>> = Mutex::new(Vec::new());
 
 fn fx_register(pos: [i32; 3], nbt: &Compound) {
     if let Ok(mut g) = FX.lock() {
@@ -5306,7 +5472,12 @@ fn fx_tick(game: &mut Game<'_>) {
 // machines show it whichever game does the work.
 fn client_fx(game: &mut Game<'_>, pos: [i32; 3], nbt: &Compound) {
     let name = game.native_block(pos);
-    if name != "create:millstone" && name != "create:mechanical_saw" && name != "create:crushing_wheel" {
+    if name != "create:millstone"
+        && name != "create:mechanical_saw"
+        && name != "create:crushing_wheel"
+        && name != "create:mechanical_mixer"
+        && name != "create:mechanical_press"
+    {
         return;
     }
     let speed = get_f32(nbt, "speed");
@@ -5315,16 +5486,64 @@ fn client_fx(game: &mut Game<'_>, pos: [i32; 3], nbt: &Compound) {
     }
     let phase = (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(3);
     let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
-    if name == "create:millstone" {
+    // the sound goes with the particles, a little less often (about every 12 ticks per machine)
+    let beat = (game.ticks as i64 + i64::from(pos[0]) * 5 + i64::from(pos[2]) * 3).rem_euclid(12) == 0;
+    let pick = (hash01(game.ticks as i32, pos[0] ^ pos[2]) * 3.0) as i32 + 1;
+    let pitch = 0.85 + 0.3 * hash01(pos[1], game.ticks as i32);
+    if name == "create:mechanical_press" {
+        // each strike on an item (the counter "ph" went up) throws bits of it up from the belt or depot
+        let count = get_int(nbt, "ph", 0);
+        let seen = match PRESS_SEEN.lock() {
+            Ok(mut g) => {
+                let at = g.iter().position(|e| e.0 == pos);
+                match at {
+                    Some(i) => std::mem::replace(&mut g[i].1, count),
+                    None => {
+                        if g.len() < 96 {
+                            g.push((pos, count));
+                        }
+                        count
+                    }
+                }
+            }
+            Err(_) => count,
+        };
+        if count != seen {
+            let item = get_text(nbt, "pi");
+            let depth = get_int(nbt, "pd", 1);
+            if !item.is_empty() {
+                spray(game, [x + 0.5, y - f64::from(depth) + 0.95, z + 0.5], Some(&item), 8);
+            }
+        }
+        return;
+    }
+    if name == "create:mechanical_mixer" {
+        // splashes in the basin below while the run goes, with the mixing sound
+        if get_f32(nbt, "mp") > 0.0 {
+            if phase == 0 {
+                let at = [x + 0.5, y - 1.25, z + 0.5];
+                puff(game, horizon_client::particles::ParticleType::Splash, at);
+            }
+            if beat {
+                sfx(game, "create:mixing", [pos[0], pos[1] - 2, pos[2]], 0.35, pitch);
+            }
+        }
+    } else if name == "create:millstone" {
         if phase == 0 {
             if let Some((item, _)) = pair_list(nbt, "mi").first() {
                 spray(game, [x + 0.5, y + 1.0, z + 0.5], Some(item), 3);
+                if beat {
+                    sfx(game, &format!("create:crushing_{pick}"), pos, 0.3, pitch);
+                }
             }
         }
     } else if name == "create:mechanical_saw" {
         if phase == 0 {
             if let Some((item, _)) = pair_list(nbt, "si").first() {
                 spray(game, [x + 0.5, y + 1.05, z + 0.5], Some(item), 3);
+                if beat {
+                    sfx(game, "create:saw_activate_wood", pos, 0.2, pitch);
+                }
             }
         }
         let bp = get_int(nbt, "bp", 0);
@@ -5341,6 +5560,9 @@ fn client_fx(game: &mut Game<'_>, pos: [i32; 3], nbt: &Compound) {
             if let Some(me) = node_at(game, pos) {
                 if let Some(g) = crusher_gap_view(game, pos, me.axis) {
                     spray(game, [f64::from(g[0]) + 0.5, f64::from(g[1]) + 1.0, f64::from(g[2]) + 0.5], Some(item), 3);
+                    if beat {
+                        sfx(game, &format!("create:crushing_{pick}"), g, 0.4, pitch);
+                    }
                 }
             }
         }
@@ -5698,6 +5920,7 @@ fn crush_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Node,
             if let Some(rec) = recipe_for(game, "create:crushing", &item) {
                 let outs = roll_outputs(game, g, &rec, count);
                 let at = [f64::from(g[0]) + 0.5, f64::from(g[1]) + 0.2, f64::from(g[2]) + 0.5];
+                sfx(game, "create:crushing_2", g, 0.5, 1.0);
                 for o in outs {
                     spray(game, at, Some(&o.0), 6);
                     let n = o.1.min(99);
@@ -5949,6 +6172,7 @@ fn crafter_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f
         }
     }
     pair_store(nbt, "co", &[(result.item.to_string(), result.count)]);
+    sfx(game, "create:crafter_craft", pos, 0.6, 1.0);
     if put_on(game, add3(pos, dirv), &result.item.to_string(), result.count) {
         pair_store(nbt, "co", &[]);
     }
@@ -5961,6 +6185,7 @@ fn crafter_click(game: &mut Game<'_>, pos: [i32; 3], held_item: Option<String>) 
         let at = POINTS.iter().position(|p| *p == now.as_str()).unwrap_or(0);
         let next = POINTS[(at + 1) % 4];
         game.native_set_block_property(pos, "pointing", next);
+        sfx(game, "create:wrench_rotate", pos, 0.6, 1.0);
         say(game, &(String::from("Mechanical Crafter points ") + next));
         return true;
     }
@@ -6004,6 +6229,7 @@ fn crafter_click(game: &mut Game<'_>, pos: [i32; 3], held_item: Option<String>) 
             .unwrap_or(0);
         if took > 0 {
             game.native_block_entity_sync(pos);
+            sfx(game, "create:crafter_click", pos, 0.5, 1.0);
             take_held(game, took);
             return true;
         }
@@ -6409,6 +6635,224 @@ fn glue_path(game: &Game<'_>) -> Option<std::path::PathBuf> {
 }
 
 // Runs `f` on the glue of the open world, loading it first when the world is another one.
+// A box that was just glued: the window game shows its connections for a moment (glue_fx).
+static GLUE_FLASH: Mutex<Vec<(GlueBox, i32)>> = Mutex::new(Vec::new());
+
+fn glue_flash(b: GlueBox) {
+    if let Ok(mut g) = GLUE_FLASH.lock() {
+        if g.len() < 8 {
+            g.push((b, 24));
+        }
+    }
+}
+
+fn glue_dust(game: &mut Game<'_>, rgb: [f32; 3], scale: f32, at: [f64; 3]) {
+    use horizon_client::particles::ParticleOptions;
+    game.particles.add(&ParticleOptions::dust(rgb, scale), at, [0.0, 0.0, 0.0]);
+}
+
+// A line of dust points close together (so it reads as one thin line, as the outlines of Create do). `phase`
+// thins the points so that each one is shown again every 4 ticks, which keeps the line steady without flooding.
+fn glue_line(game: &mut Game<'_>, from: [f64; 3], to: [f64; 3], rgb: [f32; 3], scale: f32, phase: i32, budget: &mut i32) {
+    let len = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2) + (to[2] - from[2]).powi(2)).sqrt();
+    let gap = (len / 40.0).max(0.125);
+    let n = (len / gap).ceil().max(1.0) as i32;
+    for i in 0..=n {
+        if *budget <= 0 {
+            return;
+        }
+        if (i + phase).rem_euclid(4) != 0 {
+            continue;
+        }
+        let t = f64::from(i) / f64::from(n);
+        let at = [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t, from[2] + (to[2] - from[2]) * t];
+        glue_dust(game, rgb, scale, at);
+        *budget -= 1;
+    }
+}
+
+// The 12 edges of a box (min and max block, both inside it) as lines, a hair outside the blocks.
+fn glue_outline(game: &mut Game<'_>, b: &GlueBox, rgb: [f32; 3], scale: f32, phase: i32, budget: &mut i32) {
+    let e = 0.01;
+    let lo = [f64::from(b.min[0]) - e, f64::from(b.min[1]) - e, f64::from(b.min[2]) - e];
+    let hi = [f64::from(b.max[0] + 1) + e, f64::from(b.max[1] + 1) + e, f64::from(b.max[2] + 1) + e];
+    for a in 0..3 {
+        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+        for cu in [lo[u], hi[u]] {
+            for cv in [lo[v], hi[v]] {
+                let mut from = [0.0f64; 3];
+                from[a] = lo[a];
+                from[u] = cu;
+                from[v] = cv;
+                let mut to = from;
+                to[a] = hi[a];
+                glue_line(game, from, to, rgb, scale, phase, budget);
+            }
+        }
+    }
+}
+
+// Create's outline colours: the glue boxes 0x4D9162, the one being made 0x68C586, links 0xB5F2C6, and 0xC5B548 for
+// links that carry a shaft, cogwheel or other kinetic block.
+const GLUE_PASSIVE: [f32; 3] = [0.302, 0.569, 0.384];
+const GLUE_HIGHLIGHT: [f32; 3] = [0.408, 0.773, 0.525];
+const GLUE_LINK: [f32; 3] = [0.710, 0.949, 0.776];
+const GLUE_KINETIC: [f32; 3] = [0.773, 0.710, 0.282];
+
+// The links inside a box: a line from the middle of each block to the middle of its touching neighbour, as the
+// glued faces join the blocks. A link with a shaft, cogwheel or any kinetic block on it has the second colour.
+fn glue_links(game: &mut Game<'_>, b: &GlueBox, phase: i32, budget: &mut i32) {
+    let mut made = 0;
+    for x in b.min[0]..=b.max[0] {
+        for y in b.min[1]..=b.max[1] {
+            for z in b.min[2]..=b.max[2] {
+                let here = [x, y, z];
+                let name = game.native_block(here);
+                if is_air(&name) {
+                    continue;
+                }
+                let mine = kind_of(&name).is_some();
+                for a in 0..3 {
+                    let mut n = here;
+                    n[a] += 1;
+                    if n[a] > b.max[a] {
+                        continue;
+                    }
+                    let other = game.native_block(n);
+                    if is_air(&other) {
+                        continue;
+                    }
+                    let kin = mine || kind_of(&other).is_some();
+                    let c = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
+                    let mut d = c;
+                    d[a] += 1.0;
+                    let rgb = if kin { GLUE_KINETIC } else { GLUE_LINK };
+                    glue_line(game, c, d, rgb, 0.45, phase, budget);
+                    made += 1;
+                    if made >= 60 || *budget <= 0 {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// What the player sees of the super glue, in the window game: while the glue is held, the outline of every glue box
+// near the player, the first corner that was marked (brighter), and for a moment after a box is made the links
+// between its blocks (the middle of each face where two blocks of the box touch, shafts and cogwheels included).
+fn glue_fx(game: &mut Game<'_>) {
+    let Some(pl) = game.native_player() else { return };
+    let p = [pl.x, pl.y, pl.z];
+    let tick = game.ticks as i32;
+    let holding = game.held().map(|h| &*h.item == GLUE_ITEM).unwrap_or(false);
+    if holding {
+        let mut budget = 260;
+        let near = |b: &GlueBox| {
+            let c = [
+                f64::from(b.min[0] + b.max[0]) * 0.5 + 0.5,
+                f64::from(b.min[1] + b.max[1]) * 0.5 + 0.5,
+                f64::from(b.min[2] + b.max[2]) * 0.5 + 0.5,
+            ];
+            let d = (c[0] - p[0]).powi(2) + (c[1] - p[1]).powi(2) + (c[2] - p[2]).powi(2);
+            d < 32.0 * 32.0
+        };
+        let boxes: Vec<GlueBox> = glue_boxes_here(game).into_iter().filter(|b| near(b)).take(10).collect();
+        for b in boxes.iter() {
+            glue_outline(game, b, GLUE_PASSIVE, 0.4, tick, &mut budget);
+            let mut links = 90;
+            glue_links(game, b, tick, &mut links);
+        }
+        let dim = game.dim.id().to_string();
+        let pending = with_glue(game, |g| g.pending.clone()).flatten();
+        if let Some((d, a)) = pending {
+            if d == dim {
+                let mut own = 90;
+                glue_outline(game, &GlueBox::new(a, a), GLUE_HIGHLIGHT, 0.55, tick, &mut own);
+            }
+        }
+    }
+    let flashes: Vec<(GlueBox, i32)> = match GLUE_FLASH.lock() {
+        Ok(mut g) => {
+            for f in g.iter_mut() {
+                f.1 -= 1;
+            }
+            let out = g.clone();
+            g.retain(|f| f.1 > 0);
+            out
+        }
+        Err(_) => Vec::new(),
+    };
+    for (b, _left) in flashes {
+        let mut budget = 200;
+        glue_outline(game, &b, GLUE_HIGHLIGHT, 0.55, tick, &mut budget);
+        let mut links = 150;
+        glue_links(game, &b, tick, &mut links);
+    }
+}
+
+// The belt connector in hand, as Create shows it: the shaft that was clicked first is outlined, and while the
+// crosshair is on another shaft the whole belt that would be made is outlined, green when it can be made and
+// red when it cannot (not on one axis, too far, or something in the way). Same line style as the glue.
+const BELT_FAIL: [f32; 3] = [0.620, 0.169, 0.169];
+
+fn belt_preview_fx(game: &mut Game<'_>) {
+    let holding = game.held().map(|h| &*h.item == "create:belt_connector").unwrap_or(false);
+    if !holding {
+        return;
+    }
+    let tick = game.ticks as i32;
+    let first = PENDING.lock().ok().and_then(|p| *p);
+    let Some((o, d)) = game.aim() else { return };
+    let mut aimed: Option<[i32; 3]> = None;
+    let mut t = 0.0f64;
+    while t < 6.0 {
+        let q = [(o[0] + d[0] * t).floor() as i32, (o[1] + d[1] * t).floor() as i32, (o[2] + d[2] * t).floor() as i32];
+        if !is_air(&game.native_block(q)) {
+            aimed = Some(q);
+            break;
+        }
+        t += 0.05;
+    }
+    let mut budget = 200;
+    if let Some(a) = first {
+        glue_outline(game, &GlueBox::new(a, a), GLUE_HIGHLIGHT, 0.55, tick, &mut budget);
+    }
+    let Some(pos) = aimed else { return };
+    let Some((axis, _)) = connector_axis(game, pos) else { return };
+    let Some(a) = first else {
+        glue_outline(game, &GlueBox::new(pos, pos), GLUE_PASSIVE, 0.45, tick, &mut budget);
+        return;
+    };
+    if a == pos {
+        return;
+    }
+    let h = if axis == 0 { 2 } else { 0 };
+    let delta = [pos[0] - a[0], pos[1] - a[1], pos[2] - a[2]];
+    let len = delta[h].abs();
+    let mut ok = match connector_axis(game, a) {
+        Some((axis_a, _)) => axis_a == axis && delta[1] == 0 && delta[axis] == 0 && len >= 1 && len <= 19,
+        None => false,
+    };
+    if ok {
+        let mut dir = [0; 3];
+        dir[h] = delta[h].signum();
+        for i in 1..len {
+            let q = [a[0] + dir[0] * i, a[1], a[2] + dir[2] * i];
+            if !is_air(&game.native_block(q)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    let rgb = if ok { GLUE_HIGHLIGHT } else { BELT_FAIL };
+    glue_outline(game, &GlueBox::new(a, pos), rgb, 0.55, tick, &mut budget);
+    // the line along the belt, from shaft to shaft
+    let c = [f64::from(a[0]) + 0.5, f64::from(a[1]) + 0.5, f64::from(a[2]) + 0.5];
+    let e = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    glue_line(game, c, e, if ok { GLUE_LINK } else { BELT_FAIL }, 0.45, tick, &mut budget);
+}
+
 fn with_glue<R>(game: &Game<'_>, f: impl FnOnce(&mut GlueStore) -> R) -> Option<R> {
     let world = game.native_world_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
     let mut guard = GLUE.lock().ok()?;
@@ -6448,6 +6892,8 @@ fn glue_click(game: &mut Game<'_>, pos: [i32; 3]) {
             }
             let _ = with_glue(game, |g| g.boxes.push((dim.clone(), b)));
             glue_save(game);
+            sfx(game, "create:slime_added", pos, 0.6, 1.0);
+            glue_flash(b);
             say(
                 game,
                 &("Super Glue: stuck ".to_string()
@@ -6461,6 +6907,7 @@ fn glue_click(game: &mut Game<'_>, pos: [i32; 3]) {
         }
         _ => {
             let _ = with_glue(game, |g| g.pending = Some((dim.clone(), pos)));
+            sfx(game, "create:slime_added", pos, 0.4, 1.3);
             say(
                 game,
                 &("Super Glue: first corner ".to_string()
@@ -6751,6 +7198,7 @@ fn bearing_release(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
         bearing_clear(&mut e.nbt);
     });
     game.native_block_entity_sync(pos);
+    sfx(game, "create:contraption_disassemble", pos, 0.6, 1.0);
     bearing_said(game, &me, &("put down ".to_string() + &count.to_string() + " blocks"));
     true
 }
@@ -6771,6 +7219,7 @@ fn bearing_toggle(game: &mut Game<'_>, pos: [i32; 3]) {
                 bearing_fill(&mut e.nbt, &list, sails, &gl, bes);
             });
             game.native_block_entity_sync(pos);
+            sfx(game, "create:contraption_assemble", pos, 0.6, 1.0);
             bearing_assembled(game, &me, list.len(), sails);
         }
         Err(why) => bearing_said(game, &me, &("cannot assemble, ".to_string() + &why)),
@@ -6808,6 +7257,7 @@ fn bearing_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Nod
                 bearing_remove(game, pos, &list);
                 bearing_fill(nbt, &list, sails, &gl, bes);
                 game.native_block_entity_sync(pos);
+                sfx(game, "create:contraption_assemble", pos, 0.6, 1.0);
                 bearing_assembled(game, me, list.len(), sails);
             }
             Err(why) => bearing_said(game, me, &("cannot assemble, ".to_string() + &why)),
@@ -6825,6 +7275,7 @@ fn bearing_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me: &Nod
         glue_give_back(game, pos, me.axis, &gl, ang);
         bearing_clear(nbt);
         game.native_block_entity_sync(pos);
+        sfx(game, "create:contraption_disassemble", pos, 0.6, 1.0);
         bearing_said(game, me, &("put down ".to_string() + &count.to_string() + " blocks"));
     }
 }
@@ -7691,6 +8142,8 @@ fn actor_destroy(game: &mut Game<'_>, p: [i32; 3], bes: &mut Compound, list: &[M
     let dim = game.dim.id().to_string();
     if game.native_set_block(&dim, p, BlockStateId(0), 3) {
         game.destroy_particles(p, state);
+        let brk = game.res.facts().get(state).sounds.break_sound.to_string();
+        block_sfx(game, &brk, p, 1.0, 0.8);
         for d in drops {
             if &*d.item == "minecraft:air" {
                 continue;
@@ -8133,6 +8586,8 @@ pub fn client_tick(game: &mut Game<'_>) {
         return;
     }
     fx_tick(game);
+    glue_fx(game);
+    belt_preview_fx(game);
     let Some(p) = game.native_player() else { return };
     let mut kick = [0.0f32; 3];
     let mut any = false;
@@ -9092,6 +9547,8 @@ fn deployer_mine(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, target:
         let dim = game.dim.id().to_string();
         if game.native_set_block(&dim, target, BlockStateId(0), 3) {
             game.destroy_particles(target, state);
+            let brk = game.res.facts().get(state).sounds.break_sound.to_string();
+            block_sfx(game, &brk, target, 1.0, 0.8);
             for d in drops {
                 if &*d.item != "minecraft:air" {
                     dep_pick_up(game, nbt, &d.item, d.count);
@@ -9857,7 +10314,7 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         for key in ["cp", "cr", "ch", "cs", "bp", "bx", "by", "bz"] {
             put_int(&mut c, key, get_int(&entity.nbt, key, 0));
         }
-        for key in ["mi", "cq"] {
+        for key in ["mi", "cq", "bc", "bv"] {
             let text = get_text(&entity.nbt, key);
             c.insert(JavaString::from(key), Tag::String(JavaString::from(text.as_str())));
         }
@@ -10109,6 +10566,39 @@ pub fn destroyed(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
 // block it tells the player its speed and the network stress.
 pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
     let held_item = game.held().map(|h| h.item.to_string());
+    if game.native_block(pos) == "create:belt" {
+        // dye colours the whole belt, a casing covers one piece, a wrench takes the cover off
+        let done = match held_item.as_deref() {
+            Some(item) if dye_color(item).is_some() => {
+                if fresh_click(game, pos) {
+                    if let Some(c) = dye_color(item) {
+                        if belt_dye(game, pos, c) {
+                            take_held(game, 1);
+                        }
+                    }
+                }
+                true
+            }
+            Some(item) if item == "create:andesite_casing" || item == "create:brass_casing" => {
+                if fresh_click(game, pos) && belt_cover_click(game, pos, item) {
+                    take_held(game, 1);
+                }
+                true
+            }
+            Some("create:wrench") => {
+                let had = game.native_with_mod_block_entity(pos, |e| !get_text(&e.nbt, "bv").is_empty()).unwrap_or(false);
+                if had && fresh_click(game, pos) {
+                    belt_uncover(game, pos);
+                }
+                had
+            }
+            _ => false,
+        };
+        if done {
+            *canceled = true;
+            return;
+        }
+    }
     if held_item.as_deref() == Some("create:belt_connector") {
         if fresh_click(game, pos) {
             belt_connector(game, pos);
@@ -10369,12 +10859,14 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
             }
             put_int(&mut e.nbt, "until", until);
         });
+        sfx(game, "create:cranking", pos, 0.5, 1.0);
     }
     if me.kind == Kind::Crank {
         let until = (game.ticks as i32).wrapping_add(CRANK_TICKS);
         let _ = game.native_with_mod_block_entity(pos, |e| {
             put_int(&mut e.nbt, "until", until);
         });
+        sfx(game, "create:cranking", pos, 0.5, 1.0);
     }
     let info = game.native_with_mod_block_entity(pos, |e| {
         (get_f32(&e.nbt, "speed"), get_int(&e.nbt, "load", 0), get_int(&e.nbt, "cap", 0))
@@ -10671,16 +11163,28 @@ pub fn submit(
         let part = game.native_block_state_property(state, "part").map(|v| v.to_string()).unwrap_or_default();
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         if part == "start" || part == "middle" || part == "end" || part == "pulley" {
-            let part = if part == "pulley" { "middle".to_string() } else { part.clone() };
-            // The belt surface is one of sixteen pictures, each shifted a pixel further along the belt.
-            let t = draw.game_time as f64 + f64::from(draw.partial);
-            let flip = f64::from(belt_flip(front));
-            let frame = ((-flip * t * speed / 30.0).floor() as i64).rem_euclid(16).to_string();
-            game.native_draw_block(
-                draw,
-                "create:belt_part",
-                &[("facing", f.as_str()), ("part", part.as_str()), ("frame", frame.as_str())],
-            );
+            let cover = get_text(&entity.nbt, "bv");
+            if !cover.is_empty() {
+                // a covered belt hides the belt surface and what rides on it
+                game.native_draw_block(
+                    draw,
+                    "create:belt_cover_part",
+                    &[("facing", f.as_str()), ("part", part.as_str()), ("kind", cover.as_str())],
+                );
+            } else {
+                let part = if part == "pulley" { "middle".to_string() } else { part.clone() };
+                // The belt surface is one of sixteen pictures, each shifted a pixel further along the belt.
+                let t = draw.game_time as f64 + f64::from(draw.partial);
+                let flip = f64::from(belt_flip(front));
+                let frame = ((-flip * t * speed / 30.0).floor() as i64).rem_euclid(16).to_string();
+                let dye = get_text(&entity.nbt, "bc");
+                let color = if dye.is_empty() { "none" } else { dye.as_str() };
+                game.native_draw_block(
+                    draw,
+                    "create:belt_part",
+                    &[("facing", f.as_str()), ("part", part.as_str()), ("frame", frame.as_str()), ("color", color)],
+                );
+            }
         }
         if part != "middle" {
             let a = axis_of(front);
@@ -10690,7 +11194,8 @@ pub fn submit(
         let now = draw.game_time as f64 + f64::from(draw.partial);
         let (shown, seen) = belt_view(pos, &entity.nbt, now);
         let elapsed = (now - seen).clamp(0.0, 30.0);
-        for b in shown {
+        let covered = !get_text(&entity.nbt, "bv").is_empty();
+        for b in if covered { Vec::new() } else { shown } {
             let mut pf = f64::from(b.p);
             if b.moving {
                 pf += speed / 480.0 * f64::from(belt_flip(front)) * elapsed;
@@ -10959,6 +11464,9 @@ pub fn submit(
     let degrees = (speed * 0.3 * t) % 360.0;
     draw.push();
     if anim == 1 {
+        if speed.abs() >= 1.0 {
+            fx_register(pos, &entity.nbt);
+        }
         let phase = f64::from(get_f32(&entity.nbt, "pp"));
         let dy = -0.6 * (1.0 - phase.to_radians().cos());
         draw.translate([0.0, dy as f32, 0.0]);
@@ -11791,7 +12299,8 @@ fn amount_press(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity,
     .clamp(lo, hi);
     put_int(&mut entity.nbt, field, next);
     if tunnel {
-        put_int(&mut entity.nbt, "mv", get_int(&entity.nbt, "mv", 0) + 1);
+        let mv = get_int(&entity.nbt, "mv", 0) + 1;
+        put_int(&mut entity.nbt, "mv", mv);
     }
     entity.data.clear();
     entity.data.push(next);
@@ -12848,6 +13357,14 @@ fn fan_process_particles(game: &mut Game<'_>, kind: u8, at: [f64; 3]) {
         return;
     }
     let up = |dy: f64| [at[0], at[1] + dy, at[2]];
+    // the sound of the processing goes with its particles: washing, smoking, blasting, haunting
+    let (sound, volume, pitch) = match kind {
+        1 => ("minecraft:entity.generic.splash", 0.2, 1.4),
+        2 => ("minecraft:block.fire.ambient", 0.4, 1.0),
+        3 => ("minecraft:block.lava.pop", 0.4, 1.0),
+        _ => ("minecraft:particle.soul_escape", 0.4, 1.0),
+    };
+    fan_plain(game, at, sound, volume, pitch + (fan_rand() - 0.5) * 0.2);
     match kind {
         1 => {
             // a dust of colour 0x0055FF and a spit, each at its own random spot, rising at 0.125
