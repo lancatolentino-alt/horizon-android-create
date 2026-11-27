@@ -17,9 +17,9 @@
 # ABI selects the Android architecture (default arm64-v8a); VARIANT can be --preview or --dev.
 set -euo pipefail
 
-MIXINS_GIT=https://github.com/horizon-rust/horizon-mixins
+MIXINS_GIT=https://github.com/reservedbytes/horizon-mixins
 # Horizon's launcher's (launcher/src/native_mods.rs, MIXINS_REV).
-MIXINS_REV=main
+MIXINS_REV=5a64af938ec86b00d53d16a408aabc0038fb3e57
 
 fail() { echo "native_build: $*" >&2; exit 1; }
 [ $# -ge 3 ] || fail "usage: native_build.sh SOURCE OUT BUNDLE..."
@@ -43,7 +43,7 @@ mkdir -p "$cache"
 
 tools=$cache/mixins-${MIXINS_REV:0:12}
 if [ ! -x "$tools/bin/horizon-mixins" ]; then
-  cargo install --locked --git "$MIXINS_GIT" --branch "$MIXINS_REV" --root "$tools" horizon-mixins-cli
+  cargo install --locked --git "$MIXINS_GIT" --rev "$MIXINS_REV" --root "$tools" horizon-mixins-cli
 fi
 
 commit=$(git -C "$source" rev-parse HEAD)
