@@ -3,10 +3,9 @@ run-name: Android native-mod dev · ${{ github.sha }}
 
 on:
   push:
-    branches: [android-native, android-native2]
+    branches: [android-native]
     paths:
       - 'native-mods/**'
-      - 'crates/**'
       - 'tools/apply_native_mods.py'
       - '.github/workflows/android-native-dev.yml'
   workflow_dispatch:
@@ -25,7 +24,7 @@ concurrency:
 jobs:
   build:
     # Never expose a signing secret to pull requests or arbitrary dispatch refs.
-    if: github.ref == 'refs/heads/android-native' || github.ref == 'refs/heads/android-native2'
+    if: github.ref == 'refs/heads/android-native'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
@@ -41,10 +40,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           persist-credentials: false
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .local/keystore-cache
-          key: native-dev-keystore-v1
       - name: Restore the saved dev signing key
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -114,12 +109,24 @@ jobs:
           python3 tools/check_public_tree.py
           python3 -m unittest discover -s tests -p 'test_android_release_audit.py'
       - name: Apply native mods (horizon-mixins)
+        env:
+          # Set repo secret MIXINS_TOKEN (read access to the mixins repo) if it is private.
+          MIXINS_TOKEN: ${{ secrets.MIXINS_TOKEN }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+          GIT_TERMINAL_PROMPT: '0'
         run: |
+          if [[ -n "$MIXINS_TOKEN" ]]; then
+            git config --global url."https://x-access-token:${MIXINS_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+          # Fail with a clear message instead of cargo's misleading auth error.
+          git ls-remote https://github.com/horizon-rust/horizon-mixins HEAD \
+            || { echo "::error::horizon-mixins repo is missing/private or the URL is wrong (add MIXINS_TOKEN or fix the URL)"; exit 1; }
           cargo install --locked --root "$RUNNER_TEMP/mixins" \
             --git https://github.com/horizon-rust/horizon-mixins \
             --rev d9c83d7096b7ea5b83678da2efdfd6161f74997e horizon-mixins-cli
           python3 tools/apply_native_mods.py --mods native-mods \
             --cli "$RUNNER_TEMP/mixins/bin/horizon-mixins"
+          git config --global --unset-all url."https://x-access-token:${MIXINS_TOKEN}@github.com/".insteadOf || true
       - name: Use Mojang's original 26.3 version file
         run: |
           # Mojang republished 26.3.json; Horizon only accepts the original (content-addressed, still served).
