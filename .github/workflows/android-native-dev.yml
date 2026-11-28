@@ -159,11 +159,14 @@ jobs:
           python3 tools/apply_native_mods.py --mods native-mods --cli "$dest/bin/horizon-mixins"
       - name: Use Mojang's original 26.3 version file
         run: |
-          # Mojang republished 26.3.json; Horizon only accepts the original (content-addressed, still served).
-          mkdir -p .local/minecraft/26.3
-          curl -fsSL https://piston-meta.mojang.com/v1/packages/11f1aefe473eefba0af62e3286c33b692807b2eb/26.3.json \
-            -o .local/minecraft/26.3/manifest.json
-          test "$(sha1sum .local/minecraft/26.3/manifest.json | cut -d' ' -f1)" = 11f1aefe473eefba0af62e3286c33b692807b2eb
+          # Mojang republished 26.3.json (the new one lists lwjgl-freetype 3.4.3-mojang-2.15.0, but Horizon
+          # expects 3.4.3). The original is content-addressed and still served; seed it everywhere the
+          # tools look so the downloader keeps it and fetches the libraries it lists.
+          sha=11f1aefe473eefba0af62e3286c33b692807b2eb
+          mkdir -p .local/minecraft/26.3 .local/android/minecraft/versions/26.3
+          curl -fsSL "https://piston-meta.mojang.com/v1/packages/$sha/26.3.json" -o .local/minecraft/26.3/manifest.json
+          test "$(sha1sum .local/minecraft/26.3/manifest.json | cut -d' ' -f1)" = "$sha"
+          cp .local/minecraft/26.3/manifest.json .local/android/minecraft/versions/26.3/26.3.json
       - name: Prepare private engine inputs from official downloads
         run: python3 tools/android_prepare.py --java-home "$JAVA_HOME"
       - name: Diagnose missing Minecraft library
