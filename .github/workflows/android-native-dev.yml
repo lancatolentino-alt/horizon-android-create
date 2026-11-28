@@ -3,7 +3,7 @@ run-name: Android native-mod dev · ${{ github.sha }}
 
 on:
   push:
-    branches: [android-native]
+    branches: [android-native, android-native2]
     paths:
       - 'native-mods/**'
       - 'tools/apply_native_mods.py'
@@ -24,7 +24,7 @@ concurrency:
 jobs:
   build:
     # Never expose a signing secret to pull requests or arbitrary dispatch refs.
-    if: github.ref == 'refs/heads/android-native'
+    if: startsWith(github.ref, 'refs/heads/android-native')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
