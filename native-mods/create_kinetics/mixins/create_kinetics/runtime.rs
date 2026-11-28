@@ -24,6 +24,56 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+// Starling 0.8.0 compatibility: the old `native_*` reads, written over what `crate::game` can reach.
+trait KineticsCompat {
+    fn native_block(&self, pos: [i32; 3]) -> String;
+    fn native_block_property(&self, pos: [i32; 3], key: &str) -> Option<String>;
+    fn native_block_state_property(&self, state: BlockStateId, key: &str) -> Option<&str>;
+    fn native_neighbor_signal(&mut self, dim: &str, pos: [i32; 3]) -> i32;
+    fn native_recipe_result(&self, json: &serde_json::Value) -> Option<ItemStack>;
+    fn native_summon(&mut self, dim: &str, kind: &str, at: [f64; 3], nbt: Compound) -> Option<u32>;
+}
+impl KineticsCompat for Game<'_> {
+    fn native_block(&self, pos: [i32; 3]) -> String {
+        self.res
+            .facts()
+            .get(self.world.block(pos[0], pos[1], pos[2]))
+            .name
+            .to_string()
+    }
+    fn native_block_property(&self, pos: [i32; 3], key: &str) -> Option<String> {
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        self.pack
+            .assets
+            .registry
+            .state(state)?
+            .properties
+            .get(key)
+            .cloned()
+    }
+    fn native_block_state_property(&self, state: BlockStateId, key: &str) -> Option<&str> {
+        self.pack
+            .assets
+            .registry
+            .state(state)?
+            .properties
+            .get(key)
+            .map(String::as_str)
+    }
+    fn native_neighbor_signal(&mut self, _dim: &str, pos: [i32; 3]) -> i32 {
+        self.with_level(|b, level, ticks| {
+            b.best_neighbor_signal(level, ticks, BlockPos::new(pos[0], pos[1], pos[2]))
+        })
+    }
+    fn native_recipe_result(&self, json: &serde_json::Value) -> Option<ItemStack> {
+        self.recipe_result(&json.to_string()).ok().flatten()
+    }
+    fn native_summon(&mut self, dim: &str, kind: &str, at: [f64; 3], nbt: Compound) -> Option<u32> {
+        ::mod_api::prelude::EntitiesServerHost::summon(self, dim, kind, at, nbt)
+    }
+}
+
+
 pub const BE_ID: &str = "create:kinetic";
 const NONE_HOPS: i32 = 255;
 const MAX_HOPS: i32 = 128;
@@ -672,7 +722,7 @@ struct Reading {
 // What the kinetic block entity at `p` holds.
 fn read_neighbour(game: &mut Game<'_>, p: [i32; 3]) -> Option<Reading> {
     game.native_with_mod_block_entity(p, |e| {
-        if e.id == BE_ID {
+        if e.id() == BE_ID {
             Some(Reading {
                 speed: get_f32(&e.nbt, "speed"),
                 hops: get_hops(&e.nbt),
@@ -1051,7 +1101,7 @@ fn basin_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         }
     }
     if wanted != current && !wanted.is_empty() {
-        game.native_set_block_property(pos, "facing", &wanted);
+        game.set_block_property(pos, "facing", &wanted);
     }
     let out = bag_read(nbt, "out");
     let Some((item, count)) = out.first().cloned() else { return false };
@@ -1359,7 +1409,7 @@ fn tunnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
             let belt_axis = axis_of(n.front);
             let across = if belt_axis == 0 { 2 } else { 0 };
             if across != axis {
-                game.native_set_block_property(pos, "axis", axis_char(belt_axis));
+                game.set_block_property(pos, "axis", axis_char(belt_axis));
                 axis = across;
             }
         }
@@ -1367,7 +1417,7 @@ fn tunnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) {
     let want = tunnel_shape(game, pos, axis);
     let now = game.native_block_property(pos, "shape").map(|v| v.to_string()).unwrap_or_default();
     if now != want {
-        game.native_set_block_property(pos, "shape", want);
+        game.set_block_property(pos, "shape", want);
     }
     if game.native_block(pos) != "create:brass_tunnel" {
         return;
@@ -1416,7 +1466,7 @@ fn tunnel_flap(game: &mut Game<'_>, pos: [i32; 3], end: usize, inward: bool) {
     let fd = format!("fd{}", end);
     let done = game
         .native_with_mod_block_entity(pos, move |e| {
-            if e.id != TUNNEL_BE {
+            if e.id() != TUNNEL_BE {
                 return false;
             }
             let next = (get_int(&e.nbt, &fa, 0) + 1) % 1000000;
@@ -1714,7 +1764,7 @@ fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction, 
         }
         _ => {
             // a chest, barrel, furnace and the like: the first slot its side `face` lets go of
-            let dim = game.native_dimension().to_string();
+            let dim = game.dimension().to_string();
             let Some(slots) = game.native_container_slots(&dim, p, face) else { return None };
             for slot in slots {
                 if !slot.can_take {
@@ -1823,7 +1873,7 @@ fn storage_give(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32) -> u32
 fn funnel_click(game: &mut Game<'_>, pos: [i32; 3], brass: bool, held: Option<&str>) {
     if held == Some("create:wrench") {
         let now = game.native_block_property(pos, "unloading").map(|v| v == "true").unwrap_or(false);
-        game.native_set_block_property(pos, "unloading", if now { "false" } else { "true" });
+        game.set_block_property(pos, "unloading", if now { "false" } else { "true" });
         sfx(game, "minecraft:block.iron_trapdoor.open", pos, 0.4, 1.4);
         say(game, if now { "Funnel: pulling items in" } else { "Funnel: taking items out" });
         return;
@@ -1963,7 +2013,7 @@ fn funnel_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
     let powered = game.native_neighbor_signal(&dim, pos) > 0;
     let was = game.native_block_property(pos, "powered").map(|v| v == "true").unwrap_or(false);
     if powered != was {
-        game.native_set_block_property(pos, "powered", if powered { "true" } else { "false" });
+        game.set_block_property(pos, "powered", if powered { "true" } else { "false" });
     }
     if powered {
         return false;
@@ -2112,7 +2162,7 @@ fn burner_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
     put_int(nbt, "fuel", fuel - 1);
     if fuel % 6 == 0 {
         let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.9, f64::from(pos[2]) + 0.5];
-        game.native_flame_particle(at, false);
+        game.flame_particle(at, false);
     }
     // the fire of the burner crackles with the flames
     if fuel % 30 == 0 {
@@ -2491,7 +2541,7 @@ fn redstone_sync(game: &mut Game<'_>, pos: [i32; 3]) {
     let want = if on { "true" } else { "false" };
     let same = game.native_block_property(pos, "powered").map(|v| v == want).unwrap_or(true);
     if !same {
-        game.native_set_block_property(pos, "powered", want);
+        game.set_block_property(pos, "powered", want);
     }
 }
 
@@ -2545,7 +2595,7 @@ fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
                 }
                 let first = chain_first_towards(me.axis, a);
                 if first != me.first {
-                    game.native_set_block_property(pos, "axis_along_first", if first { "true" } else { "false" });
+                    game.set_block_property(pos, "axis_along_first", if first { "true" } else { "false" });
                 }
                 return;
             }
@@ -2553,7 +2603,7 @@ fn chain_part(game: &mut Game<'_>, pos: [i32; 3], me: &Node) {
     }
     let same = game.native_block_property(pos, "part").map(|v| v == want).unwrap_or(true);
     if !same {
-        game.native_set_block_property(pos, "part", want);
+        game.set_block_property(pos, "part", want);
     }
 }
 
@@ -3416,7 +3466,7 @@ fn belt_cover_click(game: &mut Game<'_>, pos: [i32; 3], held: &str) -> bool {
     if had == kind {
         return false;
     }
-    game.native_set_block_property(pos, "cover", kind);
+    game.set_block_property(pos, "cover", kind);
     if !had.is_empty() {
         let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
         game.spawn_item(stack_of(&format!("create:{}_casing", had), 1), at, [0.0, 0.1, 0.0], 10);
@@ -3430,7 +3480,7 @@ fn belt_uncover(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     if had.is_empty() {
         return false;
     }
-    game.native_set_block_property(pos, "cover", "none");
+    game.set_block_property(pos, "cover", "none");
     let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
     game.spawn_item(stack_of(&format!("create:{}_casing", had), 1), at, [0.0, 0.1, 0.0], 10);
     sfx(game, "minecraft:block.stone.break", pos, 0.8, 1.2);
@@ -3490,7 +3540,7 @@ fn belt_dismantle(game: &mut Game<'_>, at: [i32; 3], skip: Option<[i32; 3]>) {
         if part != "middle" {
             if let Some(base) = shaft {
                 game.native_set_block(&dim, p, base, 3);
-                game.native_set_block_property(p, "axis", axis_char(shaft_axis));
+                game.set_block_property(p, "axis", axis_char(shaft_axis));
             }
         } else {
             game.native_set_block(&dim, p, BlockStateId(0), 3);
@@ -3586,17 +3636,17 @@ fn belt_shape_fix(game: &mut Game<'_>, pos: [i32; 3]) {
     }
     let want = belt_shp(&get(game, "facing"), &get(game, "part"), &get(game, "slope"));
     if have != want {
-        game.native_set_block_property(pos, "shp", &want);
+        game.set_block_property(pos, "shp", &want);
     }
 }
 
 fn belt_piece_s(game: &mut Game<'_>, base: BlockStateId, p: [i32; 3], facing: &str, part: &str, slope: &str) {
     let dim = game.dim.id().to_string();
     game.native_set_block(&dim, p, base, 3);
-    game.native_set_block_property(p, "facing", facing);
-    game.native_set_block_property(p, "part", part);
-    game.native_set_block_property(p, "slope", slope);
-    game.native_set_block_property(p, "casing", "false");
+    game.set_block_property(p, "facing", facing);
+    game.set_block_property(p, "part", part);
+    game.set_block_property(p, "slope", slope);
+    game.set_block_property(p, "casing", "false");
     belt_shape_fix(game, p);
 }
 
@@ -3686,7 +3736,7 @@ fn belt_extend(game: &mut Game<'_>, pos: [i32; 3]) -> bool {
     }
     let Some(base) = game.pack.assets.registry.default_state("create:belt") else { return true };
     let facing = dir_name(front);
-    game.native_set_block_property(pos, "part", "middle");
+    game.set_block_property(pos, "part", "middle");
     belt_piece(game, base, np, facing, &part);
     if !game.creative {
         game.consume_held();
@@ -3702,7 +3752,7 @@ fn belt_add_pulley(game: &mut Game<'_>, pos: [i32; 3]) {
         say(game, "A shaft goes into the middle of a belt");
         return;
     }
-    game.native_set_block_property(pos, "part", "pulley");
+    game.set_block_property(pos, "part", "pulley");
     if !game.creative {
         game.consume_held();
     }
@@ -3775,7 +3825,7 @@ fn belt_connector(game: &mut Game<'_>, pos: [i32; 3]) {
             }
         }
         let facing = dir_name(front);
-        game.native_set_block_property(piece, "part", "middle");
+        game.set_block_property(piece, "part", "middle");
         for i in 1..len {
             let p = [piece[0] + to_shaft[0] * i, piece[1], piece[2] + to_shaft[2] * i];
             belt_piece(game, base, p, facing, "middle");
@@ -4092,7 +4142,7 @@ fn pipe_sync(game: &mut Game<'_>, pos: [i32; 3]) {
         let want = if open[i] { "true" } else { "false" };
         let same = game.native_block_property(pos, name).map(|v| v == want).unwrap_or(true);
         if !same {
-            game.native_set_block_property(pos, name, want);
+            game.set_block_property(pos, name, want);
         }
     }
 }
@@ -4205,7 +4255,7 @@ fn tank_sync(game: &mut Game<'_>, pos: [i32; 3]) {
     for (prop, v) in wants {
         let same = game.native_block_property(pos, prop).map(|x| x == v).unwrap_or(true);
         if !same {
-            game.native_set_block_property(pos, prop, v);
+            game.set_block_property(pos, prop, v);
         }
     }
 }
@@ -4527,7 +4577,7 @@ fn place_fluid(game: &mut Game<'_>, p: [i32; 3], fluid: &str) -> bool {
         let dim = game.dim.id().to_string();
         let ok = game.native_set_block(&dim, p, st, 3);
         if ok && fluid != "lava" {
-            game.native_set_block_property(p, "level", "3");
+            game.set_block_property(p, "level", "3");
         }
         return ok;
     }
@@ -4764,7 +4814,7 @@ fn hose_blocks(game: &mut Game<'_>, pos: [i32; 3], l: f32, moving: bool) {
                     let wet = here == "minecraft:water";
                     if let Some(st) = game.pack.assets.registry.default_state(w) {
                         if game.native_set_block(&dim, cell, st, 3) && wet {
-                            game.native_set_block_property(cell, "waterlogged", "true");
+                            game.set_block_property(cell, "waterlogged", "true");
                         }
                     }
                 }
@@ -5040,7 +5090,7 @@ fn valve_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, speed: f32
     let want = if open >= 0.5 { "true" } else { "false" };
     let same = game.native_block_property(pos, "enabled").map(|v| v == want).unwrap_or(true);
     if !same {
-        game.native_set_block_property(pos, "enabled", want);
+        game.set_block_property(pos, "enabled", want);
     }
 }
 
@@ -5440,7 +5490,7 @@ fn json_ingredient(v: &serde_json::Value) -> Option<serde_json::Value> {
 
 fn ingredient_has(game: &Game<'_>, v: &serde_json::Value, item: &str) -> bool {
     let Some(j) = json_ingredient(v) else { return false };
-    match game.native_recipe_ingredient(&j) {
+    match game.recipe_ingredient(&j) {
         Some(ing) => ing.0.contains(item),
         None => false,
     }
@@ -5448,7 +5498,7 @@ fn ingredient_has(game: &Game<'_>, v: &serde_json::Value, item: &str) -> bool {
 
 // A recipe of type `kind` with one ingredient that fits `item`, from the packs recipe files.
 fn custom_rec(game: &Game<'_>, kind: &str, item: &str) -> Option<Rec> {
-    for r in game.native_recipes_of_type(kind) {
+    for r in game.recipes_of_type(kind) {
         let j: &serde_json::Value = &r.json;
         let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
         if ings.len() != 1 || !ingredient_has(game, &ings[0], item) {
@@ -6634,7 +6684,7 @@ fn crafter_at(game: &Game<'_>, p: [i32; 3]) -> Option<([i32; 3], [i32; 3])> {
 }
 
 fn crafter_result(game: &Game<'_>, cells: &[Option<String>], w: usize, h: usize) -> Option<ItemStack> {
-    for r in game.native_recipes_of_type("create:mechanical_crafting") {
+    for r in game.recipes_of_type("create:mechanical_crafting") {
         let j: &serde_json::Value = &r.json;
         let Some(rows) = j.get("pattern").and_then(|v| v.as_array()) else { continue };
         let Some(key) = j.get("key").and_then(|v| v.as_object()) else { continue };
@@ -6959,7 +7009,7 @@ fn crafter_look_fix(game: &mut Game<'_>, p: [i32; 3]) {
     let now = game.native_block_property(p, "cn").map(|v| v.to_string()).unwrap_or_default();
     let want = mask.to_string();
     if now != want {
-        game.native_set_block_property(p, "cn", &want);
+        game.set_block_property(p, "cn", &want);
     }
 }
 
@@ -7042,7 +7092,7 @@ fn crafter_click(game: &mut Game<'_>, pos: [i32; 3], held_item: Option<String>) 
         let now = game.native_block_property(pos, "pointing").unwrap_or_default();
         let at = POINTS.iter().position(|p| *p == now.as_str()).unwrap_or(0);
         let next = POINTS[(at + 1) % 4];
-        game.native_set_block_property(pos, "pointing", next);
+        game.set_block_property(pos, "pointing", next);
         sfx(game, "create:wrench_rotate", pos, 0.6, 1.0);
         say(game, &(String::from("Mechanical Crafter points ") + next));
         return true;
@@ -7115,7 +7165,7 @@ fn wrench_rotate(game: &mut Game<'_>, pos: [i32; 3], name: &str) -> bool {
     if name == "create:belt" {
         let part = game.native_block_property(pos, "part").map(|v| v.to_string()).unwrap_or_default();
         if part == "pulley" {
-            game.native_set_block_property(pos, "part", "middle");
+            game.set_block_property(pos, "part", "middle");
             let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.0, f64::from(pos[2]) + 0.5];
             game.spawn_item(stack_of("create:shaft", 1), at, [0.0, 0.1, 0.0], 10);
             return true;
@@ -7130,15 +7180,15 @@ fn wrench_rotate(game: &mut Game<'_>, pos: [i32; 3], name: &str) -> bool {
     if let (Some(f), Some(fi)) = (facing.as_ref(), first.as_ref()) {
         let at = FACINGS.iter().position(|x| *x == f.as_str()).unwrap_or(0) + if fi.as_str() == "true" { 6 } else { 0 };
         let n = (at + 1) % 12;
-        let a = game.native_set_block_property(pos, "axis_along_first", if n >= 6 { "true" } else { "false" });
-        let b = game.native_set_block_property(pos, "facing", FACINGS[n % 6]);
+        let a = game.set_block_property(pos, "axis_along_first", if n >= 6 { "true" } else { "false" });
+        let b = game.set_block_property(pos, "facing", FACINGS[n % 6]);
         return a || b;
     }
     if let Some(f) = facing {
         let start = FACINGS.iter().position(|x| *x == f.as_str()).unwrap_or(0);
         for k in 1..=6 {
             let cand = FACINGS[(start + k) % 6];
-            if game.native_set_block_property(pos, "facing", cand) {
+            if game.set_block_property(pos, "facing", cand) {
                 return true;
             }
         }
@@ -7150,7 +7200,7 @@ fn wrench_rotate(game: &mut Game<'_>, pos: [i32; 3], name: &str) -> bool {
             "y" => "z",
             _ => "x",
         };
-        return game.native_set_block_property(pos, "axis", next);
+        return game.set_block_property(pos, "axis", next);
     }
     false
 }
@@ -7999,7 +8049,7 @@ fn bearing_place_back(game: &mut Game<'_>, pos: [i32; 3], axis: usize, cb: &str,
             Some(b) if free => {
                 game.native_set_block(&dim, p, b, 3);
                 for (k, v) in turned_props(&m.props, axis, turns) {
-                    game.native_set_block_property(p, &k, &v);
+                    game.set_block_property(p, &k, &v);
                 }
                 // the data it had, put back at its new place
                 if let Some(Tag::Compound(saved)) = bes.get(&JavaString::from(i.to_string().as_str())) {
@@ -8452,7 +8502,7 @@ fn psi_slots_of(tag: &Tag) -> Option<Vec<Option<ItemStack>>> {
             if m.items.is_empty() {
                 None
             } else {
-                Some(m.items)
+                Some(m.items.clone())
             }
         }
         _ => None,
@@ -9232,7 +9282,7 @@ fn harvester_visit(game: &mut Game<'_>, cell: [i32; 3], bes: &mut Compound, list
     }
     if keep_block {
         let age = if n == "sweet_berry_bush" { "1" } else { "0" };
-        game.native_set_block_property(cell, "age", age);
+        game.set_block_property(cell, "age", age);
     } else {
         let wet = matches!(n.as_str(), "kelp" | "kelp_plant" | "seagrass" | "tall_seagrass");
         if wet {
@@ -9850,7 +9900,7 @@ fn seq_state(item: &str) -> Option<(String, usize)> {
 // The sequenced assembly recipe a stack belongs to and the step it waits for.
 fn seq_find(game: &Game<'_>, item: &str) -> Option<(serde_json::Value, usize)> {
     let st = seq_state(item);
-    for r in game.native_recipes_of_type("create:sequenced_assembly") {
+    for r in game.recipes_of_type("create:sequenced_assembly") {
         let j: &serde_json::Value = &r.json;
         let trans = j.get("transitional_item").and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or("");
         match &st {
@@ -9914,7 +9964,7 @@ fn seq_advance(j: &serde_json::Value, step: usize) -> (String, u32) {
 fn deploy_rec(game: &Game<'_>, target: &str, held: &str) -> Option<Deploy> {
     let sand = serde_json::json!({ "tag": "create:sandpaper" });
     if ingredient_has(game, &sand, held) {
-        for r in game.native_recipes_of_type("create:sandpaper_polishing") {
+        for r in game.recipes_of_type("create:sandpaper_polishing") {
             let j: &serde_json::Value = &r.json;
             let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
             if ings.len() == 1 && ingredient_has(game, &ings[0], target) {
@@ -9936,7 +9986,7 @@ fn deploy_rec(game: &Game<'_>, target: &str, held: &str) -> Option<Deploy> {
         }
     }
     for kind in ["create:deploying", "create:item_application"] {
-        for r in game.native_recipes_of_type(kind) {
+        for r in game.recipes_of_type(kind) {
             let j: &serde_json::Value = &r.json;
             let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
             if ings.len() != 2 || !ingredient_has(game, &ings[0], target) || !ingredient_has(game, &ings[1], held) {
@@ -10165,7 +10215,7 @@ fn deployer_apply_world(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, 
     let state = game.world.block(target[0], target[1], target[2]);
     let name = game.res.facts().get(state).name.to_string();
     let mut found: Option<Deploy> = None;
-    for r in game.native_recipes_of_type("create:item_application") {
+    for r in game.recipes_of_type("create:item_application") {
         let j: &serde_json::Value = &r.json;
         let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
         if ings.len() == 2 && ingredient_has(game, &ings[0], &name) && ingredient_has(game, &ings[1], &held) {
@@ -10183,7 +10233,7 @@ fn deployer_apply_world(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, 
     if game.native_set_block(&dim, target, base, 3) {
         if let Some(axis) = game.native_block_state_property(state, "axis") {
             let axis = axis.to_string();
-            game.native_set_block_property(target, "axis", &axis);
+            game.set_block_property(target, "axis", &axis);
         }
     }
     let at = [f64::from(target[0]) + 0.5, f64::from(target[1]) + 0.5, f64::from(target[2]) + 0.5];
@@ -10410,7 +10460,7 @@ fn deployer_use_item(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], nbt: &
             let axis = game.native_block_state_property(state, "axis").map(|a| a.to_string());
             if dep_put_block(game, target, &name) {
                 if let Some(a) = axis {
-                    game.native_set_block_property(target, "axis", &a);
+                    game.set_block_property(target, "axis", &a);
                 }
                 sfx(game, "minecraft:item.axe.strip", target, 1.0, 1.0);
                 dep_consume(game, pos, nbt, false);
@@ -11061,11 +11111,11 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     } else if (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(8) == 3 && game.native_block(pos) == "create:mechanical_crafter" {
         crafter_look_fix(game, pos);
     }
-    if entity.id == FLUID_BE {
+    if entity.id() == FLUID_BE {
         fluid_tick(game, pos, entity);
         return;
     }
-    if entity.id == DEPOT_BE {
+    if entity.id() == DEPOT_BE {
         if !game.native_window() {
             let before = depot_list(&entity.nbt);
             depot_bridge(entity);
@@ -11075,7 +11125,7 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
         }
         return;
     }
-    if entity.id == BASIN_BE {
+    if entity.id() == BASIN_BE {
         if !game.native_window() {
             let before = (get_text(&entity.nbt, "in"), get_text(&entity.nbt, "out"));
             basin_bridge(entity);
@@ -11088,13 +11138,13 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
         }
         return;
     }
-    if entity.id == TUNNEL_BE {
+    if entity.id() == TUNNEL_BE {
         tunnel_tick(game, pos, &mut entity.nbt);
         entity.data.clear();
         entity.data.push(get_int(&entity.nbt, "mode", 0));
         return;
     }
-    if entity.id == FUNNEL_BE {
+    if entity.id() == FUNNEL_BE {
         let committed = amount_commit(pos, &mut entity.nbt);
         if funnel_tick(game, pos, &mut entity.nbt) || committed {
             game.native_block_entity_sync(pos);
@@ -11103,19 +11153,19 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
         entity.data.push(get_int(&entity.nbt, "cnt", 16));
         return;
     }
-    if entity.id == BURNER_BE {
+    if entity.id() == BURNER_BE {
         if burner_tick(game, pos, &mut entity.nbt) {
             game.native_block_entity_sync(pos);
         }
         return;
     }
-    if entity.id == ENGINE_BE {
+    if entity.id() == ENGINE_BE {
         if engine_tick(game, pos, &mut entity.nbt) {
             game.native_block_entity_sync(pos);
         }
         return;
     }
-    if entity.id == CHUTE_BE {
+    if entity.id() == CHUTE_BE {
         let committed = amount_commit(pos, &mut entity.nbt);
         if chute_tick(game, pos, &mut entity.nbt) || committed {
             game.native_block_entity_sync(pos);
@@ -11124,7 +11174,7 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
         entity.data.push(get_int(&entity.nbt, "cnt", 16));
         return;
     }
-    if entity.id != BE_ID {
+    if entity.id() != BE_ID {
         return;
     }
     let Some(me) = node_at(game, pos) else { return };
@@ -11297,7 +11347,7 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
 }
 
 pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
-    if entity.id == DEPOT_BE {
+    if entity.id() == DEPOT_BE {
         let mut c = Compound::new();
         match depot_content(&entity.nbt) {
             Some(content) => depot_put(&mut c, Some(content)),
@@ -11312,7 +11362,7 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(c);
         return;
     }
-    if entity.id == TUNNEL_BE {
+    if entity.id() == TUNNEL_BE {
         let mut c = Compound::new();
         for key in ["fa0", "fd0", "fa1", "fd1", "mode", "ctl"] {
             put_int(&mut c, key, get_int(&entity.nbt, key, 0));
@@ -11324,7 +11374,7 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(c);
         return;
     }
-    if entity.id == FUNNEL_BE {
+    if entity.id() == FUNNEL_BE {
         let mut c = Compound::new();
         let flt = get_text(&entity.nbt, "flt");
         c.insert(JavaString::from("flt"), Tag::String(JavaString::from(flt.as_str())));
@@ -11335,7 +11385,7 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(c);
         return;
     }
-    if entity.id == CHUTE_BE {
+    if entity.id() == CHUTE_BE {
         let mut c = Compound::new();
         let fs = get_text(&entity.nbt, "fs");
         c.insert(JavaString::from("fs"), Tag::String(JavaString::from(fs.as_str())));
@@ -11349,21 +11399,21 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(c);
         return;
     }
-    if entity.id == ENGINE_BE {
+    if entity.id() == ENGINE_BE {
         let mut c = Compound::new();
         put_f32(&mut c, "sp", get_f32(&entity.nbt, "sp"));
         put_f32(&mut c, "eff", get_f32(&entity.nbt, "eff"));
         *tag = Some(c);
         return;
     }
-    if entity.id == BURNER_BE {
+    if entity.id() == BURNER_BE {
         let mut c = Compound::new();
         put_int(&mut c, "fuel", get_int(&entity.nbt, "fuel", 0));
         put_int(&mut c, "sup", get_int(&entity.nbt, "sup", 0));
         *tag = Some(c);
         return;
     }
-    if entity.id == BASIN_BE {
+    if entity.id() == BASIN_BE {
         let mut c = Compound::new();
         for key in ["in", "out"] {
             let text = get_text(&entity.nbt, key);
@@ -11376,7 +11426,7 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(c);
         return;
     }
-    if entity.id == FLUID_BE {
+    if entity.id() == FLUID_BE {
         let mut c = Compound::new();
         let fl = get_text(&entity.nbt, "fl");
         c.insert(JavaString::from("fl"), Tag::String(JavaString::from(fl.as_str())));
@@ -11393,7 +11443,7 @@ pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(c);
         return;
     }
-    if entity.id == BE_ID {
+    if entity.id() == BE_ID {
         let mut c = Compound::new();
         put_f32(&mut c, "speed", get_f32(&entity.nbt, "speed"));
         put_f32(&mut c, "pp", get_f32(&entity.nbt, "pp"));
@@ -13512,7 +13562,7 @@ fn amount_press(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity,
     if let Ok(mut at) = AMT_AT.lock() {
         *at = Some(pos);
     }
-    let tunnel = entity.id == TUNNEL_BE;
+    let tunnel = entity.id() == TUNNEL_BE;
     let (field, lo, hi) = if tunnel { ("mode", 0, 5) } else { ("cnt", 1, 64) };
     let cur = get_int(&entity.nbt, field, if tunnel { 0 } else { 16 });
     let next = match id {
@@ -13818,11 +13868,11 @@ pub fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
 }
 
 pub fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) {
-    if (entity.id == FUNNEL_BE || entity.id == CHUTE_BE || entity.id == TUNNEL_BE) && amount_block(&game.native_block(pos)) {
+    if (entity.id() == FUNNEL_BE || entity.id() == CHUTE_BE || entity.id() == TUNNEL_BE) && amount_block(&game.native_block(pos)) {
         amount_press(game, pos, entity, id);
         return;
     }
-    if entity.id != BE_ID || game.native_block(pos) != MOTOR_BLOCK {
+    if entity.id() != BE_ID || game.native_block(pos) != MOTOR_BLOCK {
         return;
     }
     let cur = motor_rpm(&entity.nbt);
@@ -15083,8 +15133,8 @@ fn chute_shape(game: &mut Game<'_>, pos: [i32; 3]) {
     if !down {
         let behind = [pos[0] - facing[0], pos[1] - 1, pos[2] - facing[2]];
         if chute_info(game, behind).is_none() {
-            game.native_set_block_property(pos, "facing", "down");
-            game.native_set_block_property(pos, "shape", "normal");
+            game.set_block_property(pos, "facing", "down");
+            game.set_block_property(pos, "shape", "normal");
             return;
         }
     }
@@ -15121,7 +15171,7 @@ fn chute_shape(game: &mut Game<'_>, pos: [i32; 3]) {
         }
     };
     if want != shape {
-        game.native_set_block_property(pos, "shape", want);
+        game.set_block_property(pos, "shape", want);
     }
 }
 
@@ -15141,7 +15191,7 @@ fn chute_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         let on = game.native_neighbor_signal(&dim, pos) > 0;
         let was = game.native_block_property(pos, "powered").map(|v| v == "true").unwrap_or(false);
         if on != was {
-            game.native_set_block_property(pos, "powered", if on { "true" } else { "false" });
+            game.set_block_property(pos, "powered", if on { "true" } else { "false" });
         }
         paused = on;
     }
@@ -15259,15 +15309,15 @@ fn chute_click(game: &mut Game<'_>, pos: [i32; 3], smart: bool, held: Option<&st
                 return false;
             }
             if shape == "encased" {
-                game.native_set_block_property(pos, "shape", "normal");
+                game.set_block_property(pos, "shape", "normal");
                 sfx(game, "minecraft:block.metal.break", pos, 1.0, 0.8);
             } else if down {
-                game.native_set_block_property(pos, "shape", if shape == "normal" { "window" } else { "normal" });
+                game.set_block_property(pos, "shape", if shape == "normal" { "window" } else { "normal" });
             }
             return true;
         }
         if held == Some("create:industrial_iron_block") && shape != "encased" && shape != "intersection" {
-            game.native_set_block_property(pos, "shape", "encased");
+            game.set_block_property(pos, "shape", "encased");
             sfx(game, "minecraft:block.netherite_block.hit", pos, 0.5, 1.05);
             return true;
         }
@@ -16033,7 +16083,7 @@ fn unpower(game: &mut Game<'_>, pos: [i32; 3]) {
     let dim = game.dim.id().to_string();
     if let Some(st) = game.pack.assets.registry.default_state("create:shaft") {
         game.native_set_block(&dim, pos, st, 3);
-        game.native_set_block_property(pos, "axis", axis.as_str());
+        game.set_block_property(pos, "axis", axis.as_str());
     }
 }
 
@@ -16223,7 +16273,7 @@ fn engine_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
         if let Some(st) = game.pack.assets.registry.default_state(POWERED_SHAFT) {
             game.native_set_block(&dim, shaft, st, 3);
             if let Some(a) = shaft_axis {
-                game.native_set_block_property(shaft, "axis", axis_char(a));
+                game.set_block_property(shaft, "axis", axis_char(a));
             }
         }
     }
@@ -16264,7 +16314,7 @@ fn engine_tick(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound) -> bool {
     }
     let until = (now as i32).wrapping_add(40);
     let _ = game.native_with_mod_block_entity(shaft, move |e| {
-        if e.id == BE_ID {
+        if e.id() == BE_ID {
             put_f32(&mut e.nbt, "eff", eff);
             put_int(&mut e.nbt, "pdir", dir);
             put_int(&mut e.nbt, "until", until);
