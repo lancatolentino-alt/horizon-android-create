@@ -1084,6 +1084,8 @@ pub struct Mesher<'a> {
     pub smooth_lighting: bool,
     /// The `cutoutLeaves` option (fancy graphics); off makes leaves opaque.
     pub cutout_leaves: bool,
+    /// Experimental: skip the faces between two leaf blocks even with cutout (fancy) leaves.
+    pub experimental_leaf_culling: bool,
 }
 impl Mesher<'_> {
     /// `region[dz][dx]` are the chunks around the meshed column (centre 1,1).
@@ -1182,7 +1184,9 @@ impl Mesher<'_> {
                         let neighbor = pad.blocks[pi(x + dx, y + dy, z + dz)];
                         let other = &info[neighbor as usize];
                         // LeavesBlock.skipRendering with opaque leaves.
-                        let opaque_leaves = !self.cutout_leaves && state.leaves && other.leaves;
+                        let opaque_leaves = (!self.cutout_leaves || self.experimental_leaf_culling)
+                            && state.leaves
+                            && other.leaves;
                         visible[d as usize] = !opaque_leaves
                             && self
                                 .visibility
