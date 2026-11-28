@@ -5476,7 +5476,7 @@ fn json_ingredient(v: &serde_json::Value) -> Option<serde_json::Value> {
 fn ingredient_has(game: &Game<'_>, v: &serde_json::Value, item: &str) -> bool {
     let Some(j) = json_ingredient(v) else { return false };
     match game.recipe_ingredient(&j.to_string()).ok().flatten() {
-        Some(ing) => ing.0.contains(item),
+        Some(ing) => ing.items.contains(item),
         None => false,
     }
 }
@@ -11644,7 +11644,11 @@ fn teleport_mob(game: &mut Game<'_>, id: u32, to: [f64; 3]) -> bool {
 
 // The old container reads and moves, on the game's item capability (`BlockSide` and a transaction).
 fn block_side(game: &Game<'_>, p: [i32; 3], face: Direction) -> Option<::mod_api::BlockSide> {
-    let level = game.native_level_here()?;
+    let epoch = game.native_lifecycle.epoch()?;
+    if !game.native_simulates() {
+        return None;
+    }
+    let level = game.level_ref(epoch, game.dim.key());
     Some(::mod_api::BlockSide { level, pos: p, side: Some(face) })
 }
 
@@ -16579,7 +16583,7 @@ fn engine_info(game: &mut Game<'_>, pos: [i32; 3]) {
 
 // The way Create turns the engine parts to the engine: about the block centre, by the horizontal angle of the
 // attached direction (a model faces south; east is 90 and west 270 because Create flips the angle on the x axis), then 90 more than its vertical angle, and a quarter more when the shaft runs the other way.
-fn engine_orient(draw: &mut BlockEntityDraw, fd: [i32; 3], roll: bool) {
+fn engine_orient(game: &Game<'_>, draw: &mut BlockEntityDraw, fd: [i32; 3], roll: bool) {
     let c = [0.5f32, 0.5, 0.5];
     let yaw = match fd {
         [1, 0, 0] => 90.0,
@@ -16629,12 +16633,12 @@ fn engine_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: &M
     let swing = (rod / 0.875).clamp(-1.0, 1.0).acos() * if a.cos() >= 0.0 { 1.0 } else { -1.0 };
     let roll = (fa != 1 && saxis == 1) || (fa == 1 && saxis == 2);
     game.native_draw_push(draw);
-    engine_orient(draw, fd, roll);
+    engine_orient(game, draw, fd, roll);
     game.native_draw_translate(draw, [0.0, distance + 1.25, 0.0]);
     game.native_draw_block(draw, "create:steam_engine_piston_part", &[]);
     game.native_draw_pop(draw);
     game.native_draw_push(draw);
-    engine_orient(draw, fd, roll);
+    engine_orient(game, draw, fd, roll);
     game.native_draw_translate(draw, [0.0, 1.0, 0.0]);
     game.native_draw_translate(draw, [0.0, distance + 1.25, 0.0]);
     game.native_draw_translate(draw, [0.0, 0.25, 0.5]);
@@ -16643,7 +16647,7 @@ fn engine_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: &M
     game.native_draw_block(draw, "create:steam_engine_linkage_part", &[]);
     game.native_draw_pop(draw);
     game.native_draw_push(draw);
-    engine_orient(draw, fd, roll);
+    engine_orient(game, draw, fd, roll);
     game.native_draw_translate(draw, [0.0, 2.0, 0.0]);
     game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], (-(a + std::f32::consts::FRAC_PI_2)).to_degrees(), [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:steam_engine_connector_part", &[]);
