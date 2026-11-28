@@ -168,7 +168,36 @@ jobs:
           test "$(sha1sum .local/minecraft/26.3/manifest.json | cut -d' ' -f1)" = "$sha"
           cp .local/minecraft/26.3/manifest.json .local/android/minecraft/versions/26.3/26.3.json
       - name: Prepare private engine inputs from official downloads
-        run: python3 tools/android_prepare.py --java-home "$JAVA_HOME"
+        run: |
+          if ! python3 tools/android_prepare.py --java-home "$JAVA_HOME"; then
+            echo "::warning::android_prepare.py failed; retrying with Mojang's original 26.3 version file and its libraries"
+            python3 - <<'PY'
+          import hashlib, json, shutil, urllib.request
+          from pathlib import Path
+          mc = Path('.local/android/minecraft')
+          original = Path('.local/minecraft/26.3/manifest.json')
+          # The downloader replaced the version file with Mojang's republished one; put the pinned original back.
+          shutil.copyfile(original, mc / 'versions/26.3/26.3.json')
+          manifest = json.loads(original.read_text())
+          fetched = 0
+          for lib in manifest['libraries']:
+              art = lib.get('downloads', {}).get('artifact')
+              if not art or any(x in art['path'] for x in ('natives-windows', 'natives-macos')):
+                  continue
+              dest = mc / 'libraries' / art['path']
+              if dest.is_file() and hashlib.sha1(dest.read_bytes()).hexdigest() == art['sha1']:
+                  continue
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              data = urllib.request.urlopen(art['url'], timeout=120).read()
+              if hashlib.sha1(data).hexdigest() != art['sha1']:
+                  raise SystemExit(f"checksum mismatch: {art['path']}")
+              dest.write_bytes(data); fetched += 1
+          print(f'fetched {fetched} libraries from the original 26.3 version file')
+          PY
+            cargo run -p horizon-prepare -- --root "$PWD" --prepare \
+              --minecraft-dir "$PWD/.local/android/minecraft" \
+              --server-jar "$PWD/.local/android/minecraft/versions/26.3/26.3-server.jar"
+          fi
       - name: Diagnose missing Minecraft library
         if: failure()
         run: |
