@@ -166,6 +166,16 @@ jobs:
           test "$(sha1sum .local/minecraft/26.3/manifest.json | cut -d' ' -f1)" = 11f1aefe473eefba0af62e3286c33b692807b2eb
       - name: Prepare private engine inputs from official downloads
         run: python3 tools/android_prepare.py --java-home "$JAVA_HOME"
+      - name: Diagnose missing Minecraft library
+        if: failure()
+        run: |
+          mc=.local/android/minecraft
+          echo "== version files =="; ls -la "$mc/versions/26.3" .local/minecraft/26.3 2>&1 || true
+          echo "== sha1 of manifests =="; sha1sum "$mc"/versions/26.3/*.json .local/minecraft/26.3/manifest.json 2>&1 || true
+          echo "== freetype entries in manifests =="
+          grep -o '"name": *"[^"]*freetype[^"]*"' "$mc"/versions/26.3/*.json .local/minecraft/26.3/manifest.json 2>&1 || true
+          echo "== lwjgl dirs on disk =="; ls "$mc/libraries/org/lwjgl" 2>&1 || true
+          ls -R "$mc/libraries/org/lwjgl/lwjgl-freetype" 2>&1 | head -20 || true
       - name: Build optimized public dev APK
         env:
           ABI: ${{ matrix.abi }}
