@@ -110,23 +110,53 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_android_release_audit.py'
       - name: Apply native mods (horizon-mixins)
         env:
-          # Set repo secret MIXINS_TOKEN (read access to the mixins repo) if it is private.
-          MIXINS_TOKEN: ${{ secrets.MIXINS_TOKEN }}
+          # Horizon launcher's pinned tool (crates/horizon-mod-package/src/mixins_tool.rs REV).
+          MIXINS_REV: ${{ vars.MIXINS_REV || 'e59da9094f0c2fdda6c627fe9eff22dec6a906f0' }}
+          MIXINS_REPO: ${{ vars.MIXINS_REPO || 'https://github.com/horizon-rust/horizon-mixins' }}
+          # sha256 of tools/mixins/narrow-reference-rule.patch (used if the file is not in this checkout)
+          MIXINS_PATCH_SHA: ${{ vars.MIXINS_PATCH_SHA || '52eaeef7cac10d894066635dc46b12f76d877416317f06eaf385f176de5e1c35' }}
+          MIXINS_RELEASES: https://github.com/arismoko/horizon/releases/download
+          MIXINS_TOKEN: ${{ secrets.MIXINS_TOKEN }}   # only if the source repo is private
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
           GIT_TERMINAL_PROMPT: '0'
         run: |
-          if [[ -n "$MIXINS_TOKEN" ]]; then
-            git config --global url."https://x-access-token:${MIXINS_TOKEN}@github.com/".insteadOf "https://github.com/"
+          set -euo pipefail
+          dest="$RUNNER_TEMP/mixins"; mkdir -p "$dest/bin"
+          patch=tools/mixins/narrow-reference-rule.patch
+          if [[ -f "$patch" ]]; then psha=$(sha256sum "$patch" | cut -d' ' -f1); else psha="$MIXINS_PATCH_SHA"; fi
+          target=x86_64-unknown-linux-gnu
+          tag="mixins-tool-${MIXINS_REV:0:12}-${psha:0:12}"
+          url="$MIXINS_RELEASES/$tag/horizon-mixins-$target.tar.gz"
+
+          # 1) Prebuilt tool published by the fork (no access to the mixins source repo needed).
+          got=0
+          if curl -fsSL "$url" -o "$RUNNER_TEMP/mixins.tgz"; then
+            mkdir -p "$RUNNER_TEMP/mixins-x" && tar -xzf "$RUNNER_TEMP/mixins.tgz" -C "$RUNNER_TEMP/mixins-x"
+            id=$(find "$RUNNER_TEMP/mixins-x" -name identity.txt | head -n1 || true)
+            bin=$(find "$RUNNER_TEMP/mixins-x" -type f -name horizon-mixins | head -n1 || true)
+            if [[ -n "$bin" && -n "$id" ]] && grep -qx "rev = $MIXINS_REV" "$id" && grep -qx "patch = $psha" "$id"; then
+              install -m 0755 "$bin" "$dest/bin/horizon-mixins"; got=1; echo "Using prebuilt tool $tag"
+            else
+              echo "::warning::Prebuilt archive did not match rev/patch; building from source."
+            fi
+          else
+            echo "::warning::No prebuilt tool at $url; building from source."
           fi
-          # Fail with a clear message instead of cargo's misleading auth error.
-          git ls-remote https://github.com/horizon-rust/horizon-mixins HEAD \
-            || { echo "::error::horizon-mixins repo is missing/private or the URL is wrong (add MIXINS_TOKEN or fix the URL)"; exit 1; }
-          cargo install --locked --root "$RUNNER_TEMP/mixins" \
-            --git https://github.com/horizon-rust/horizon-mixins \
-            --rev d9c83d7096b7ea5b83678da2efdfd6161f74997e horizon-mixins-cli
-          python3 tools/apply_native_mods.py --mods native-mods \
-            --cli "$RUNNER_TEMP/mixins/bin/horizon-mixins"
-          git config --global --unset-all url."https://x-access-token:${MIXINS_TOKEN}@github.com/".insteadOf || true
+
+          # 2) Build from source, carrying the launcher's patch.
+          if [[ "$got" != 1 ]]; then
+            if [[ -n "$MIXINS_TOKEN" ]]; then
+              git config --global url."https://x-access-token:${MIXINS_TOKEN}@github.com/".insteadOf "https://github.com/"
+            fi
+            git ls-remote "$MIXINS_REPO" HEAD >/dev/null \
+              || { echo "::error::Cannot read $MIXINS_REPO and no prebuilt tool at $url. Set repo variable MIXINS_REPO, or secret MIXINS_TOKEN."; exit 1; }
+            src="$RUNNER_TEMP/mixins-src"
+            git clone "$MIXINS_REPO" "$src" && git -C "$src" checkout "$MIXINS_REV"
+            if [[ -f "$patch" ]]; then git -C "$src" apply --whitespace=nowarn "$GITHUB_WORKSPACE/$patch"; else echo "::warning::$patch missing; building the tool without the launcher patch."; fi
+            cargo install --locked --root "$dest" --path "$src/$(cd "$src" && ls -d */horizon-mixins-cli 2>/dev/null | head -n1 || echo .)"
+          fi
+
+          python3 tools/apply_native_mods.py --mods native-mods --cli "$dest/bin/horizon-mixins"
       - name: Use Mojang's original 26.3 version file
         run: |
           # Mojang republished 26.3.json; Horizon only accepts the original (content-addressed, still served).
