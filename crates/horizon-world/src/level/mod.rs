@@ -476,6 +476,16 @@ pub trait LevelAccess {
     /// Storage write (`LevelChunkSection.setBlockState`). Returns the previous
     /// state, or None when nothing could be stored (unloaded chunk).
     fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId>;
+    /// `set_raw` with the `Level.setBlock` update flags that `update.rs` passes. A level that does
+    /// not use the flags keeps the old behaviour: they are ignored.
+    fn set_raw_with_flags(
+        &mut self,
+        pos: BlockPos,
+        state: BlockStateId,
+        _update_flags: i32,
+    ) -> Option<BlockStateId> {
+        self.set_raw(pos, state)
+    }
     fn is_loaded(&self, pos: BlockPos) -> bool;
     /// Inclusive minimum and exclusive maximum build height.
     fn min_y(&self) -> i32 {
