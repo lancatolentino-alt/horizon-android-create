@@ -19,7 +19,7 @@ kind = "HEAD"
 helper = "block_entity.rs"
 bindings = [
   { name = "block", ty = "&str", value = "block" },
-  { name = "entity", ty = "&mut Option<(String, horizon_world::nbt::Compound)>", value = "&mut *entity" },
+  { name = "entity", ty = "&mut Option<horizon_world::nbt::Compound>", value = "&mut *entity" },
 ]
 
 [[injection]]
@@ -42,7 +42,7 @@ helper = "tick.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "pos", ty = "[i32; 3]", value = "pos" },
-  { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "&mut *entity" },
+  { name = "entity", ty = "&mut ::mod_api::ModBlockEntity", value = "&mut *entity" },
 ]
 
 [[injection]]
@@ -52,7 +52,7 @@ hook_version = 1
 kind = "HEAD"
 helper = "update_tag.rs"
 bindings = [
-  { name = "entity", ty = "&horizon_client::containers::ModBlockEntity", value = "entity" },
+  { name = "entity", ty = "&::mod_api::ModBlockEntity", value = "entity" },
   { name = "tag", ty = "&mut Option<horizon_world::nbt::Compound>", value = "&mut *tag" },
 ]
 
@@ -67,7 +67,7 @@ bindings = [
   { name = "pos", ty = "[i32; 3]", value = "pos" },
   { name = "block", ty = "&str", value = "block" },
   { name = "state", ty = "horizon_world::registry::BlockStateId", value = "state" },
-  { name = "entity", ty = "&horizon_client::containers::ModBlockEntity", value = "entity" },
+  { name = "entity", ty = "&::mod_api::ModBlockEntity", value = "entity" },
   { name = "draw", ty = "&mut crate::game::native_block_entity_draw::BlockEntityDraw", value = "&mut *draw" },
 ]
 
@@ -89,6 +89,7 @@ id = "block-entity-container"
 hook = "block_entity_container"
 hook_version = 1
 kind = "HEAD"
+cancellable = true
 helper = "container.rs"
 bindings = [
   { name = "block", ty = "&str", value = "block" },
@@ -103,7 +104,7 @@ kind = "HEAD"
 helper = "screen.rs"
 bindings = [
   { name = "block", ty = "&str", value = "block" },
-  { name = "screen", ty = "&mut Option<crate::game::native_hooks::NativeScreen>", value = "&mut *screen" },
+  { name = "screen", ty = "&mut Option<::mod_api::Screen>", value = "&mut *screen" },
 ]
 
 [[injection]]
@@ -141,7 +142,7 @@ helper = "menu_button.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "context", ty = "&mod_api::item::menu::MenuButtonContext", value = "context" },
-  { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "&mut *entity" },
+  { name = "entity", ty = "&mut ::mod_api::ModBlockEntity", value = "&mut *entity" },
 ]
 
 [[injection]]
@@ -209,6 +210,16 @@ helper = "bounds.rs"
 bindings = [
   { name = "pos", ty = "[i32; 3]", value = "pos" },
   { name = "block", ty = "&str", value = "block" },
-  { name = "entity", ty = "&horizon_client::containers::ModBlockEntity", value = "entity" },
+  { name = "entity", ty = "&::mod_api::ModBlockEntity", value = "entity" },
   { name = "bounds", ty = "&mut [f32; 6]", value = "&mut *bounds" },
+]
+
+# The host builds its block entity types from the registration step; this adds this mod's to them.
+[[injection]]
+id = "block-entity-types"
+kind = "RETURN"
+target = "horizon_client::game::api_values::block_entity_declarations"
+helper = "declared_types.rs"
+bindings = [
+  { name = "value", ty = "Vec<horizon_mod_package::content::BlockEntityType>", value = "$value" },
 ]

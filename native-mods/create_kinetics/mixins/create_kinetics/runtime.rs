@@ -9,7 +9,7 @@
 // sources stop until the load is cut.
 use super::native_block_entity_draw::BlockEntityDraw;
 use super::native_mobs::NativeSpawn;
-use super::native_hooks::{NativeScreen, NativeScreenView};
+use super::native_hooks::NativeScreenView;
 use super::{Game, GameLevel};
 use horizon_client::containers::{ModBlockEntity, ModContainer};
 use horizon_client::hud::HudBatch;
@@ -1497,7 +1497,7 @@ fn tunnel_flaps_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, enti
         .native_block_state_property(state, "axis")
         .and_then(|v| tunnel_side_axis(&v.to_string()))
         .unwrap_or(0);
-    let now = draw.game_time as f64 + f64::from(draw.partial);
+    let now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let belt_axis = if axis == 0 { 2 } else { 0 };
     for end in 0..2usize {
         // as in Create (updateTunnelConnections): where another tunnel stands in front, the end is open, no flap
@@ -1529,16 +1529,16 @@ fn tunnel_flaps_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, enti
             (_, 0) => 90.0,
             _ => -90.0,
         };
-        draw.push();
-        draw.rotate_about([0.0, 1.0, 0.0], turn, [0.5, 0.5, 0.5]);
+        game.native_draw_push(draw);
+        game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], turn, [0.5, 0.5, 0.5]);
         for i in 0..4 {
-            draw.push();
-            draw.rotate_about([1.0, 0.0, 0.0], flap_angle(value, i), [0.0, 0.628125, 0.090625]);
+            game.native_draw_push(draw);
+            game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], flap_angle(value, i), [0.0, 0.628125, 0.090625]);
             game.native_draw_block(draw, "create:tunnel_flap_part", &[]);
-            draw.pop();
-            draw.translate([-0.190625, 0.0, 0.0]);
+            game.native_draw_pop(draw);
+            game.native_draw_translate(draw, [-0.190625, 0.0, 0.0]);
         }
-        draw.pop();
+        game.native_draw_pop(draw);
     }
     // the sides that have an output (the arms of a T or of the cross) hang a flap too, as in Create
     let shape = game.native_block_state_property(state, "shape").map(|v| v.to_string()).unwrap_or_default();
@@ -1562,16 +1562,16 @@ fn tunnel_flaps_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, enti
                 (_, 1) => 180.0,
                 _ => 0.0,
             };
-            draw.push();
-            draw.rotate_about([0.0, 1.0, 0.0], turn, [0.5, 0.5, 0.5]);
+            game.native_draw_push(draw);
+            game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], turn, [0.5, 0.5, 0.5]);
             for i in 0..4 {
-                draw.push();
-                draw.rotate_about([1.0, 0.0, 0.0], flap_angle(0.0, i), [0.0, 0.628125, 0.090625]);
+                game.native_draw_push(draw);
+                game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], flap_angle(0.0, i), [0.0, 0.628125, 0.090625]);
                 game.native_draw_block(draw, "create:tunnel_flap_part", &[]);
-                draw.pop();
-                draw.translate([-0.190625, 0.0, 0.0]);
+                game.native_draw_pop(draw);
+                game.native_draw_translate(draw, [-0.190625, 0.0, 0.0]);
             }
-            draw.pop();
+            game.native_draw_pop(draw);
         }
     }
     if state_is_brass_tunnel(game, state) {
@@ -1764,21 +1764,7 @@ fn storage_take(game: &mut Game<'_>, p: [i32; 3], amount: u32, face: Direction, 
         }
         _ => {
             // a chest, barrel, furnace and the like: the first slot its side `face` lets go of
-            let dim = game.dimension().to_string();
-            let Some(slots) = game.native_container_slots(&dim, p, face) else { return None };
-            for slot in slots {
-                if !slot.can_take {
-                    continue;
-                }
-                let Some((have, name)) = slot.stack.as_ref().map(|st| (st.count, st.item.to_string())) else { continue };
-                if !filter.is_empty() && name != filter {
-                    continue;
-                }
-                if let Some(out) = game.native_extract_item(&dim, p, face, slot.slot, have.min(amount)) {
-                    return Some((out.item.to_string(), out.count));
-                }
-            }
-            None
+            container_take(game, p, face, filter, amount)
         }
     }
 }
@@ -1912,8 +1898,7 @@ fn funnel_deliver(game: &mut Game<'_>, p: [i32; 3], item: &str, count: u32, face
     if funnel_storage(game, p) != 0 {
         return storage_give(game, p, item, count);
     }
-    let leftover = game.native_insert_item(p, face, stack_of(item, count));
-    let rest = leftover.map(|st| st.count).unwrap_or(0).min(count);
+    let rest = count - container_put(game, p, face, item, count);
     if rest > 0 && drop_ok && is_air(&game.native_block(p)) {
         let (at, vel) = drop_at.unwrap_or(([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.3, f64::from(p[2]) + 0.5], [0.0, 0.0, 0.0]));
         game.spawn_item(stack_of(item, rest), at, vel, 10);
@@ -1958,7 +1943,7 @@ fn funnel_flaps_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, enti
     if facing[1] != 0 {
         return;
     }
-    let now = draw.game_time as f64 + f64::from(draw.partial);
+    let now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let counter = get_int(&entity.nbt, "fa", 0);
     let dir = get_int(&entity.nbt, "fd", 1) as f32;
     let value = FLAPS.with(|m| {
@@ -1982,17 +1967,17 @@ fn funnel_flaps_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, enti
         [1, 0, 0] => -90.0,
         _ => 90.0,
     };
-    draw.push();
-    draw.rotate_about([0.0, 1.0, 0.0], turn, [0.5, 0.5, 0.5]);
-    draw.translate([0.0046875, 0.0, -0.0625]);
+    game.native_draw_push(draw);
+    game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], turn, [0.5, 0.5, 0.5]);
+    game.native_draw_translate(draw, [0.0046875, 0.0, -0.0625]);
     for i in 0..4 {
-        draw.push();
-        draw.rotate_about([1.0, 0.0, 0.0], flap_angle(value, i), [0.0, 0.625, 0.59375]);
+        game.native_draw_push(draw);
+        game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], flap_angle(value, i), [0.0, 0.625, 0.59375]);
         game.native_draw_block(draw, "create:funnel_flap_part", &[]);
-        draw.pop();
-        draw.translate([-0.190625, 0.0, 0.0]);
+        game.native_draw_pop(draw);
+        game.native_draw_translate(draw, [-0.190625, 0.0, 0.0]);
     }
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // One tick of a funnel on the server. True when the flaps moved, so clients should see it.
@@ -2186,7 +2171,7 @@ fn burner_submit(game: &Game<'_>, entity: &ModBlockEntity, draw: &mut BlockEntit
     } else {
         "create:blaze_head_idle"
     };
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let bob = (0.02 * (t * 0.08).sin()) as f32;
     // the flame rods around the blaze: short while it idles, tall while it burns, white-hot when superheated
     let rods = if fuel <= 0 {
@@ -2198,10 +2183,10 @@ fn burner_submit(game: &Game<'_>, entity: &ModBlockEntity, draw: &mut BlockEntit
     } else {
         "create:blaze_rods_small_part"
     };
-    draw.push();
-    draw.translate([0.0, bob, 0.0]);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [0.0, bob, 0.0]);
     game.native_draw_block(draw, part, &[]);
-    draw.pop();
+    game.native_draw_pop(draw);
     game.native_draw_block(draw, rods, &[]);
 }
 
@@ -2468,12 +2453,12 @@ fn mixer_submit(
     draw: &mut BlockEntityDraw,
 ) {
     let speed = f64::from(get_f32(&entity.nbt, "speed"));
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let offset = if (pos[0] + pos[2]).rem_euclid(2) == 0 { 22.5 } else { 0.0 };
-    draw.push();
-    draw.rotate_about([0.0, 1.0, 0.0], ((speed * 0.3 * t) % 360.0 + offset) as f32, [0.5, 0.5, 0.5]);
+    game.native_draw_push(draw);
+    game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], ((speed * 0.3 * t) % 360.0 + offset) as f32, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:mixer_cog_part", &[("axis", "y")]);
-    draw.pop();
+    game.native_draw_pop(draw);
     let mp = f64::from(get_f32(&entity.nbt, "mp"));
     // splash and the mixing sound are made in the window game (client_fx) from this state
     if speed.abs() >= 1.0 && mp > 0.0 {
@@ -2483,16 +2468,16 @@ fn mixer_submit(
     let lift = (mp.min(MIX_UNITS as f64 - mp) / 20.0).clamp(0.0, 1.0);
     let eased = lift * lift * (3.0 - 2.0 * lift);
     let drop = (eased * 1.3) as f32;
-    draw.push();
-    draw.translate([0.0, -drop, 0.0]);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [0.0, -drop, 0.0]);
     game.native_draw_block(draw, "create:mixer_pole_part", &[]);
-    draw.pop();
+    game.native_draw_pop(draw);
     let spin = (t * speed * 0.6) % 360.0;
-    draw.push();
-    draw.translate([0.0, -drop, 0.0]);
-    draw.rotate_about([0.0, 1.0, 0.0], spin as f32, [0.5, 0.5, 0.5]);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [0.0, -drop, 0.0]);
+    game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], spin as f32, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:mixer_head_part", &[]);
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // The basin on screen: what is in it floats in a ring and turns round while the mixer works.
@@ -2501,11 +2486,11 @@ fn basin_submit(game: &Game<'_>, pos: [i32; 3], entity: &ModBlockEntity, draw: &
     let amt = get_int(&entity.nbt, "fa", 0);
     if amt > 0 && matches!(fl.as_str(), "water" | "lava" | "milk") {
         let level = ((amt * 8 + BASIN_CAP - 1) / BASIN_CAP).clamp(1, 8).to_string();
-        draw.push();
-        draw.translate([0.125, 0.25, 0.125]);
-        draw.scale([0.75, 0.6, 0.75]);
+        game.native_draw_push(draw);
+        game.native_draw_translate(draw, [0.125, 0.25, 0.125]);
+        game.native_draw_scale(draw, [0.75, 0.6, 0.75]);
         game.native_draw_block(draw, "create:fluid_level_part", &[("ext", "0"), ("fluid", fl.as_str()), ("level", level.as_str())]);
-        draw.pop();
+        game.native_draw_pop(draw);
     }
     let mut shown = bag_read(&entity.nbt, "in");
     shown.extend(bag_read(&entity.nbt, "out"));
@@ -2514,7 +2499,7 @@ fn basin_submit(game: &Game<'_>, pos: [i32; 3], entity: &ModBlockEntity, draw: &
         return;
     }
     let mixing = get_int(&entity.nbt, "mix", 0) == 1;
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let turn = if mixing { t * 0.35 } else { 0.0 };
     let n = shown.len();
     for (k, (item, count)) in shown.iter().enumerate() {
@@ -2523,13 +2508,13 @@ fn basin_submit(game: &Game<'_>, pos: [i32; 3], entity: &ModBlockEntity, draw: &
         let bob = 0.015 * (t * 0.15 + k as f64).sin();
         let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
         let is_block = game.pack.assets.registry.default_state(item).is_some();
-        draw.push();
-        draw.translate([(0.5 + r * a.cos()) as f32, (0.45 + bob) as f32, (0.5 + r * a.sin()) as f32]);
+        game.native_draw_push(draw);
+        game.native_draw_translate(draw, [(0.5 + r * a.cos()) as f32, (0.45 + bob) as f32, (0.5 + r * a.sin()) as f32]);
         if !is_block {
-            draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+            game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
         }
         game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
-        draw.pop();
+        game.native_draw_pop(draw);
     }
 }
 
@@ -5490,7 +5475,7 @@ fn json_ingredient(v: &serde_json::Value) -> Option<serde_json::Value> {
 
 fn ingredient_has(game: &Game<'_>, v: &serde_json::Value, item: &str) -> bool {
     let Some(j) = json_ingredient(v) else { return false };
-    match game.recipe_ingredient(&j) {
+    match game.recipe_ingredient(&j.to_string()).ok().flatten() {
         Some(ing) => ing.0.contains(item),
         None => false,
     }
@@ -5498,7 +5483,7 @@ fn ingredient_has(game: &Game<'_>, v: &serde_json::Value, item: &str) -> bool {
 
 // A recipe of type `kind` with one ingredient that fits `item`, from the packs recipe files.
 fn custom_rec(game: &Game<'_>, kind: &str, item: &str) -> Option<Rec> {
-    for r in game.recipes_of_type(kind) {
+    for r in game.recipes_of_type(kind).iter() {
         let j: &serde_json::Value = &r.json;
         let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
         if ings.len() != 1 || !ingredient_has(game, &ings[0], item) {
@@ -6004,7 +5989,7 @@ fn hash01(a: i32, b: i32) -> f32 {
 // the effect of a machine working. It is drawn with the machine, so it shows wherever the machine does.
 fn crumbs(game: &Game<'_>, draw: &mut BlockEntityDraw, item: &str, base: [f32; 3], count: i32, seed: i32) {
     let stack = stack_of(item, 1);
-    let now = draw.game_time as f64 + f64::from(draw.partial);
+    let now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     for i in 0..count {
         let life = 14.0 + 10.0 * f64::from(hash01(seed, i * 5 + 1));
         let offset = f64::from(hash01(seed, i * 5 + 2)) * life;
@@ -6012,11 +5997,11 @@ fn crumbs(game: &Game<'_>, draw: &mut BlockEntityDraw, item: &str, base: [f32; 3
         let vx = (hash01(seed, i * 5 + 3) - 0.5) * 1.2;
         let vz = (hash01(seed, i * 5 + 4) - 0.5) * 1.2;
         let vy = 1.0 + hash01(seed, i * 5 + 5);
-        draw.push();
-        draw.translate([base[0] + vx * t, base[1] + vy * t - 4.5 * t * t, base[2] + vz * t]);
-        draw.scale([0.22, 0.22, 0.22]);
+        game.native_draw_push(draw);
+        game.native_draw_translate(draw, [base[0] + vx * t, base[1] + vy * t - 4.5 * t * t, base[2] + vz * t]);
+        game.native_draw_scale(draw, [0.22, 0.22, 0.22]);
         game.native_draw_item(draw, &stack, DisplayContext::Ground, None, seed ^ i);
-        draw.pop();
+        game.native_draw_pop(draw);
     }
 }
 
@@ -6684,7 +6669,7 @@ fn crafter_at(game: &Game<'_>, p: [i32; 3]) -> Option<([i32; 3], [i32; 3])> {
 }
 
 fn crafter_result(game: &Game<'_>, cells: &[Option<String>], w: usize, h: usize) -> Option<ItemStack> {
-    for r in game.recipes_of_type("create:mechanical_crafting") {
+    for r in game.recipes_of_type("create:mechanical_crafting").iter() {
         let j: &serde_json::Value = &r.json;
         let Some(rows) = j.get("pattern").and_then(|v| v.as_array()) else { continue };
         let Some(key) = j.get("key").and_then(|v| v.as_object()) else { continue };
@@ -6740,7 +6725,7 @@ fn crafter_result(game: &Game<'_>, cells: &[Option<String>], w: usize, h: usize)
                 }
             }
         }
-        return game.recipes().craft(&grid, 3);
+        return game.recipes().craft(&game.loop_context, &grid, 3);
     }
     None
 }
@@ -7994,7 +7979,7 @@ fn bearing_entities(game: &Game<'_>, pos: [i32; 3], list: &[Moved]) -> Compound 
     for (i, m) in list.iter().enumerate() {
         let key = (pos[0] + m.at[0], pos[1] + m.at[1], pos[2] + m.at[2]);
         if let Some(be) = game.world.block_entities.get(&key) {
-            let tag = horizon_client::save::encode_block_entity(key, be, &m.name);
+            let tag = horizon_client::save::block_entity_data(key, be, &m.name, None);
             out.insert(JavaString::from(i.to_string().as_str()), tag);
         }
     }
@@ -8359,7 +8344,7 @@ fn platforms_clear(game: &mut Game<'_>, pos: [i32; 3]) {
         Err(_) => Vec::new(),
     };
     for id in ids {
-        game.native_remove_mob(&dim, id);
+        remove_mob(game, id);
     }
 }
 
@@ -8424,7 +8409,7 @@ fn bearing_platforms(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me:
     let gone: Vec<usize> = have.keys().filter(|k| !wanted.contains(k)).copied().collect();
     for k in gone {
         if let Some(id) = have.remove(&k) {
-            game.native_remove_mob(&dim, id);
+            remove_mob(game, id);
         }
     }
     let spawn = NativeSpawn {
@@ -8440,7 +8425,7 @@ fn bearing_platforms(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, me:
     for (i, p) in &want {
         match have.get(i).copied() {
             Some(id) => {
-                if !game.native_teleport_mob(&dim, id, *p) {
+                if !teleport_mob(game, id, *p) {
                     have.remove(i);
                 }
             }
@@ -8522,7 +8507,7 @@ fn psi_with_slots(tag: &Tag, name: &str, items: Vec<Option<ItemStack>>) -> Optio
         }
         _ => return None,
     };
-    Some(horizon_client::save::encode_block_entity(p, &changed, name))
+    Some(horizon_client::save::block_entity_data(p, &changed, name, None))
 }
 
 // All inventories of a contraption, in the order carried.
@@ -8909,21 +8894,21 @@ fn psi_submit(game: &Game<'_>, state: BlockStateId, entity: &ModBlockEntity, dra
     psi_plates(game, draw, &f, front, middle, out);
     let ex = get_int(&entity.nbt, "exq", 0);
     if ex == 0 || ex == 4 {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
 // The middle runs out half as far as the top, as the two parts of a piston.
 fn psi_plates(game: &Game<'_>, draw: &mut BlockEntityDraw, facing: &str, front: [i32; 3], middle: &str, out: f32) {
     let step = [front[0] as f32, front[1] as f32, front[2] as f32];
-    draw.push();
-    draw.translate([step[0] * out * 0.5, step[1] * out * 0.5, step[2] * out * 0.5]);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [step[0] * out * 0.5, step[1] * out * 0.5, step[2] * out * 0.5]);
     game.native_draw_block(draw, middle, &[("facing", facing)]);
-    draw.pop();
-    draw.push();
-    draw.translate([step[0] * out, step[1] * out, step[2] * out]);
+    game.native_draw_pop(draw);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [step[0] * out, step[1] * out, step[2] * out]);
     game.native_draw_block(draw, "create:portable_storage_interface_top_part", &[("facing", facing)]);
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 
@@ -9394,7 +9379,7 @@ fn actor_hurt(game: &mut Game<'_>, cell: [i32; 3], len: f64, motion: [f64; 3]) {
         if !inside {
             continue;
         }
-        m.damage(damage, Damage::of(DamageKind::Generic));
+        m.damage(crate::game::entity::damage_level_of!(game), damage, Damage::of(DamageKind::Generic));
         m.velocity.x += b[0];
         m.velocity.y += b[1];
         m.velocity.z += b[2];
@@ -9715,7 +9700,7 @@ fn belt_ride(game: &mut Game<'_>, at: [f64; 3]) -> Option<[f32; 3]> {
 }
 
 // Where a bearing draws, for culling: its own block and as far as its carried blocks reach round it.
-pub fn bounds(
+fn bounds_engine(
     pos: [i32; 3],
     block: &str,
     entity: &ModBlockEntity,
@@ -9900,7 +9885,7 @@ fn seq_state(item: &str) -> Option<(String, usize)> {
 // The sequenced assembly recipe a stack belongs to and the step it waits for.
 fn seq_find(game: &Game<'_>, item: &str) -> Option<(serde_json::Value, usize)> {
     let st = seq_state(item);
-    for r in game.recipes_of_type("create:sequenced_assembly") {
+    for r in game.recipes_of_type("create:sequenced_assembly").iter() {
         let j: &serde_json::Value = &r.json;
         let trans = j.get("transitional_item").and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or("");
         match &st {
@@ -9964,7 +9949,7 @@ fn seq_advance(j: &serde_json::Value, step: usize) -> (String, u32) {
 fn deploy_rec(game: &Game<'_>, target: &str, held: &str) -> Option<Deploy> {
     let sand = serde_json::json!({ "tag": "create:sandpaper" });
     if ingredient_has(game, &sand, held) {
-        for r in game.recipes_of_type("create:sandpaper_polishing") {
+        for r in game.recipes_of_type("create:sandpaper_polishing").iter() {
             let j: &serde_json::Value = &r.json;
             let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
             if ings.len() == 1 && ingredient_has(game, &ings[0], target) {
@@ -9986,7 +9971,7 @@ fn deploy_rec(game: &Game<'_>, target: &str, held: &str) -> Option<Deploy> {
         }
     }
     for kind in ["create:deploying", "create:item_application"] {
-        for r in game.recipes_of_type(kind) {
+        for r in game.recipes_of_type(kind).iter() {
             let j: &serde_json::Value = &r.json;
             let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
             if ings.len() != 2 || !ingredient_has(game, &ings[0], target) || !ingredient_has(game, &ings[1], held) {
@@ -10200,7 +10185,7 @@ fn deployer_place(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], nbt: &mut
     let stack = stack_of(&item, 1);
     let Ok(state) = game.apply_item_block_state(at, state, &stack) else { return false };
     let name = game.res.facts().get(state).name.clone();
-    if let Some(entity) = game.new_block_entity(&name) {
+    if let Some(entity) = new_block_entity(&name) {
         game.world.block_entities.insert((at[0], at[1], at[2]), entity);
         game.apply_placed_item(at, &stack, false);
     }
@@ -10215,7 +10200,7 @@ fn deployer_apply_world(game: &mut Game<'_>, pos: [i32; 3], nbt: &mut Compound, 
     let state = game.world.block(target[0], target[1], target[2]);
     let name = game.res.facts().get(state).name.to_string();
     let mut found: Option<Deploy> = None;
-    for r in game.recipes_of_type("create:item_application") {
+    for r in game.recipes_of_type("create:item_application").iter() {
         let j: &serde_json::Value = &r.json;
         let Some(ings) = j.get("ingredients").and_then(|v| v.as_array()) else { continue };
         if ings.len() == 2 && ingredient_has(game, &ings[0], &name) && ingredient_has(game, &ings[1], &held) {
@@ -10283,10 +10268,21 @@ fn deployer_block_use(game: &mut Game<'_>, front: [i32; 3], target: [i32; 3], it
     } else {
         0.0
     };
-    let player = horizon_world::level::PlayerContext { yaw, pitch, may_build: true, can_eat: true, game_master: false };
+    let player = horizon_world::level::PlayerContext { yaw, pitch, may_build: true, can_eat: true, game_master: false, respawn_point: None };
     let item = item.map(|i| i.to_string());
     let result = game.with_level(|b, level, ticks| {
-        b.use_item_on(level, ticks, BlockPos::new(target[0], target[1], target[2]), face, hit, player, item.as_deref())
+        b.use_item_on(
+            level,
+            ticks,
+            horizon_core::geometry::BlockHit {
+                location: hit,
+                direction: face,
+                block: BlockPos::new(target[0], target[1], target[2]),
+                inside: false,
+            },
+            player,
+            item.as_deref(),
+        )
     });
     let _ = game.process_level_events();
     result.consumes_action()
@@ -10528,7 +10524,7 @@ fn deployer_activate(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], nbt: &
             let mc = game.mobs[i].bounds().center();
             let c = [mc.x, mc.y, mc.z];
             deployer_watch_kill(game, pos, c);
-            game.mobs[i].damage(1.0 + bonus, Damage::of(DamageKind::PlayerAttack));
+            game.mobs[i].damage(crate::game::entity::damage_level_of!(game), 1.0 + bonus, Damage::of(DamageKind::PlayerAttack));
             return;
         }
         deployer_mine(game, pos, nbt, target, held.as_ref().map(|h| h.0.clone()));
@@ -10946,7 +10942,7 @@ fn deployer_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: 
             filter_item_draw(game, draw, &dflt, face, false, Some(0.5));
         }
     }
-    let now = draw.game_time as f64 + f64::from(draw.partial);
+    let now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let reach = if get_f32(&entity.nbt, "dre") > 0.0 { get_f32(&entity.nbt, "dre") } else { 0.75 };
     let held = dep_held(&entity.nbt);
     let punch = get_int(&entity.nbt, "dpunch", 0) == 1;
@@ -10959,17 +10955,17 @@ fn deployer_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: 
     };
     let offset = deployer_offset(pos, &entity.nbt, speed, now, pose_len, reach);
     let f = [front[0] as f32, front[1] as f32, front[2] as f32];
-    draw.push();
-    draw.translate([f[0] * offset, f[1] * offset, f[2] * offset]);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [f[0] * offset, f[1] * offset, f[2] * offset]);
     // the pole is turned a quarter about its own axis on some placements
-    draw.push();
+    game.native_draw_push(draw);
     if first ^ (axis_of(front) == 2) {
-        draw.rotate_about(f, 90.0, [0.5, 0.5, 0.5]);
+        game.native_draw_rotate_about(draw, f, 90.0, [0.5, 0.5, 0.5]);
     }
     game.native_draw_block(draw, "create:deployer_pole_part", &[("facing", value.as_str())]);
-    draw.pop();
+    game.native_draw_pop(draw);
     game.native_draw_block(draw, hand, &[("facing", value.as_str())]);
-    draw.pop();
+    game.native_draw_pop(draw);
     if let Some((item, count)) = held {
         let stack = dep_stack(&item, count, dep_dmg(&entity.nbt));
         let is_block = game.res.items().get(item.as_str()).map(|i| i.block.is_some()).unwrap_or(false) && !flat_item(game, &stack);
@@ -10996,22 +10992,23 @@ fn deployer_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: 
             0.0
         };
         let display = front[1] > 0 && speed == 0.0 && !punch;
-        draw.push();
-        draw.translate([0.5 + f[0] * offset, 0.5 + f[1] * offset, 0.5 + f[2] * offset]);
-        draw.rotate_about([0.0, 1.0, 0.0], yaw, [0.0, 0.0, 0.0]);
+        game.native_draw_push(draw);
+        game.native_draw_translate(draw, [0.5 + f[0] * offset, 0.5 + f[1] * offset, 0.5 + f[2] * offset]);
+        game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], yaw, [0.0, 0.0, 0.0]);
         if !display {
-            draw.rotate_about([1.0, 0.0, 0.0], x_rot, [0.0, 0.0, 0.0]);
-            draw.translate([0.0, 0.0, -0.6875]);
+            game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], x_rot, [0.0, 0.0, 0.0]);
+            game.native_draw_translate(draw, [0.0, 0.0, -0.6875]);
         }
         if punch {
-            draw.translate([0.0, 0.125, -0.0625]);
+            game.native_draw_translate(draw, [0.0, 0.125, -0.0625]);
         }
         let context;
         if display {
             let scale = if is_block { 1.25f32 } else { 1.0 };
-            draw.translate([0.0, if is_block { 0.5625 } else { 0.6875 }, 0.0]);
-            draw.scale([scale, scale, scale]);
-            draw.rotate_about([0.0, 1.0, 0.0], ((draw.game_time as f64 + f64::from(draw.partial)) % 360.0) as f32, [0.0, 0.0, 0.0]);
+            game.native_draw_translate(draw, [0.0, if is_block { 0.5625 } else { 0.6875 }, 0.0]);
+            game.native_draw_scale(draw, [scale, scale, scale]);
+            let turn_now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
+            game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], (turn_now % 360.0) as f32, [0.0, 0.0, 0.0]);
             context = DisplayContext::Ground;
         } else {
             let scale = if is_block {
@@ -11021,14 +11018,14 @@ fn deployer_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: 
             } else {
                 0.5
             };
-            draw.scale([scale, scale, scale]);
+            game.native_draw_scale(draw, [scale, scale, scale]);
             context = if punch { DisplayContext::ThirdPersonRightHand } else { DisplayContext::Fixed };
         }
         game.native_draw_item(draw, &stack, context, None, pos[0] ^ pos[2]);
-        draw.pop();
+        game.native_draw_pop(draw);
     }
     if speed == 0.0 {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
@@ -11056,43 +11053,151 @@ fn harvester_placement(
 
 // ---- hooks ----
 
-pub fn block_entity(block: &str, entity: &mut Option<(String, Compound)>) {
+
+// Block entity types: the host takes them from a registration step, not from the block hook, and a
+// pack file cannot declare them. They are added to what `block_entity_declarations` returns.
+pub fn block_entity_types(
+    mut declared: Vec<horizon_mod_package::content::BlockEntityType>,
+) -> Vec<horizon_mod_package::content::BlockEntityType> {
+    const TYPES: &[(&str, &[&str])] = &[
+        ("create:kinetic", &["create:adjustable_chain_gearshift", "create:belt", "create:clutch", "create:cogwheel", "create:copper_valve_handle", "create:creative_motor", "create:crushing_wheel", "create:deployer", "create:encased_chain_drive", "create:encased_fan", "create:fluid_valve", "create:gearbox", "create:gearshift", "create:hand_crank", "create:hose_pulley", "create:large_cogwheel", "create:large_water_wheel", "create:mechanical_bearing", "create:mechanical_crafter", "create:mechanical_drill", "create:mechanical_mixer", "create:mechanical_press", "create:mechanical_pump", "create:mechanical_saw", "create:millstone", "create:powered_shaft", "create:shaft", "create:vertical_gearbox", "create:water_wheel", "create:windmill_bearing"]),
+        ("create:depot_be", &["create:depot"]),
+        ("create:fluid", &["create:fluid_pipe", "create:fluid_tank", "create:spout", "create:item_drain", "create:glass_fluid_pipe"]),
+        ("create:basin_be", &["create:basin"]),
+        ("create:funnel_be", &["create:andesite_funnel", "create:brass_funnel"]),
+        ("create:tunnel_be", &["create:andesite_tunnel", "create:brass_tunnel"]),
+        ("create:blaze_burner_be", &["create:blaze_burner"]),
+        ("create:steam_engine_be", &["create:steam_engine"]),
+        ("create:chute_be", &["create:chute", "create:smart_chute"]),
+    ];
+    for (id, blocks) in TYPES {
+        if declared.iter().any(|d| d.id == *id) {
+            continue;
+        }
+        declared.push(horizon_mod_package::content::BlockEntityType {
+            id: (*id).to_string(),
+            blocks: blocks.iter().map(|b| (*b).to_string()).collect(),
+        });
+    }
+    declared
+}
+
+// The game hands the hooks its API form of a mod block entity (`mod_api::ModBlockEntity`); the code here works
+// on the engine's own, so each hook converts in, and the ones that change it write back what changed.
+fn engine_entity(game: &Game<'_>, e: &::mod_api::ModBlockEntity) -> ModBlockEntity {
+    use crate::game::api_values::TryIntoEngine;
+    let items = e.items.try_into_engine(game.items()).unwrap_or_default();
+    ModBlockEntity::new(
+        e.id().to_string(),
+        horizon_client::containers::ModBlockEntityFields { nbt: e.nbt.clone(), items, data: e.data.clone() },
+    )
+}
+
+fn engine_entity_data(e: &::mod_api::ModBlockEntity) -> ModBlockEntity {
+    ModBlockEntity::new(
+        e.id().to_string(),
+        horizon_client::containers::ModBlockEntityFields { nbt: e.nbt.clone(), items: Vec::new(), data: e.data.clone() },
+    )
+}
+
+fn write_back(to: &mut ::mod_api::ModBlockEntity, from: &ModBlockEntity) {
+    use crate::game::api_values::TryIntoApi;
+    if to.nbt != from.nbt {
+        to.nbt = from.nbt.clone();
+    }
+    if to.data != from.data {
+        to.data = from.data.clone();
+    }
+    if let Ok(items) = from.items.try_into_api() {
+        if to.items != items {
+            to.items = items;
+        }
+    }
+}
+
+pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ::mod_api::ModBlockEntity) {
+    let mut e = engine_entity(game, entity);
+    tick_engine(game, pos, &mut e);
+    write_back(entity, &e);
+}
+
+pub fn update_tag(entity: &::mod_api::ModBlockEntity, tag: &mut Option<Compound>) {
+    update_tag_engine(&engine_entity_data(entity), tag);
+}
+
+pub fn submit(
+    game: &Game<'_>,
+    pos: [i32; 3],
+    block: &str,
+    state: BlockStateId,
+    entity: &::mod_api::ModBlockEntity,
+    draw: &mut BlockEntityDraw,
+) {
+    submit_engine(game, pos, block, state, &engine_entity(game, entity), draw);
+}
+
+pub fn bounds(pos: [i32; 3], block: &str, entity: &::mod_api::ModBlockEntity, bounds: &mut [f32; 6]) {
+    bounds_engine(pos, block, &engine_entity_data(entity), bounds);
+}
+
+pub fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ::mod_api::ModBlockEntity, id: i32) {
+    let mut e = engine_entity(game, entity);
+    menu_button_engine(game, pos, &mut e, id);
+    write_back(entity, &e);
+}
+
+// A block entity for the block `name`, as the game made one: this mod's types from the registered table,
+// vanilla ones from their block.
+fn new_block_entity(name: &str) -> Option<horizon_client::containers::BlockEntity> {
+    use horizon_client::containers::{BlockEntity, ModBlockEntityFields};
+    if let Some(id) = horizon_client::block_entity_types::type_for(name) {
+        let mut initial: Option<Compound> = None;
+        block_entity(name, &mut initial);
+        return Some(BlockEntity::Mod(Box::new(ModBlockEntity::new(
+            id.to_string(),
+            ModBlockEntityFields { nbt: initial.unwrap_or_default(), ..Default::default() },
+        ))));
+    }
+    BlockEntity::for_block(name)
+}
+
+pub fn block_entity(block: &str, entity: &mut Option<Compound>) {
     if entity.is_none() && block == DEPOT_BLOCK {
-        *entity = Some((DEPOT_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && is_fluid_block(block) {
-        *entity = Some((FLUID_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && block == BASIN_BLOCK {
-        *entity = Some((BASIN_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && funnel_brass(block).is_some() {
-        *entity = Some((FUNNEL_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && tunnel_name(block) {
-        *entity = Some((TUNNEL_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && block == BURNER_BLOCK {
-        *entity = Some((BURNER_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && block == ENGINE_BLOCK {
-        *entity = Some((ENGINE_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && is_chute_name(block) {
-        *entity = Some((CHUTE_BE.to_string(), Compound::new()));
+        *entity = Some(Compound::new());
         return;
     }
     if entity.is_none() && kind_of(block).is_some() {
         let mut c = Compound::new();
         set_state(&mut c, 0.0, NONE_HOPS, None);
-        *entity = Some((BE_ID.to_string(), c));
+        *entity = Some(c);
     }
 }
 
@@ -11102,7 +11207,7 @@ pub fn ticks(block: &str, ticks: &mut bool) {
     }
 }
 
-pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
+fn tick_engine(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if game.native_window() {
         client_fx(game, pos, &entity.nbt);
     } else if (game.ticks as i64 + i64::from(pos[0]) + i64::from(pos[2])).rem_euclid(8) == 0 && game.native_block(pos) == "create:belt" {
@@ -11141,7 +11246,8 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if entity.id() == TUNNEL_BE {
         tunnel_tick(game, pos, &mut entity.nbt);
         entity.data.clear();
-        entity.data.push(get_int(&entity.nbt, "mode", 0));
+        let pushed = get_int(&entity.nbt, "mode", 0);
+        entity.data.push(pushed);
         return;
     }
     if entity.id() == FUNNEL_BE {
@@ -11150,7 +11256,8 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
             game.native_block_entity_sync(pos);
         }
         entity.data.clear();
-        entity.data.push(get_int(&entity.nbt, "cnt", 16));
+        let pushed = get_int(&entity.nbt, "cnt", 16);
+        entity.data.push(pushed);
         return;
     }
     if entity.id() == BURNER_BE {
@@ -11171,7 +11278,8 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
             game.native_block_entity_sync(pos);
         }
         entity.data.clear();
-        entity.data.push(get_int(&entity.nbt, "cnt", 16));
+        let pushed = get_int(&entity.nbt, "cnt", 16);
+        entity.data.push(pushed);
         return;
     }
     if entity.id() != BE_ID {
@@ -11346,7 +11454,7 @@ pub fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     }
 }
 
-pub fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
+fn update_tag_engine(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
     if entity.id() == DEPOT_BE {
         let mut c = Compound::new();
         match depot_content(&entity.nbt) {
@@ -11505,6 +11613,72 @@ fn fresh_click(game: &Game<'_>, pos: [i32; 3]) -> bool {
         }
         Err(_) => true,
     }
+}
+
+
+// The old `native_remove_mob` and `native_teleport_mob`, on what the game has now.
+fn remove_mob(game: &mut Game<'_>, id: u32) {
+    if let Some(epoch) = game.native_lifecycle.epoch() {
+        if game.entity_discard(::mod_api::EntityRef::new(epoch, id)) {
+            return;
+        }
+    }
+    if let Some(m) = game.mobs.iter_mut().find(|m| m.id == id) {
+        m.removed = true;
+    }
+}
+
+fn teleport_mob(game: &mut Game<'_>, id: u32, to: [f64; 3]) -> bool {
+    let Some(m) = game.mobs.iter_mut().find(|m| m.id == id && !m.removed && m.alive()) else {
+        return false;
+    };
+    m.position.x = to[0];
+    m.position.y = to[1];
+    m.position.z = to[2];
+    m.previous = m.position;
+    m.velocity.x = 0.0;
+    m.velocity.y = 0.0;
+    m.velocity.z = 0.0;
+    true
+}
+
+// The old container reads and moves, on the game's item capability (`BlockSide` and a transaction).
+fn block_side(game: &Game<'_>, p: [i32; 3], face: Direction) -> Option<::mod_api::BlockSide> {
+    let level = game.native_level_here()?;
+    Some(::mod_api::BlockSide { level, pos: p, side: Some(face) })
+}
+
+fn has_container(game: &Game<'_>, p: [i32; 3], face: Direction) -> bool {
+    block_side(game, p, face).and_then(|at| game.container_size(at)).is_some()
+}
+
+// The first slot of the storage at `p` that its side `face` lets go of, up to `amount`.
+fn container_take(game: &mut Game<'_>, p: [i32; 3], face: Direction, filter: &str, amount: u32) -> Option<(String, u32)> {
+    let at = block_side(game, p, face)?;
+    let size = game.container_size(at)?;
+    for slot in 0..size {
+        let Some(held) = game.container_stack(at, slot) else { continue };
+        if !filter.is_empty() && held.item.to_string() != filter {
+            continue;
+        }
+        let seal = game.transaction_open();
+        let out = game.container_extract(at, slot, held.count.min(amount), seal.transaction());
+        game.transaction_close(&seal, out.is_some());
+        if let Some(out) = out {
+            return Some((out.item.to_string(), out.count));
+        }
+    }
+    None
+}
+
+// Puts what fits of `count` of `item` into the storage at `p` through `face`; how many went in.
+fn container_put(game: &mut Game<'_>, p: [i32; 3], face: Direction, item: &str, count: u32) -> u32 {
+    let Some(at) = block_side(game, p, face) else { return 0 };
+    let stack = stack_of(item, count);
+    let seal = game.transaction_open();
+    let n = game.container_insert_kind(at, &stack, u64::from(count), seal.transaction());
+    game.transaction_close(&seal, n > 0);
+    (n as u32).min(count)
 }
 
 fn stack_of(item: &str, count: u32) -> ItemStack {
@@ -12070,7 +12244,7 @@ pub fn right_click(game: &mut Game<'_>, pos: [i32; 3], canceled: &mut bool) {
 // offset: it depends only on the coordinates across the axis, so blocks along one shaft line
 // stay aligned and meshing neighbours sit half a tooth apart. The press head moves up and
 // down instead.
-pub fn submit(
+fn submit_engine(
     game: &Game<'_>,
     pos: [i32; 3],
     block: &str,
@@ -12082,7 +12256,8 @@ pub fn submit(
         slot_frame_submit(game, pos, block, draw);
     }
     if block == "create:creative_motor" {
-        draw.light = open_light(game, pos);
+        let lit = open_light(game, pos);
+        game.native_draw_set_light(draw, lit);
     }
     if block == BASIN_BLOCK {
         basin_submit(game, pos, entity, draw);
@@ -12143,13 +12318,13 @@ pub fn submit(
             };
             for c in 0..stack_copies(*count) {
                 let o = copy_offset(c, !flat);
-                draw.push();
-                draw.translate([0.5 + dx + o[0], top + o[1], 0.5 + dz + o[2]]);
+                game.native_draw_push(draw);
+                game.native_draw_translate(draw, [0.5 + dx + o[0], top + o[1], 0.5 + dz + o[2]]);
                 if flat {
-                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                    game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
                 }
                 game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32) ^ (c as i32));
-                draw.pop();
+                game.native_draw_pop(draw);
             }
         }
         return;
@@ -12161,11 +12336,11 @@ pub fn submit(
             // the fluid inside the spout, seen through its window (SpoutRenderer: x and z 2.5 to 13.5 pixels, from 2.5 pixels up 7 pixels at most)
             let level = (amt as f32 / SPOUT_CAP as f32).clamp(0.175, 1.0);
             let sy = 7.0 * level / 15.98;
-            draw.push();
-            draw.translate([0.0411, 2.5 / 16.0, 0.0411]);
-            draw.scale([0.9167, sy, 0.9167]);
+            game.native_draw_push(draw);
+            game.native_draw_translate(draw, [0.0411, 2.5 / 16.0, 0.0411]);
+            game.native_draw_scale(draw, [0.9167, sy, 0.9167]);
             game.native_draw_block(draw, "create:fluid_level_part", &[("ext", "0"), ("fluid", fl.as_str()), ("level", "8")]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
         if !fl.is_empty() && amt > 0 {
             // filling: the stream runs from the nozzle down to the item (the model reaches the top of a depot or belt)
@@ -12173,10 +12348,10 @@ pub fn submit(
                 game.native_draw_block(draw, "create:spout_stream_part", &[("fluid", fl.as_str())]);
                 // two blocks above the belt: the stream carries on down through the second block
                 if is_air(&game.native_block([pos[0], pos[1] - 1, pos[2]])) && spout_floor(game, pos)[1] == pos[1] - 2 {
-                    draw.push();
-                    draw.translate([0.0, -1.0, 0.0]);
+                    game.native_draw_push(draw);
+                    game.native_draw_translate(draw, [0.0, -1.0, 0.0]);
                     game.native_draw_block(draw, "create:spout_stream_part", &[("fluid", fl.as_str())]);
-                    draw.pop();
+                    game.native_draw_pop(draw);
                 }
             }
         }
@@ -12187,11 +12362,11 @@ pub fn submit(
         let Some(a) = game.native_block_state_property(state, "axis") else { return };
         let Some(axis) = parse_axis(&a.to_string()) else { return };
         if fl.is_empty() {
-            draw.keep();
+            game.native_draw_keep(draw);
             return;
         }
         let dir = DIRS[(get_int(&entity.nbt, "fd", 0).clamp(0, 5)) as usize];
-        let t = draw.game_time as f64 + f64::from(draw.partial);
+        let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
         let mut frame = ((t * 0.8) as i64).rem_euclid(8);
         if dir[axis] < 0 {
             frame = 7 - frame;
@@ -12205,15 +12380,15 @@ pub fn submit(
         let mut amt = get_int(&entity.nbt, "fa", 0);
         let hi = get_text(&entity.nbt, "hi");
         if !hi.is_empty() {
-            let el = draw.game_time as f32 + draw.partial - get_int(&entity.nbt, "ht", 0) as f32;
+            let el = game.native_draw_game_time(draw) as f32 + game.native_draw_partial(draw) - get_int(&entity.nbt, "ht", 0) as f32;
             let prog = (el / DRAIN_TIME as f32).clamp(0.0, 1.0);
             let tilt = (el / 10.0).clamp(0.0, 1.0) * 75.0;
             let stack = ItemStack { item: Arc::from(hi.as_str()), count: 1, damage: 0, extra: None };
-            draw.push();
-            draw.translate([0.5, 1.0, 0.5]);
-            draw.rotate_about([0.0, 0.0, 1.0], -tilt, [0.0, 0.0, 0.0]);
+            game.native_draw_push(draw);
+            game.native_draw_translate(draw, [0.5, 1.0, 0.5]);
+            game.native_draw_rotate_about(draw, [0.0, 0.0, 1.0], -tilt, [0.0, 0.0, 0.0]);
             game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
-            draw.pop();
+            game.native_draw_pop(draw);
             if let Some(f) = bucket_fluid(&hi) {
                 if el >= 8.0 {
                     game.native_draw_block(draw, "create:pour_part", &[("fluid", f)]);
@@ -12252,15 +12427,16 @@ pub fn submit(
         let f = f.to_string();
         let Some(front) = parse_dir(&f) else { return };
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
-        let l = get_f32(&entity.nbt, "hl") + ((speed / 500.0) as f32) * draw.partial;
+        let l = get_f32(&entity.nbt, "hl") + ((speed / 500.0) as f32) * game.native_draw_partial(draw);
         let l = l.clamp(0.0, HOSE_MAX);
         let axis = axis_of(cw(front));
         let mut about = [0.0f32; 3];
         about[axis] = 1.0;
-        draw.push();
-        draw.rotate_about(about, (speed * 0.3 * (draw.game_time as f64 + f64::from(draw.partial))) as f32 % 360.0, [0.5, 0.5, 0.5]);
+        game.native_draw_push(draw);
+        let turn_now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
+        game.native_draw_rotate_about(draw, about, (speed * 0.3 * turn_now) as f32 % 360.0, [0.5, 0.5, 0.5]);
         game.native_draw_block(draw, "create:hose_coil_part", &[("facing", f.as_str())]);
-        draw.pop();
+        game.native_draw_pop(draw);
         half_shaft(game, pos, cw(front), speed, draw);
         let whole = l.floor() as i32;
         let part = l - whole as f32;
@@ -12268,22 +12444,22 @@ pub fn submit(
             if game.native_block([pos[0], pos[1] - k, pos[2]]) == ROPE {
                 continue;
             }
-            draw.push();
-            draw.translate([0.0, -(k as f32), 0.0]);
+            game.native_draw_push(draw);
+            game.native_draw_translate(draw, [0.0, -(k as f32), 0.0]);
             game.native_draw_block(draw, "create:hose_rope_part", &[]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
         if part > 0.01 {
-            draw.push();
-            draw.translate([0.0, -l, 0.0]);
+            game.native_draw_push(draw);
+            game.native_draw_translate(draw, [0.0, -l, 0.0]);
             game.native_draw_block(draw, "create:hose_rope_part", &[]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
         if part > 0.01 || game.native_block([pos[0], pos[1] - 1 - whole, pos[2]]) != MAGNET {
-            draw.push();
-            draw.translate([0.0, -(l + 1.0), 0.0]);
+            game.native_draw_push(draw);
+            game.native_draw_translate(draw, [0.0, -(l + 1.0), 0.0]);
             game.native_draw_block(draw, "create:hose_magnet_part", &[]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
         return;
     }
@@ -12339,7 +12515,7 @@ pub fn submit(
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         through_shaft(game, pos, valve_axis(axis_of(front), first), speed, draw);
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
@@ -12362,7 +12538,7 @@ pub fn submit(
             {
                 let part = if part == "pulley" { "middle".to_string() } else { part.clone() };
                 // The belt surface is one of sixteen pictures, each shifted a pixel further along the belt.
-                let t = draw.game_time as f64 + f64::from(draw.partial);
+                let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
                 let flip = if slope == "down" { -flip_v } else { flip_v };
                 let frame = ((-flip * t * speed / 30.0).floor() as i64).rem_euclid(16).to_string();
                 let dye = get_text(&entity.nbt, "bc");
@@ -12379,7 +12555,7 @@ pub fn submit(
             through_shaft(game, pos, if a == 0 { 2 } else { 0 }, speed, draw);
         }
         // the items riding this piece, moving on between ticks
-        let now = draw.game_time as f64 + f64::from(draw.partial);
+        let now = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
         let (shown, seen) = belt_view(pos, &entity.nbt, now);
         let elapsed = (now - seen).clamp(0.0, 30.0);
         for b in shown {
@@ -12405,22 +12581,22 @@ pub fn submit(
             let is_block = game.pack.assets.registry.default_state(&b.item).is_some();
             for k in 0..stack_copies(b.count) {
                 let o = copy_offset(k, is_block);
-                draw.push();
-                draw.translate([at[0] + o[0], at[1] + o[1], at[2] + o[2]]);
+                game.native_draw_push(draw);
+                game.native_draw_translate(draw, [at[0] + o[0], at[1] + o[1], at[2] + o[2]]);
                 // on a slope the item leans with it: the belt rises (or falls) along its front
                 if slope == "upward" || slope == "downward" {
                     let lean = if slope == "upward" { BELT_SLOPE_LEAN } else { -BELT_SLOPE_LEAN };
-                    draw.rotate_about([-front[2] as f32, 0.0, front[0] as f32], lean, [0.0, 0.0, 0.0]);
+                    game.native_draw_rotate_about(draw, [-front[2] as f32, 0.0, front[0] as f32], lean, [0.0, 0.0, 0.0]);
                 }
                 if !is_block {
-                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                    game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
                 }
                 game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (b.p * 100.0) as i32 ^ (k as i32));
-                draw.pop();
+                game.native_draw_pop(draw);
             }
         }
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
@@ -12430,17 +12606,17 @@ pub fn submit(
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
         chain_shaft(game, axis, speed, draw);
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
     if block == "create:millstone" {
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
-        let t = draw.game_time as f64 + f64::from(draw.partial);
-        draw.push();
-        draw.rotate_about([0.0, 1.0, 0.0], ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
+        let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
+        game.native_draw_push(draw);
+        game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
         game.native_draw_block(draw, "create:millstone_inner_part", &[]);
-        draw.pop();
+        game.native_draw_pop(draw);
         if speed.abs() >= 1.0 {
             fx_register(pos, &entity.nbt);
             if let Some((item, _)) = pair_list(&entity.nbt, "mi").first() {
@@ -12448,7 +12624,7 @@ pub fn submit(
             }
         }
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
@@ -12457,13 +12633,13 @@ pub fn submit(
         let value = value.to_string();
         let Some(axis) = parse_axis(&value) else { return };
         let speed = f64::from(get_f32(&entity.nbt, "speed"));
-        let t = draw.game_time as f64 + f64::from(draw.partial);
+        let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
         let mut about = [0.0f32; 3];
         about[axis] = 1.0;
-        draw.push();
-        draw.rotate_about(about, ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
+        game.native_draw_push(draw);
+        game.native_draw_rotate_about(draw, about, ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
         game.native_draw_block(draw, "create:crushing_wheel_part", &[("axis", value.as_str())]);
-        draw.pop();
+        game.native_draw_pop(draw);
         if speed.abs() >= 1.0 {
             fx_register(pos, &entity.nbt);
             if let Some((item, _, _)) = triple_list(&entity.nbt, "cq").first() {
@@ -12474,7 +12650,7 @@ pub fn submit(
             }
         }
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
@@ -12485,10 +12661,11 @@ pub fn submit(
         let axis = axis_of(front);
         let mut about = [0.0f32; 3];
         about[axis] = 1.0;
-        draw.push();
-        draw.rotate_about(about, spin_degrees(pos, axis, speed, draw), [0.5, 0.5, 0.5]);
+        game.native_draw_push(draw);
+        let spun = spin_degrees(game, pos, axis, speed, draw);
+        game.native_draw_rotate_about(draw, about, spun, [0.5, 0.5, 0.5]);
         game.native_draw_block(draw, "create:cogwheel_shaftless_part", &[("axis", axis_char(axis))]);
-        draw.pop();
+        game.native_draw_pop(draw);
         let facing_text = value.to_string();
         let pointing = game.native_block_state_property(state, "pointing").unwrap_or("up").to_string();
         game.native_draw_block(
@@ -12500,7 +12677,7 @@ pub fn submit(
         if let Some((item, count)) = shown.as_ref() {
             let stack = ItemStack { item: Arc::from(item.as_str()), count: *count, damage: 0, extra: None };
             // sliding along the arrows to the last crafter, then shrinking away into it
-            let now = game.ticks as f64 + f64::from(draw.partial);
+            let now = game.ticks as f64 + f64::from(game.native_draw_partial(draw));
             let stamp = f64::from(get_int(&entity.nbt, "cs", 0));
             let cp = get_int(&entity.nbt, "cp", 0);
             let mut slide = [0.0f32; 3];
@@ -12532,17 +12709,17 @@ pub fn submit(
                 }
                 grow = 1.15 * (1.0 - ((pct - 0.85) / 0.15).clamp(0.0, 1.0)).max(0.02) as f32;
             }
-            draw.push();
-            draw.translate([0.5 + front[0] as f32 * 0.6 + slide[0], 0.5 + slide[1], 0.5 + front[2] as f32 * 0.6 + slide[2]]);
+            game.native_draw_push(draw);
+            game.native_draw_translate(draw, [0.5 + front[0] as f32 * 0.6 + slide[0], 0.5 + slide[1], 0.5 + front[2] as f32 * 0.6 + slide[2]]);
             if front[0] != 0 {
-                draw.rotate_about([0.0, 1.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
             }
-            draw.scale([grow, grow, grow]);
+            game.native_draw_scale(draw, [grow, grow, grow]);
             game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
@@ -12572,13 +12749,13 @@ pub fn submit(
             let (dx, dz) = if first { (0.0f32, -sign) } else { (sign, 0.0f32) };
             for k in 0..stack_copies(*count) {
                 let o = copy_offset(k, is_block);
-                draw.push();
-                draw.translate([0.5 + dx * along + o[0], BELT_TOP + o[1], 0.5 + dz * along + o[2]]);
+                game.native_draw_push(draw);
+                game.native_draw_translate(draw, [0.5 + dx * along + o[0], BELT_TOP + o[1], 0.5 + dz * along + o[2]]);
                 if !is_block {
-                    draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+                    game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
                 }
                 game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos[0] ^ pos[2] ^ (k as i32));
-                draw.pop();
+                game.native_draw_pop(draw);
             }
         }
         if speed.abs() >= 1.0 {
@@ -12614,7 +12791,7 @@ pub fn submit(
             ],
         );
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
@@ -12669,16 +12846,16 @@ pub fn submit(
     let Some(axis) = axis else { return };
     let part_value = if anim >= 2 { axis_char(axis).to_string() } else { value.clone() };
     let speed = f64::from(get_f32(&entity.nbt, "speed"));
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let degrees = (speed * 0.3 * t) % 360.0;
-    draw.push();
+    game.native_draw_push(draw);
     if anim == 1 {
         if speed.abs() >= 1.0 {
             fx_register(pos, &entity.nbt);
         }
         let phase = f64::from(get_f32(&entity.nbt, "pp"));
         let dy = -0.6 * (1.0 - phase.to_radians().cos());
-        draw.translate([0.0, dy as f32, 0.0]);
+        game.native_draw_translate(draw, [0.0, dy as f32, 0.0]);
     } else {
         let mut about = [0.0f32; 3];
         about[axis] = 1.0;
@@ -12687,24 +12864,24 @@ pub fn submit(
         if across % 2 == 0 {
             offset = 22.5;
         }
-        draw.rotate_about(about, degrees as f32 + offset, [0.5, 0.5, 0.5]);
+        game.native_draw_rotate_about(draw, about, degrees as f32 + offset, [0.5, 0.5, 0.5]);
     }
     game.native_draw_block(draw, part, &[(part_prop, part_value.as_str())]);
-    draw.pop();
+    game.native_draw_pop(draw);
     if anim == 2 {
         for sgn in [-1, 1] {
             let mut d = [0; 3];
             d[axis] = sgn;
             let mut about = [0.0f32; 3];
             about[axis] = 1.0;
-            draw.push();
-            draw.rotate_about(about, degrees as f32, [0.5, 0.5, 0.5]);
+            game.native_draw_push(draw);
+            game.native_draw_rotate_about(draw, about, degrees as f32, [0.5, 0.5, 0.5]);
             game.native_draw_block(draw, "create:motor_shaft_part", &[("facing", dir_name(d))]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
     }
     if speed == 0.0 {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
@@ -12739,11 +12916,11 @@ fn bearing_submit(
     if !running {
         game.native_draw_block(draw, plate, &[("facing", f.as_str())]);
         if speed == 0.0 {
-            draw.keep();
+            game.native_draw_keep(draw);
         }
         return;
     }
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let text = get_text(&entity.nbt, "cb");
     let sign = if front[axis] < 0 { -1.0 } else { 1.0 };
     let Ok(mut guard) = SHOWN.lock() else { return };
@@ -12785,14 +12962,14 @@ fn bearing_submit(
     shown.speed = speed;
     shown.sign = sign;
     shown.fresh = 6;
-    draw.push();
-    draw.rotate_about(about, shown.angle as f32, [0.5, 0.5, 0.5]);
+    game.native_draw_push(draw);
+    game.native_draw_rotate_about(draw, about, shown.angle as f32, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, plate, &[("facing", f.as_str())]);
     let psx = psx_decode(&get_text(&entity.nbt, "psx"));
     for (idx, m) in shown.blocks.iter().enumerate() {
         let props: Vec<(&str, &str)> = m.props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        draw.push();
-        draw.translate([m.at[0] as f32, m.at[1] as f32, m.at[2] as f32]);
+        game.native_draw_push(draw);
+        game.native_draw_translate(draw, [m.at[0] as f32, m.at[1] as f32, m.at[2] as f32]);
         game.native_draw_block(draw, &m.name, &props);
         if m.name == SAW_BLOCK {
             // the blade, working while the contraption moves
@@ -12814,10 +12991,10 @@ fn bearing_submit(
                 if let Some(front) = parse_dir(&face.1) {
                     let mut about = [0.0f32; 3];
                     about[axis_of(front)] = 1.0;
-                    draw.push();
-                    draw.rotate_about(about, (t * 20.0 % 360.0) as f32, [0.5, 0.5, 0.5]);
+                    game.native_draw_push(draw);
+                    game.native_draw_rotate_about(draw, about, (t * 20.0 % 360.0) as f32, [0.5, 0.5, 0.5]);
                     game.native_draw_block(draw, "create:drill_head_part", &[("facing", face.1.as_str())]);
-                    draw.pop();
+                    game.native_draw_pop(draw);
                 }
             }
         }
@@ -12829,9 +13006,9 @@ fn bearing_submit(
                 }
             }
         }
-        draw.pop();
+        game.native_draw_pop(draw);
     }
-    draw.pop();
+    game.native_draw_pop(draw);
     // the crack on the block in front of each drill and saw, in the world (not turned with the contraption)
     let crk = get_text(&entity.nbt, "crk");
     for (k, part) in crk.split(';').enumerate() {
@@ -12844,13 +13021,13 @@ fn bearing_submit(
         crumbs(game, draw, &hit, [off[0] + 0.5, off[1] + 0.5, off[2] + 0.5], 6, pos[0] * 31 + pos[2] + 7 + k as i32);
     }
     if speed == 0.0 && crk.is_empty() {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
 // Degrees a part turns by along its shaft at `speed` rpm: Create phase offset, set by the position across the axis.
-fn spin_degrees(pos: [i32; 3], axis: usize, speed: f64, draw: &BlockEntityDraw) -> f32 {
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+fn spin_degrees(game: &Game<'_>, pos: [i32; 3], axis: usize, speed: f64, draw: &BlockEntityDraw) -> f32 {
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let across: i32 = (0..3).filter(|i| *i != axis).map(|i| pos[i]).sum();
     let offset = if across % 2 == 0 { 22.5 } else { 0.0 };
     ((speed * 0.3 * t) % 360.0) as f32 + offset
@@ -12860,10 +13037,11 @@ fn spin_degrees(pos: [i32; 3], axis: usize, speed: f64, draw: &BlockEntityDraw) 
 fn through_shaft(game: &Game<'_>, pos: [i32; 3], axis: usize, speed: f64, draw: &mut BlockEntityDraw) {
     let mut about = [0.0f32; 3];
     about[axis] = 1.0;
-    draw.push();
-    draw.rotate_about(about, spin_degrees(pos, axis, speed, draw), [0.5, 0.5, 0.5]);
+    game.native_draw_push(draw);
+    let spun = spin_degrees(game, pos, axis, speed, draw);
+    game.native_draw_rotate_about(draw, about, spun, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:shaft_part", &[("axis", axis_char(axis))]);
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // The shaft of a chain drive: it turns without the half step the cogs need, so the shafts of linked
@@ -12871,11 +13049,11 @@ fn through_shaft(game: &Game<'_>, pos: [i32; 3], axis: usize, speed: f64, draw: 
 fn chain_shaft(game: &Game<'_>, axis: usize, speed: f64, draw: &mut BlockEntityDraw) {
     let mut about = [0.0f32; 3];
     about[axis] = 1.0;
-    let t = draw.game_time as f64 + f64::from(draw.partial);
-    draw.push();
-    draw.rotate_about(about, ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
+    game.native_draw_push(draw);
+    game.native_draw_rotate_about(draw, about, ((speed * 0.3 * t) % 360.0) as f32, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:shaft_part", &[("axis", axis_char(axis))]);
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // A half shaft sticking out of the block towards `d`.
@@ -12883,10 +13061,11 @@ fn half_shaft(game: &Game<'_>, pos: [i32; 3], d: [i32; 3], speed: f64, draw: &mu
     let axis = axis_of(d);
     let mut about = [0.0f32; 3];
     about[axis] = 1.0;
-    draw.push();
-    draw.rotate_about(about, spin_degrees(pos, axis, speed, draw), [0.5, 0.5, 0.5]);
+    game.native_draw_push(draw);
+    let spun = spin_degrees(game, pos, axis, speed, draw);
+    game.native_draw_rotate_about(draw, about, spun, [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:motor_shaft_part", &[("facing", dir_name(d))]);
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // The drill has its shaft at the back, the press one across it.
@@ -12922,7 +13101,7 @@ fn submit_halves(
     let Some(axis) = parse_axis(&value.to_string()) else { return };
     let src = get_parent(&entity.nbt).unwrap_or([0; 3]);
     let speed = f64::from(get_f32(&entity.nbt, "speed"));
-    let t = draw.game_time as f64 + f64::from(draw.partial);
+    let t = game.native_draw_game_time(draw) as f64 + f64::from(game.native_draw_partial(draw));
     let gearbox = block == "create:gearbox" || block == "create:vertical_gearbox";
     for a in 0..3 {
         for sgn in [-1, 1] {
@@ -12937,14 +13116,14 @@ fn submit_halves(
             let degrees = ((speed * m * 0.3 * t) % 360.0) as f32 + offset;
             let mut about = [0.0f32; 3];
             about[a] = 1.0;
-            draw.push();
-            draw.rotate_about(about, degrees, [0.5, 0.5, 0.5]);
+            game.native_draw_push(draw);
+            game.native_draw_rotate_about(draw, about, degrees, [0.5, 0.5, 0.5]);
             game.native_draw_block(draw, "create:motor_shaft_part", &[("facing", dir_name(d))]);
-            draw.pop();
+            game.native_draw_pop(draw);
         }
     }
     if speed == 0.0 {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
@@ -13761,26 +13940,32 @@ pub fn container(block: &str, container: &mut Option<ModContainer>) {
     }
 }
 
-pub fn screen(block: &str, screen: &mut Option<NativeScreen>) {
+pub fn screen(block: &str, screen: &mut Option<::mod_api::Screen>) {
     if amount_block(block) {
-        *screen = Some(NativeScreen {
+        *screen = Some(::mod_api::Screen {
             width: 176.0,
             height: 88.0,
             slots: vec![None],
             inventory_y: 4000.0,
             inventory_x: 0.0,
             own_labels: true,
+            own_background: false,
+            recipe_book: None,
+            recipe_book_toggle: None,
         });
         return;
     }
     if block == MOTOR_BLOCK {
-        *screen = Some(NativeScreen {
+        *screen = Some(::mod_api::Screen {
             width: 256.0,
             height: 96.0,
             slots: vec![None],
             inventory_y: 4000.0,
             inventory_x: 0.0,
             own_labels: true,
+            own_background: false,
+            recipe_book: None,
+            recipe_book_toggle: None,
         });
     }
 }
@@ -13867,7 +14052,7 @@ pub fn screen_click(block: &str, at: [f32; 2], button: &mut Option<i32>) {
     }
 }
 
-pub fn menu_button(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) {
+fn menu_button_engine(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, id: i32) {
     if (entity.id() == FUNNEL_BE || entity.id() == CHUTE_BE || entity.id() == TUNNEL_BE) && amount_block(&game.native_block(pos)) {
         amount_press(game, pos, entity, id);
         return;
@@ -13912,7 +14097,7 @@ const FAN_ARGMAX: f32 = 256.0;
 const FAN_CHECK: i64 = 30;
 const FAN_TIME: i32 = 150;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FanCurrent {
     facing: [i32; 3],
     pushing: bool,
@@ -14080,7 +14265,7 @@ fn fan_builtin(kind: &str, item: &str) -> Option<Rec> {
 }
 
 fn cooked_stack(game: &Game<'_>, kind: &str, stack: &ItemStack) -> Option<ItemStack> {
-    let c = game.recipes().cook(kind, stack)?;
+    let c = game.recipes().cook(&game.loop_context, kind, stack)?;
     let mut out = c.result.clone();
     out.count *= stack.count;
     Some(out)
@@ -14440,7 +14625,7 @@ fn fan_mob_effect(game: &mut Game<'_>, i: usize, kind: u8) {
     match kind {
         1 => {
             if species == Species::Enderman || species == Species::SnowGolem || species == Species::Blaze {
-                game.mobs[i].damage(2.0, Damage::of(DamageKind::Drown));
+                game.mobs[i].damage(crate::game::entity::damage_level_of!(game), 2.0, Damage::of(DamageKind::Drown));
             }
             // extinguish_fire plays the sound itself (0.7 volume, pitch about 1.6)
             game.mobs[i].extinguish_fire();
@@ -14449,7 +14634,7 @@ fn fan_mob_effect(game: &mut Game<'_>, i: usize, kind: u8) {
             if !game.mobs[i].kind.flags.fire_immune {
                 let (seconds, amount, damage) = if kind == 2 { (10, 4.0, DamageKind::OnFire) } else { (2, 2.0, DamageKind::OnFire) };
                 game.mobs[i].ignite_for_ticks(seconds * 20);
-                game.mobs[i].damage(amount, Damage::of(damage));
+                game.mobs[i].damage(crate::game::entity::damage_level_of!(game), amount, Damage::of(damage));
             }
         }
         4 => {
@@ -14480,7 +14665,7 @@ fn fan_mob_effect(game: &mut Game<'_>, i: usize, kind: u8) {
                     let dim = game.dim.id().to_string();
                     let id = game.mobs[i].id;
                     if game.native_summon(&dim, "minecraft:skeleton_horse", at, nbt).is_some() {
-                        game.native_remove_mob(&dim, id);
+                        remove_mob(game, id);
                     }
                 }
             }
@@ -14527,21 +14712,21 @@ fn fan_entities(game: &mut Game<'_>, front: [i32; 3], about: f32, cur: &FanCurre
     let flying = game.creative && game.player.as_ref().map_or(false, |p| p.flying);
     let sneaking = game.player.as_ref().map_or(false, |p| p.shift_key_down);
     fan_player(game, front, flow, about, cur, lo, hi, center, sneaking, flying);
-    if let Some(mut host) = game.lan.take() {
-        let guests: Vec<(u32, bool, bool)> = host
+    let guests: Vec<(u32, bool, bool)> = match game.lan.as_ref() {
+        Some(host) => host
             .hub
             .guests
             .iter()
             .filter(|g| host.hub.here(g) && g.loaded && !g.dead)
-            .map(|g| (g.conn, g.sneaking, g.flying && g.creative()))
-            .collect();
-        for (conn, sneaking, flying) in guests {
-            let moved = game.as_guest(&mut host, conn, |g| fan_player(g, front, flow, about, cur, lo, hi, center, sneaking, flying));
-            if let Some(Some(v)) = moved {
-                game.send_guest_motion(&host, conn, Some(v));
-            }
+            .map(|g| (g.conn, g.sneaking, g.abilities.flying && g.creative()))
+            .collect(),
+        None => Vec::new(),
+    };
+    for (conn, sneaking, flying) in guests {
+        let moved = game.as_guest(conn, |g| fan_player(g, front, flow, about, cur, lo, hi, center, sneaking, flying));
+        if let Some(Some(v)) = moved {
+            game.send_guest_motion(conn, Some(v));
         }
-        game.lan = Some(host);
     }
 }
 
@@ -14641,8 +14826,7 @@ fn fan_tag(pos: [i32; 3]) -> i64 {
 // blows, or at the far end of the current when it sucks, jittered a quarter block on every axis. The engine draws
 // it as the pack particle create:air_flow (the engine edit gives it the owner tag), and fan_steer_particles then
 // moves it every tick the way AirFlowParticle.tick does.
-fn fan_air_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &FanCurrent, center: [f64; 3]) {
-    use horizon_client::particles::ParticleOptions;
+fn fan_air_particles(game: &mut Game<'_>, _pos: [i32; 3], front: [i32; 3], cur: &FanCurrent, lo: [f64; 3], hi: [f64; 3], center: [f64; 3]) {
     if fan_rand() >= 0.5 || cur.reach <= 0.0 {
         return;
     }
@@ -14651,42 +14835,63 @@ fn fan_air_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &
     for k in 0..3 {
         at[k] = center[k] + f64::from(front[k]) * offset + f64::from(fan_rand() * 2.0 - 1.0) * 0.25;
     }
-    let mut air = ParticleOptions::named("create:air_flow");
-    air.color = [238.0 / 255.0, 238.0 / 255.0, 238.0 / 255.0, 0.25];
-    game.particles.add_with(&air, at, [0.0; 3], true, true);
-    let tag = fan_tag(pos);
-    game.particles.steer_mod(&mut |p, _| {
-        if p.tag == -1 {
-            p.tag = tag;
-        }
-    });
+    let controller = AirFlow {
+        front,
+        flow: if cur.pushing { front } else { neg(front) },
+        cur: cur.clone(),
+        lo,
+        hi,
+        center,
+    };
+    // Needs the pack's `create:air_flow` particle; without it the game makes none.
+    if let Some(mut air) = game.particles.controlled("create:air_flow", at, true, controller) {
+        air.rgba = [238.0 / 255.0, 238.0 / 255.0, 238.0 / 255.0, 0.25];
+        air.lifetime = 40;
+        game.particles.push(air);
+    }
 }
 
-// AirFlowParticle.tick for every air particle of the fan at `pos`: it goes when it leaves the current (the bounds
-// grown a quarter block, or a distance outside -0.25 to the reach plus one), moves by the flow times 0.125 times
-// (reach - (distance - 1)) times one half, takes the colour and sprite of the air at its distance (morphAirFlow),
-// and may shed the extra particle of that air along its last motion.
-fn fan_steer_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur: &FanCurrent, lo: [f64; 3], hi: [f64; 3], center: [f64; 3]) {
-    use horizon_client::particles::{ParticleOptions, ParticleType};
-    let tag = fan_tag(pos);
-    let flow = if cur.pushing { front } else { neg(front) };
-    let reach = f64::from(cur.reach);
-    let mut extras: Vec<(ParticleOptions, [f64; 3], [f64; 3])> = Vec::new();
-    game.particles.steer_mod(&mut |p, sprites| {
-        if p.tag != tag {
-            return;
+// AirFlowParticle.tick: it goes when it leaves the current (the bounds grown a quarter block, or a distance
+// outside -0.25 to the reach plus one), moves by the flow times 0.125 times (reach - (distance - 1)) times one
+// half, takes the colour and sprite of the air at its distance (morphAirFlow), and may shed the extra particle
+// of that air along its last motion.
+#[derive(Clone, Debug)]
+struct AirFlow {
+    front: [i32; 3],
+    flow: [i32; 3],
+    cur: FanCurrent,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    center: [f64; 3],
+}
+
+impl horizon_client::particles::ParticleController for AirFlow {
+    fn tick(
+        &mut self,
+        p: &mut horizon_client::particles::Particle,
+        _level: &horizon_client::particles::ParticleLevel<'_>,
+    ) -> horizon_client::particles::ParticleUpdate {
+        use horizon_client::particles::{ParticleOptions, ParticleType, ParticleUpdate};
+        let mut update = ParticleUpdate::default();
+        if !p.advance_age() {
+            return update;
         }
-        if !(0..3).all(|k| p.position[k] >= lo[k] - 0.25 && p.position[k] <= hi[k] + 0.25) {
-            p.kill();
-            return;
+        let reach = f64::from(self.cur.reach);
+        // the motion of the last tick, then the new one
+        for k in 0..3 {
+            p.position[k] += p.velocity[k];
         }
-        let dist = (0..3).map(|k| (p.position[k] - center[k]) * f64::from(front[k])).sum::<f64>().abs() - 0.5;
+        if !(0..3).all(|k| p.position[k] >= self.lo[k] - 0.25 && p.position[k] <= self.hi[k] + 0.25) {
+            p.remove();
+            return update;
+        }
+        let dist = (0..3).map(|k| (p.position[k] - self.center[k]) * f64::from(self.front[k])).sum::<f64>().abs() - 0.5;
         if dist > reach + 1.0 || dist < -0.25 {
-            p.kill();
-            return;
+            p.remove();
+            return update;
         }
         let speed = 0.125 * (reach - (dist - 1.0)) * 0.5;
-        let kind = fan_type_at(cur, dist as f32);
+        let kind = fan_type_at(&self.cur, dist as f32);
         let t = fan_rand();
         let (rgb, alpha) = match kind {
             1 => (fan_mix(4_495_871, 2_258_943, t), 1.0),
@@ -14701,9 +14906,7 @@ fn fan_steer_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur:
         } else {
             (fan_rand() * 3.0) as usize
         };
-        if !sprites.is_empty() {
-            p.show_sprite(sprites[pick * (sprites.len() - 1) / 7]);
-        }
+        update.frame = Some(pick);
         // spawnExtraParticle: the particle position, the motion it had until now times the multiplier
         let lava = || ParticleOptions::block(ParticleType::Block, String::from("block/lava_still"), 0x00FF_FFFF);
         let list: Vec<(ParticleOptions, f32, f64)> = match kind {
@@ -14725,15 +14928,24 @@ fn fan_steer_particles(game: &mut Game<'_>, pos: [i32; 3], front: [i32; 3], cur:
         for (options, chance, multiplier) in list {
             if fan_rand() < chance {
                 let w = [p.velocity[0] * multiplier, p.velocity[1] * multiplier, p.velocity[2] * multiplier];
-                extras.push((options, p.position, w));
+                update.spawned.push((options, p.position, w));
             }
         }
-        p.velocity = [f64::from(flow[0]) * speed, f64::from(flow[1]) * speed, f64::from(flow[2]) * speed];
-    });
-    for (options, at, v) in extras {
-        game.particles.add_with(&options, at, v, true, true);
+        p.velocity = [
+            f64::from(self.flow[0]) * speed,
+            f64::from(self.flow[1]) * speed,
+            f64::from(self.flow[2]) * speed,
+        ];
+        update
     }
 }
+
+// AirFlowParticle.tick for every air particle of the fan at `pos`: it goes when it leaves the current (the bounds
+// grown a quarter block, or a distance outside -0.25 to the reach plus one), moves by the flow times 0.125 times
+// (reach - (distance - 1)) times one half, takes the colour and sprite of the air at its distance (morphAirFlow),
+// and may shed the extra particle of that air along its last motion.
+// The air flow steers itself now (`AirFlow`, a particle controller); nothing is left to do here.
+fn fan_steer_particles(_game: &mut Game<'_>, _pos: [i32; 3], _front: [i32; 3], _cur: &FanCurrent, _lo: [f64; 3], _hi: [f64; 3], _center: [f64; 3]) {}
 
 // spawnProcessingParticles for an item being processed at `at`: one tick in eight.
 // The server side only notes where an item is being processed; the window game shows it (fan_client).
@@ -14771,7 +14983,7 @@ fn fan_client(game: &mut Game<'_>) {
             lo[k] = first[k].min(end);
             hi[k] = (first[k] + 1.0).max(end + 1.0);
         }
-        fan_air_particles(game, pos, front, &cur, center);
+        fan_air_particles(game, pos, front, &cur, lo, hi, center);
         fan_steer_particles(game, pos, front, &cur, lo, hi, center);
     }
     let list = match FAN_FX.lock() {
@@ -14889,8 +15101,7 @@ fn chute_inventory(game: &mut Game<'_>, p: [i32; 3]) -> bool {
     if funnel_storage(game, p) != 0 || game.native_block(p) == "create:millstone" {
         return true;
     }
-    let dim = game.dim.id().to_string();
-    game.native_container_slots(&dim, p, Direction::Up).is_some()
+    has_container(game, p, Direction::Up)
 }
 
 // The chute an item leaves the one at `pos` into (getTargetChute): below, or below and ahead for a diagonal one.
@@ -15374,16 +15585,16 @@ fn chute_submit(game: &Game<'_>, state: BlockStateId, entity: &ModBlockEntity, d
         .unwrap_or([0, -1, 0]);
     let mut height = get_int(&entity.nbt, "tm", CHUTE_TOP) as f32 / 1000.0;
     if get_int(&entity.nbt, "mv", 0) == 1 {
-        height -= (CHUTE_FALL as f32 / 1000.0) * draw.partial;
+        height -= (CHUTE_FALL as f32 / 1000.0) * game.native_draw_partial(draw);
     }
     let height = height.clamp(0.0, 1.0);
     let ahead = if facing[1] == 0 { 1.0 - height } else { 0.0 };
     let stack = ItemStack { item: Arc::from(name.as_str()), count, damage: 0, extra: None };
-    draw.push();
-    draw.translate([0.5 - facing[0] as f32 * ahead, height, 0.5 - facing[2] as f32 * ahead]);
-    draw.scale([0.5, 0.5, 0.5]);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, [0.5 - facing[0] as f32 * ahead, height, 0.5 - facing[2] as f32 * ahead]);
+    game.native_draw_scale(draw, [0.5, 0.5, 0.5]);
     game.native_draw_item(draw, &stack, DisplayContext::Ground, None, pos_seed(&name));
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // The filter of a brass funnel or smart chute, shown as the item on the side of its box.
@@ -15407,7 +15618,7 @@ fn filter_item_draw_at(game: &Game<'_>, draw: &mut BlockEntityDraw, flt: &str, f
         return;
     }
     let stack = ItemStack { item: Arc::from(flt), count: 1, damage: 0, extra: None };
-    draw.push();
+    game.native_draw_push(draw);
     // a vertical funnel is only 10/16 tall: its frame square is at that height, not on the block face
     let reach = if face[1] == 1 && funnel_top_frame { 0.635 - 0.5 } else { 0.505 };
     let side = depth.unwrap_or(0.505);
@@ -15417,7 +15628,7 @@ fn filter_item_draw_at(game: &Game<'_>, draw: &mut BlockEntityDraw, flt: &str, f
             at[1] = y;
         }
     }
-    draw.translate(at);
+    game.native_draw_translate(draw, at);
     let (axis, deg) = match face {
         [0, 0, -1] => ([0.0, 1.0, 0.0], 0.0),
         [0, 0, 1] => ([0.0, 1.0, 0.0], 180.0),
@@ -15426,10 +15637,10 @@ fn filter_item_draw_at(game: &Game<'_>, draw: &mut BlockEntityDraw, flt: &str, f
         [0, 1, 0] => ([1.0, 0.0, 0.0], 90.0),
         _ => ([1.0, 0.0, 0.0], -90.0),
     };
-    draw.rotate_about(axis, deg, [0.0, 0.0, 0.0]);
-    draw.scale([0.5, 0.5, 0.5]);
+    game.native_draw_rotate_about(draw, axis, deg, [0.0, 0.0, 0.0]);
+    game.native_draw_scale(draw, [0.5, 0.5, 0.5]);
     game.native_draw_item(draw, &stack, DisplayContext::Fixed, None, pos_seed(flt));
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // True while the player crouches (the shift key, or the crouch button of the touch controls).
@@ -15528,10 +15739,10 @@ fn slot_frame_submit(game: &Game<'_>, pos: [i32; 3], name: &str, draw: &mut Bloc
         1 => "y",
         _ => "z",
     };
-    draw.push();
-    draw.translate(off);
+    game.native_draw_push(draw);
+    game.native_draw_translate(draw, off);
     game.native_draw_block(draw, "create:slot_frame_part", &[("axis", axis)]);
-    draw.pop();
+    game.native_draw_pop(draw);
 }
 
 // The slots of the block the crosshair is on shown as squares of light, the one the crosshair is on brighter, as
@@ -16008,15 +16219,15 @@ fn large_wheel_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entit
     let Some(value) = game.native_block_state_property(state, "facing") else { return };
     let Some(axis) = parse_dir(&value.to_string()).map(axis_of) else { return };
     let speed = f64::from(get_f32(&entity.nbt, "speed"));
-    let degrees = spin_degrees(pos, axis, speed, draw);
+    let degrees = spin_degrees(game, pos, axis, speed, draw);
     let centre = [0.5f32, 0.5, 0.5];
-    draw.push();
+    game.native_draw_push(draw);
     match axis {
-        0 => draw.rotate_about([0.0, 0.0, 1.0], -90.0, centre),
-        2 => draw.rotate_about([1.0, 0.0, 0.0], 90.0, centre),
+        0 => game.native_draw_rotate_about(draw, [0.0, 0.0, 1.0], -90.0, centre),
+        2 => game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], 90.0, centre),
         _ => {}
     }
-    draw.rotate_about([0.0, 1.0, 0.0], degrees, centre);
+    game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], degrees, centre);
     let pieces: [(&str, [f32; 3]); 4] = [
         ("q0", [-1.0, 0.0, -1.0]),
         ("q1", [-1.0, 0.0, 1.0]),
@@ -16024,24 +16235,24 @@ fn large_wheel_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entit
         ("q3", [1.0, 0.0, 1.0]),
     ];
     for (quad, shift) in pieces {
-        draw.push();
-        draw.translate(shift);
+        game.native_draw_push(draw);
+        game.native_draw_translate(draw, shift);
         game.native_draw_block(draw, LARGE_PART, &[("quad", quad)]);
-        draw.pop();
+        game.native_draw_pop(draw);
     }
-    draw.pop();
+    game.native_draw_pop(draw);
     for sgn in [-1, 1] {
         let mut d = [0; 3];
         d[axis] = sgn;
         let mut about = [0.0f32; 3];
         about[axis] = 1.0;
-        draw.push();
-        draw.rotate_about(about, degrees, centre);
+        game.native_draw_push(draw);
+        game.native_draw_rotate_about(draw, about, degrees, centre);
         game.native_draw_block(draw, "create:motor_shaft_part", &[("facing", dir_name(d))]);
-        draw.pop();
+        game.native_draw_pop(draw);
     }
     if speed == 0.0 {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
@@ -16381,10 +16592,10 @@ fn engine_orient(draw: &mut BlockEntityDraw, fd: [i32; 3], roll: bool) {
         [0, -1, 0] => 90.0,
         _ => 0.0,
     };
-    draw.rotate_about([0.0, 1.0, 0.0], yaw, c);
-    draw.rotate_about([1.0, 0.0, 0.0], vert + 90.0, c);
+    game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], yaw, c);
+    game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], vert + 90.0, c);
     if roll {
-        draw.rotate_about([0.0, 1.0, 0.0], -90.0, c);
+        game.native_draw_rotate_about(draw, [0.0, 1.0, 0.0], -90.0, c);
     }
 }
 
@@ -16404,7 +16615,7 @@ fn engine_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: &M
         return;
     }
     let speed = f64::from(get_f32(&entity.nbt, "sp"));
-    let mut deg = f64::from(spin_degrees(shaft, saxis, speed, draw));
+    let mut deg = f64::from(spin_degrees(game, shaft, saxis, speed, draw));
     if saxis != 1 && ((fa == 0) ^ (fd[fa] > 0)) {
         deg = -deg;
     }
@@ -16417,28 +16628,28 @@ fn engine_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: &M
     let distance = sine - rod;
     let swing = (rod / 0.875).clamp(-1.0, 1.0).acos() * if a.cos() >= 0.0 { 1.0 } else { -1.0 };
     let roll = (fa != 1 && saxis == 1) || (fa == 1 && saxis == 2);
-    draw.push();
+    game.native_draw_push(draw);
     engine_orient(draw, fd, roll);
-    draw.translate([0.0, distance + 1.25, 0.0]);
+    game.native_draw_translate(draw, [0.0, distance + 1.25, 0.0]);
     game.native_draw_block(draw, "create:steam_engine_piston_part", &[]);
-    draw.pop();
-    draw.push();
+    game.native_draw_pop(draw);
+    game.native_draw_push(draw);
     engine_orient(draw, fd, roll);
-    draw.translate([0.0, 1.0, 0.0]);
-    draw.translate([0.0, distance + 1.25, 0.0]);
-    draw.translate([0.0, 0.25, 0.5]);
-    draw.rotate_about([1.0, 0.0, 0.0], swing.to_degrees(), [0.0, 0.0, 0.0]);
-    draw.translate([0.0, -0.25, -0.5]);
+    game.native_draw_translate(draw, [0.0, 1.0, 0.0]);
+    game.native_draw_translate(draw, [0.0, distance + 1.25, 0.0]);
+    game.native_draw_translate(draw, [0.0, 0.25, 0.5]);
+    game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], swing.to_degrees(), [0.0, 0.0, 0.0]);
+    game.native_draw_translate(draw, [0.0, -0.25, -0.5]);
     game.native_draw_block(draw, "create:steam_engine_linkage_part", &[]);
-    draw.pop();
-    draw.push();
+    game.native_draw_pop(draw);
+    game.native_draw_push(draw);
     engine_orient(draw, fd, roll);
-    draw.translate([0.0, 2.0, 0.0]);
-    draw.rotate_about([1.0, 0.0, 0.0], (-(a + std::f32::consts::FRAC_PI_2)).to_degrees(), [0.5, 0.5, 0.5]);
+    game.native_draw_translate(draw, [0.0, 2.0, 0.0]);
+    game.native_draw_rotate_about(draw, [1.0, 0.0, 0.0], (-(a + std::f32::consts::FRAC_PI_2)).to_degrees(), [0.5, 0.5, 0.5]);
     game.native_draw_block(draw, "create:steam_engine_connector_part", &[]);
-    draw.pop();
+    game.native_draw_pop(draw);
     if speed == 0.0 {
-        draw.keep();
+        game.native_draw_keep(draw);
     }
 }
 
