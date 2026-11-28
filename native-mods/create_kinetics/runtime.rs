@@ -16459,7 +16459,6 @@ fn engine_submit(game: &Game<'_>, pos: [i32; 3], state: BlockStateId, entity: &M
     }
 }
 
-#[cfg(test)]
 // ---- the mechanical arm ----
 // As in Java (ArmBlockEntity, ArmAngleTarget, ArmRenderer of the jar): you select blocks with the arm item (a right-click
 // makes it an input, again an output, again takes it away; as many of each as you like), place the arm, and it takes stacks
@@ -16925,7 +16924,7 @@ fn point_put(game: &mut Game<'_>, kind: PointKind, p: [i32; 3], st: ItemStack) -
                     if !v.iter().all(|b| (b.p - 0.5).abs() > 0.3) {
                         return 0;
                     }
-                    v.push(BeltItem { item: name, count: 1, p: 0.5, moving: true });
+                    v.push(BeltItem { item: name, count: 1, p: 0.5, moving: true, pt: 0, pm: 0 });
                     belt_store(&mut e.nbt, &v);
                     1
                 })
@@ -16947,14 +16946,14 @@ fn point_put(game: &mut Game<'_>, kind: PointKind, p: [i32; 3], st: ItemStack) -
             }
         }
         PointKind::Saw => {
-            let item = BeltItem { item: left.item.to_string(), count: left.count, p: 0.5, moving: false };
+            let item = BeltItem { item: left.item.to_string(), count: left.count, p: 0.5, moving: false, pt: 0, pm: 0 };
             if saw_accept(game, p, &item) {
                 left.count = 0;
             }
         }
         PointKind::CrushWheel => {
             if let Some((gap, _)) = crush_gap(game, p) {
-                let item = BeltItem { item: left.item.to_string(), count: left.count, p: 0.5, moving: false };
+                let item = BeltItem { item: left.item.to_string(), count: left.count, p: 0.5, moving: false, pt: 0, pm: 0 };
                 if crusher_accept(game, gap, &item) {
                     left.count = 0;
                 }
@@ -17235,7 +17234,8 @@ fn arm_tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, spe
                 put_int(&mut entity.nbt, "ph", ARM_SEARCH_OUT);
                 if let Some((p, _)) = target {
                     let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-                    let _ = game.native_play_sound("minecraft:entity.item.pickup", at, 4, 0.125, 0.6);
+                    // (the pickup sound is left out: `native_play_sound` is on GameLevel, not Game)
+                    let _ = at;
                 }
             } else {
                 put_int(&mut entity.nbt, "ph", ARM_SEARCH_IN);
